@@ -113,16 +113,19 @@ function applyAudioPlayback() {
   video.muted = settings.muted;
 }
 
-// jitterBufferTarget — клиентский рычаг, применяется мгновенно (без ffmpeg).
+// jitterBufferTarget + playoutDelayHint — клиентские рычаги задержки приёма.
+// Применяем к ОБОИМ трекам: при наличии аудио Chrome синхронизирует A/V и
+// подтягивает видео под звук, раздувая видео-буфер; playoutDelayHint=0 просит
+// минимальную задержку проигрывания и противодействует этому.
 function applyBufferTarget() {
   if (!pc) return;
   for (const r of pc.getReceivers()) {
-    if (r.track && r.track.kind === "video" && "jitterBufferTarget" in r) {
-      try {
-        r.jitterBufferTarget = settings.buffer;
-      } catch (err) {
-        console.warn("jitterBufferTarget:", err);
-      }
+    if (!r.track) continue;
+    try {
+      if ("jitterBufferTarget" in r) r.jitterBufferTarget = settings.buffer;
+      if ("playoutDelayHint" in r) r.playoutDelayHint = settings.buffer / 1000; // сек
+    } catch (err) {
+      console.warn("buffer hint:", err);
     }
   }
 }
