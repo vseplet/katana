@@ -69,13 +69,10 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 		defer wg.Done()
 		var n int
 		var loggedErr bool
-		// Диагностика: сколько кадров реально ушло в трек за последние ~5с.
-		// При зависании видно, падает ли выход сервера в 0 (стоп пайплайна)
-		// или держится (тогда виноват приём/декод в браузере).
-		var since int
-		last := time.Now()
 		for frame := range stream.Video {
 			if err := s.track.WriteSample(media.Sample{Data: frame, Duration: frameDur}); err != nil {
+				// Не выходим на транзиентной ошибке (иначе видео встанет навсегда):
+				// логируем один раз и продолжаем, восстановимся на кейфрейме.
 				if !loggedErr {
 					loggedErr = true
 					log.Printf("webrtc: write video: %v (продолжаю)", err)
@@ -83,14 +80,8 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 				continue
 			}
 			n++
-			since++
 			if n == 1 {
 				log.Printf("webrtc: first frame on track")
-			}
-			if d := time.Since(last); d >= 5*time.Second {
-				log.Printf("webrtc: video out %.0f fps", float64(since)/d.Seconds())
-				since = 0
-				last = time.Now()
 			}
 		}
 	}()
