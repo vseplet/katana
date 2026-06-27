@@ -230,6 +230,21 @@ func signalingHandler(root context.Context, enc capture.CaptureEncoder, opts cap
 			}
 		})
 
+		// Канал ввода (ordered+reliable) поверх того же peer-соединения — низкая
+		// задержка, единый транспорт. Go создаёт его до оффера; браузер шлёт сюда
+		// mouse/scroll/cursor. Создаём ДО CreateOffer, чтобы попал в SDP.
+		if dc, err := pc.CreateDataChannel("input", nil); err != nil {
+			log.Printf("signaling: data channel: %v", err)
+		} else {
+			dc.OnMessage(func(m webrtc.DataChannelMessage) {
+				var im signalMessage
+				if json.Unmarshal(m.Data, &im) != nil {
+					return
+				}
+				s.dispatchInput(&im)
+			})
+		}
+
 		// Go офферит первым.
 		offer, err := pc.CreateOffer(nil)
 		if err != nil {
@@ -385,21 +400,29 @@ func readLoop(ctx context.Context, s *session) {
 				}
 				s.setSource(newOpts.SourceKind, newOpts.SourceID) // обновить геометрию
 			}()
-		case "mouse":
-			if msg.Mouse != nil {
-				s.handleMouse(msg.Mouse)
-			}
-		case "scroll":
-			if msg.Scroll != nil {
-				scrollMouse(msg.Scroll.Dx, msg.Scroll.Dy)
-			}
-		case "cursor":
-			// Живое переключение курсора хоста — без перезапуска захвата.
-			if msg.Config != nil && msg.Config.Cursor != nil {
-				s.str.updateCursor(*msg.Config.Cursor)
-			}
+		case "mouse", "scroll", "cursor":
+			s.dispatchInput(&msg) // фолбэк, если DataChannel ещё не открыт
 		default:
 			log.Printf("signaling: unknown message type %q", msg.Type)
+		}
+	}
+}
+
+// dispatchInput обрабатывает события ввода (mouse/scroll/cursor) — общий путь
+// для DataChannel (основной) и WebSocket (фолбэк).
+func (s *session) dispatchInput(msg *signalMessage) {
+	switch msg.Type {
+	case "mouse":
+		if msg.Mouse != nil {
+			s.handleMouse(msg.Mouse)
+		}
+	case "scroll":
+		if msg.Scroll != nil {
+			scrollMouse(msg.Scroll.Dx, msg.Scroll.Dy)
+		}
+	case "cursor":
+		if msg.Config != nil && msg.Config.Cursor != nil {
+			s.str.updateCursor(*msg.Config.Cursor)
 		}
 	}
 }

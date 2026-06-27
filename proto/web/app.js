@@ -50,6 +50,7 @@ document.addEventListener("contextmenu", (e) => {
 // pc и ws пересоздаются при смене кодека (новый трек = ренеготиация).
 let pc = null;
 let ws = null;
+let inputDC = null; // DataChannel "input" (mouse/scroll/cursor); создаёт сервер
 
 // --- Настройки (модель для lil-gui) ---
 
@@ -367,6 +368,15 @@ function send(msg) {
   }
 }
 
+// Ввод (mouse/scroll/cursor) — по DataChannel; пока он не открыт, фолбэк на WS.
+function sendInput(msg) {
+  if (inputDC && inputDC.readyState === "open") {
+    inputDC.send(JSON.stringify(msg));
+  } else {
+    send(msg);
+  }
+}
+
 // Стартовые настройки уходят в query — сервер сразу запускает захват с ними
 // (без лишнего reconfig после коннекта). Кодек меняется только так.
 function connectURL() {
@@ -395,6 +405,7 @@ function disconnect() {
     pc.close();
     pc = null;
   }
+  inputDC = null;
 }
 
 function connect() {
@@ -403,6 +414,11 @@ function connect() {
   // Пустой конфиг: localhost, host-кандидаты, без ICE-серверов.
   pc = new RTCPeerConnection();
   window.pc = pc; // для отладочной статистики из DevTools
+
+  // Канал ввода создаёт сервер (офферер) — ловим его здесь.
+  pc.ondatachannel = (e) => {
+    if (e.channel.label === "input") inputDC = e.channel;
+  };
 
   pc.ontrack = (event) => {
     applyBufferTarget(); // применить текущий выбор буфера к новому приёмнику
@@ -620,7 +636,7 @@ function sendMouseAt(clientX, clientY, action, button) {
   const c = videoCoords({ clientX, clientY }) || (action === "up" ? lastCoords : null);
   if (!c) return;
   lastCoords = c;
-  send({ type: "mouse", mouse: { x: c.x, y: c.y, action, button } });
+  sendInput({ type: "mouse", mouse: { x: c.x, y: c.y, action, button } });
 }
 
 // Нажатие с дедзоной (settings.dragDeadzone): move не шлём, пока не сдвинулись
@@ -665,7 +681,7 @@ function sendScroll(dxPx, dyPx) {
   scrollAcc.y -= dy;
   if (settings.invertScrollX) dx = -dx;
   if (settings.invertScrollY) dy = -dy;
-  send({ type: "scroll", scroll: { dx, dy } });
+  sendInput({ type: "scroll", scroll: { dx, dy } });
 }
 
 // --- Вьюпорт: зум и пан (клиентские, через CSS-transform видео) ---
@@ -708,7 +724,7 @@ function setControl(on) {
   updateAppsVisibility(); // ленту приложений прячем в режиме управления
   saveSettings();
   // Курсор хоста меняем на лету (без перезапуска захвата → без обрыва видео).
-  send({ type: "cursor", config: { cursor: !on } });
+  sendInput({ type: "cursor", config: { cursor: !on } });
 }
 
 // --- Лента открытых приложений ---
