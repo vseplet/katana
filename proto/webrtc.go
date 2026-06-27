@@ -20,15 +20,16 @@ import (
 type streamer struct {
 	parent context.Context
 	enc    capture.CaptureEncoder
-	track  *webrtc.TrackLocalStaticSample
+	track  *webrtc.TrackLocalStaticSample // видео
+	audio  *webrtc.TrackLocalStaticSample // Opus, nil если звук выключен
 
 	mu     sync.Mutex
 	cancel context.CancelFunc // останавливает текущий захват
-	done   chan struct{}      // закрывается, когда писатель кадров вышел
+	done   chan struct{}      // закрывается, когда писатели кадров вышли
 }
 
-func newStreamer(parent context.Context, enc capture.CaptureEncoder, track *webrtc.TrackLocalStaticSample) *streamer {
-	return &streamer{parent: parent, enc: enc, track: track}
+func newStreamer(parent context.Context, enc capture.CaptureEncoder, track, audio *webrtc.TrackLocalStaticSample) *streamer {
+	return &streamer{parent: parent, enc: enc, track: track, audio: audio}
 }
 
 // reconfigure останавливает текущий захват (если был) и запускает новый
@@ -46,7 +47,7 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 	}
 
 	ctx, cancel := context.WithCancel(s.parent)
-	frames, err := s.enc.Start(ctx, opts)
+	stream, err := s.enc.Start(ctx, opts)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("start capture: %w", err)
@@ -56,22 +57,41 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 	s.cancel = cancel
 	s.done = done
 
+	var wg sync.WaitGroup
+
+	// Видео.
+	wg.Add(1)
 	frameDur := time.Second / time.Duration(opts.FPS)
 	go func() {
-		defer close(done)
+		defer wg.Done()
 		var n int
-		for frame := range frames {
+		for frame := range stream.Video {
 			if err := s.track.WriteSample(media.Sample{Data: frame, Duration: frameDur}); err != nil {
-				log.Printf("webrtc: write sample: %v", err)
+				log.Printf("webrtc: write video: %v", err)
 				return
 			}
 			n++
 			if n == 1 {
-				log.Printf("webrtc: first frame on track") // подтверждаем, что кадры пошли
+				log.Printf("webrtc: first frame on track")
 			}
 		}
 	}()
 
+	// Аудио (Opus, ~20 мс на пакет) — если есть трек и поток.
+	if s.audio != nil && stream.Audio != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pkt := range stream.Audio {
+				if err := s.audio.WriteSample(media.Sample{Data: pkt, Duration: 20 * time.Millisecond}); err != nil {
+					log.Printf("webrtc: write audio: %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	go func() { wg.Wait(); close(done) }()
 	return nil
 }
 
@@ -119,7 +139,26 @@ func newPeerConnection(ctx context.Context, enc capture.CaptureEncoder, opts cap
 	// PLI в прототипе не обрабатываем (кейфреймы периодические), но читаем.
 	go readRTCP(sender)
 
-	s := newStreamer(ctx, enc, track)
+	// Opus-аудиотрек — только если звук включён при подключении (как кодек,
+	// смена требует переподключения: добавление трека = ренеготиация).
+	var audio *webrtc.TrackLocalStaticSample
+	if opts.Audio {
+		audio, err = webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+			"audio", "desktop")
+		if err != nil {
+			_ = pc.Close()
+			return nil, nil, fmt.Errorf("new audio track: %w", err)
+		}
+		asender, err := pc.AddTrack(audio)
+		if err != nil {
+			_ = pc.Close()
+			return nil, nil, fmt.Errorf("add audio track: %w", err)
+		}
+		go readRTCP(asender)
+	}
+
+	s := newStreamer(ctx, enc, track, audio)
 	if err := s.reconfigure(opts); err != nil {
 		_ = pc.Close()
 		return nil, nil, err

@@ -62,6 +62,9 @@ const settings = {
   threads: 0, // потоки энкодера ffmpeg; 0 = авто
   dropLate: false, // выкидывать старые кадры под нагрузкой
   buffer: 0, // целевой джиттер-буфер приёмника, мс
+  audio: false, // передавать звук (SCK → Opus); connect-time
+  volume: 1, // громкость воспроизведения 0..1 (клиент)
+  muted: true, // mute воспроизведения (клиент; true для автоплея)
 };
 
 // Восстанавливаем сохранённые настройки до постройки панели, чтобы контролы
@@ -102,6 +105,12 @@ const metrics = {
   encoder: "—",
   latency: "—",
 };
+
+// Громкость/mute воспроизведения — клиентские, мгновенные (на <video>).
+function applyAudioPlayback() {
+  video.volume = settings.volume;
+  video.muted = settings.muted;
+}
 
 // jitterBufferTarget — клиентский рычаг, применяется мгновенно (без ffmpeg).
 function applyBufferTarget() {
@@ -248,6 +257,10 @@ cap
   .name("Encoder threads")
   .onChange(sendConfig);
 cap.add(settings, "dropLate").name("Drop late frames").onChange(sendConfig);
+cap.add(settings, "audio").name("Audio (transmit)").onChange(() => {
+  saveSettings();
+  connect(); // вкл/выкл звука = добавить/убрать дорожку → переподключение
+});
 
 const recv = gui.addFolder("Receive · browser");
 recv.domElement.classList.add("f-receive");
@@ -258,6 +271,14 @@ recv
     applyBufferTarget();
     saveSettings();
   });
+recv.add(settings, "volume", 0, 1, 0.05).name("Volume").onChange(() => {
+  applyAudioPlayback();
+  saveSettings();
+});
+recv.add(settings, "muted").name("Mute").onChange(() => {
+  applyAudioPlayback();
+  saveSettings();
+});
 
 const stat = gui.addFolder("Stats");
 stat.domElement.classList.add("f-stats");
@@ -285,6 +306,7 @@ function connectURL() {
     bitrateKbps: settings.bitrate,
     threads: settings.threads,
     dropLate: settings.dropLate,
+    audio: settings.audio,
     ...sourceParams(),
   });
   return `${proto}://${location.host}/ws?${q}`;
@@ -314,6 +336,7 @@ function connect() {
     if (video.srcObject !== event.streams[0]) {
       video.srcObject = event.streams[0];
     }
+    applyAudioPlayback(); // громкость/mute
   };
 
   pc.onconnectionstatechange = () => {

@@ -166,8 +166,8 @@ func outputArgs(opts Options, withScale bool) []string {
 	return args
 }
 
-// Start запускает захват и возвращает канал кадров (VP8 IVF либо H264 AU).
-func (f *FFmpegDarwin) Start(ctx context.Context, opts Options) (<-chan []byte, error) {
+// Start запускает захват и возвращает каналы кадров (видео + опц. аудио).
+func (f *FFmpegDarwin) Start(ctx context.Context, opts Options) (*Stream, error) {
 	// Реальный захват — через ScreenCaptureKit (дисплей/окно/приложение).
 	// avfoundation остаётся только как legacy ("screen"); тест-источник — lavfi.
 	if !opts.TestSource &&
@@ -220,7 +220,7 @@ func (f *FFmpegDarwin) Start(ctx context.Context, opts Options) (<-chan []byte, 
 		}
 	}()
 
-	return frames, nil
+	return &Stream{Video: frames}, nil // avfoundation/test — без звука
 }
 
 // readIVF читает VP8-кадры из IVF-потока ffmpeg и шлёт их в канал.

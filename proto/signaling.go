@@ -124,6 +124,8 @@ func optsFromQuery(base capture.Options, q url.Values) capture.Options {
 	case "vp8":
 		o.Codec = capture.CodecVP8
 	}
+	// Звук — только при коннекте (добавление дорожки = ренеготиация).
+	o.Audio = q.Get("audio") == "true"
 	return o
 }
 

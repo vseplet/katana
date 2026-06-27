@@ -28,6 +28,10 @@ type Options struct {
 	// Многопоточный софт-VP8 быстрее кодирует кадр → меньше задержка энкода.
 	Threads int
 
+	// Audio — захватывать и передавать звук (system/app audio через SCK → Opus).
+	// Работает только для SCK-источников (display/window/app).
+	Audio bool
+
 	// DropLate: если потребитель отстаёт, выкидывать старые кадры и держать
 	// только свежий, а не копить очередь. Меньше задержка под нагрузкой ценой
 	// возможных пропусков кадров.
@@ -39,13 +43,18 @@ type Options struct {
 	TestSource bool
 }
 
-// CaptureEncoder запускает захват+энкод экрана и отдаёт поток VP8-кадров.
+// Stream — результат захвата: каналы видео- и (опционально) аудио-кадров.
+// Video — payload IVF-кадра (VP8) или H264 access unit. Audio — Opus-пакеты
+// (из ogg), либо nil, если звук не захватывается.
+type Stream struct {
+	Video <-chan []byte
+	Audio <-chan []byte
+}
+
+// CaptureEncoder запускает захват+энкод и отдаёт каналы кадров.
 //
-// Каждый элемент канала — payload одного IVF-кадра (готовый VP8-кадр),
-// который можно напрямую отдать в track.WriteSample.
-//
-// Закрытие переданного ctx останавливает захват и завершает subprocess.
-// Канал закрывается, когда поток завершён (ctx отменён или процесс умер).
+// Закрытие переданного ctx останавливает захват и завершает subprocess'ы.
+// Каналы закрываются, когда поток завершён (ctx отменён или процесс умер).
 type CaptureEncoder interface {
-	Start(ctx context.Context, opts Options) (<-chan []byte, error)
+	Start(ctx context.Context, opts Options) (*Stream, error)
 }

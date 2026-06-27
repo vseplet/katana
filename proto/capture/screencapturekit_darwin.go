@@ -9,7 +9,7 @@ package capture
 
 char *sck_list_sources(void);
 int sck_source_size(int kind, unsigned int sid, int *outW, int *outH);
-int sck_start(int kind, unsigned int sid, int fps, int handle);
+int sck_start(int kind, unsigned int sid, int fps, int handle, int audio);
 void sck_stop(int handle);
 */
 import "C"
@@ -19,12 +19,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
 
 // sckSink хранит последний кадр потока SCK. SCK отдаёт кадры только при
@@ -32,7 +35,8 @@ import (
 // ffmpeg получает ровный поток даже на статичном окне.
 type sckSink struct {
 	mu     sync.Mutex
-	latest []byte
+	latest []byte    // последний видео-кадр (для тикера CFR)
+	audio  io.Writer // stdin аудио-ffmpeg (nil, если звук не нужен)
 }
 
 var (
@@ -71,6 +75,24 @@ func goSCKFrame(handle C.int, buf unsafe.Pointer, length C.int) {
 	s.mu.Unlock()
 }
 
+//export goSCKAudio
+func goSCKAudio(handle C.int, buf unsafe.Pointer, length C.int) {
+	sckMu.Lock()
+	s := sckSinks[int(handle)]
+	sckMu.Unlock()
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	w := s.audio
+	s.mu.Unlock()
+	if w == nil {
+		return
+	}
+	// Аудио непрерывно — пишем сразу (C-буфер валиден до возврата).
+	_, _ = w.Write(unsafe.Slice((*byte)(buf), int(length)))
+}
+
 // sckKindCode переводит строковый вид источника в код для нативной стороны.
 func sckKindCode(kind string) int {
 	switch kind {
@@ -91,8 +113,12 @@ func sckSourceSize(kind, id int) (int, int, error) {
 	return int(w), int(h), nil
 }
 
-func sckStart(kind, id, fps, handle int) error {
-	if rc := C.sck_start(C.int(kind), C.uint(id), C.int(fps), C.int(handle)); rc != 0 {
+func sckStart(kind, id, fps, handle int, audio bool) error {
+	a := 0
+	if audio {
+		a = 1
+	}
+	if rc := C.sck_start(C.int(kind), C.uint(id), C.int(fps), C.int(handle), C.int(a)); rc != 0 {
 		return fmt.Errorf("sck_start rc=%d", int(rc))
 	}
 	return nil
@@ -100,9 +126,10 @@ func sckStart(kind, id, fps, handle int) error {
 
 func sckStop(handle int) { C.sck_stop(C.int(handle)) }
 
-// startSCK захватывает окно/приложение через ScreenCaptureKit: нативный поток
-// шлёт BGRA-кадры в stdin ffmpeg, тот скейлит/кодирует, мы читаем stdout.
-func startSCK(ctx context.Context, opts Options) (<-chan []byte, error) {
+// startSCK захватывает дисплей/окно/приложение через ScreenCaptureKit:
+// нативный поток шлёт BGRA-кадры в stdin видео-ffmpeg (скейл/энкод), при
+// opts.Audio — ещё и PCM в stdin аудио-ffmpeg (Opus). Читаем оба stdout.
+func startSCK(ctx context.Context, opts Options) (*Stream, error) {
 	kind := sckKindCode(opts.SourceKind)
 	w, h, err := sckSourceSize(kind, opts.SourceID)
 	if err != nil {
@@ -111,8 +138,8 @@ func startSCK(ctx context.Context, opts Options) (<-chan []byte, error) {
 
 	args := buildSCKArgs(opts, w, h)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	log.Printf("capture: sck %s/%d %dx%d | ffmpeg %s",
-		opts.SourceKind, opts.SourceID, w, h, strings.Join(args, " "))
+	log.Printf("capture: sck %s/%d %dx%d audio=%v | ffmpeg %s",
+		opts.SourceKind, opts.SourceID, w, h, opts.Audio, strings.Join(args, " "))
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -134,16 +161,36 @@ func startSCK(ctx context.Context, opts Options) (<-chan []byte, error) {
 
 	// Регистрируем sink ДО старта SCK, чтобы первые кадры не потерялись.
 	handle, sink := sckRegister()
-	if err := sckStart(kind, opts.SourceID, opts.FPS, handle); err != nil {
+
+	// Аудио (опционально): отдельный ffmpeg PCM→Opus, его stdin вешаем в sink.
+	var audioCh chan []byte
+	var audioStop func()
+	if opts.Audio {
+		ai, ach, stop, aerr := startAudioEncoder(ctx)
+		if aerr != nil {
+			log.Printf("capture: audio encoder: %v (продолжаю без звука)", aerr)
+		} else {
+			sink.mu.Lock()
+			sink.audio = ai
+			sink.mu.Unlock()
+			audioCh = ach
+			audioStop = stop
+		}
+	}
+
+	if err := sckStart(kind, opts.SourceID, opts.FPS, handle, opts.Audio); err != nil {
 		sckUnregister(handle)
 		_ = stdin.Close()
+		if audioStop != nil {
+			audioStop()
+		}
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return nil, fmt.Errorf("sck start: %w", err)
 	}
 
-	// Тикер: гоним последний кадр в ffmpeg с целевой частотой — ровный CFR-вход
-	// даже когда SCK молчит (статичное окно).
+	// Тикер: гоним последний видео-кадр с целевой частотой — ровный CFR-вход
+	// даже когда SCK молчит (статичное окно). Аудио пишется напрямую в goSCKAudio.
 	go func() {
 		ticker := time.NewTicker(time.Second / time.Duration(opts.FPS))
 		defer ticker.Stop()
@@ -159,7 +206,7 @@ func startSCK(ctx context.Context, opts Options) (<-chan []byte, error) {
 					continue
 				}
 				if _, err := stdin.Write(f); err != nil {
-					return // ffmpeg ушёл
+					return
 				}
 			}
 		}
@@ -172,6 +219,9 @@ func startSCK(ctx context.Context, opts Options) (<-chan []byte, error) {
 			sckStop(handle)
 			sckUnregister(handle)
 			_ = stdin.Close()
+			if audioStop != nil {
+				audioStop()
+			}
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
 			}
@@ -187,7 +237,72 @@ func startSCK(ctx context.Context, opts Options) (<-chan []byte, error) {
 		}
 	}()
 
-	return frames, nil
+	return &Stream{Video: frames, Audio: audioCh}, nil
+}
+
+// startAudioEncoder поднимает ffmpeg PCM(f32le 48k стерео)→Opus(ogg), читает
+// stdout через oggreader и отдаёт Opus-пакеты в канал. Возвращает stdin (куда
+// SCK пишет PCM), канал пакетов и функцию остановки.
+func startAudioEncoder(ctx context.Context) (io.Writer, chan []byte, func(), error) {
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-nostats",
+		"-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "-",
+		"-c:a", "libopus", "-b:a", "128k", "-application", "lowdelay",
+		"-page_duration", "20000", // одна opus-страница ≈ 20 мс
+		"-f", "ogg", "-",
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	go logStderr(stderr)
+	if err := cmd.Start(); err != nil {
+		return nil, nil, nil, err
+	}
+
+	out := make(chan []byte, 16)
+	go func() {
+		defer close(out)
+		reader, _, err := oggreader.NewWith(bufio.NewReader(stdout))
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("capture: ogg header: %v", err)
+			}
+			return
+		}
+		for {
+			page, _, err := reader.ParseNextPage()
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("audio: ogg read: %v", err)
+				}
+				return
+			}
+			select {
+			case out <- page:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	stop := func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}
+	return stdin, out, stop, nil
 }
 
 // SourceDisplay — дисплей (для SCK-захвата всего экрана).

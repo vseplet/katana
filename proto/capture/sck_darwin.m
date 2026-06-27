@@ -8,8 +8,9 @@
 #include <string.h>
 #include <stdlib.h>
 
-// Реализована в Go (//export goSCKFrame): принимает один BGRA-кадр.
+// Реализованы в Go: видео-кадр (BGRA) и аудио-чанк (interleaved float32).
 extern void goSCKFrame(int handle, void *buf, int len);
+extern void goSCKAudio(int handle, void *buf, int len);
 
 // Старт SCStream трогает CoreGraphics/WindowServer, который в «голом» CLI не
 // инициализирован (Assertion CGS_REQUIRE_INIT). NSApplicationLoad поднимает
@@ -106,7 +107,14 @@ char *sck_list_sources(void) {
 - (void)stream:(SCStream *)stream
 	didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 	               ofType:(SCStreamOutputType)type {
-	if (type != SCStreamOutputTypeScreen || !CMSampleBufferIsValid(sampleBuffer)) {
+	if (!CMSampleBufferIsValid(sampleBuffer)) {
+		return;
+	}
+	if (type == SCStreamOutputTypeAudio) {
+		[self handleAudio:sampleBuffer];
+		return;
+	}
+	if (type != SCStreamOutputTypeScreen) {
 		return;
 	}
 	CVImageBufferRef px = CMSampleBufferGetImageBuffer(sampleBuffer);
@@ -131,6 +139,61 @@ char *sck_list_sources(void) {
 		free(tight);
 	}
 }
+// handleAudio извлекает PCM из аудио-CMSampleBuffer и отдаёт в Go как
+// interleaved float32 (стерео) — формат, который понимает ffmpeg (-f f32le).
+- (void)handleAudio:(CMSampleBufferRef)sampleBuffer {
+	const AudioStreamBasicDescription *asbd = NULL;
+	CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+	if (fmt) {
+		asbd = CMAudioFormatDescriptionGetStreamBasicDescription((CMAudioFormatDescriptionRef)fmt);
+	}
+	if (!asbd || asbd->mBitsPerChannel != 32) {
+		return; // ожидаем float32 (SCK отдаёт planar float32 48k стерео)
+	}
+	int channels = asbd->mChannelsPerFrame;
+	if (channels < 1 || channels > 8) {
+		return;
+	}
+	BOOL planar = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+
+	// AudioBufferList должен вмещать по буферу на канал (для planar). Базовый
+	// struct содержит место под 1 буфер — добавляем (channels-1).
+	char storage[sizeof(AudioBufferList) + 7 * sizeof(AudioBuffer)];
+	AudioBufferList *abl = (AudioBufferList *)storage;
+	size_t ablSize = sizeof(AudioBufferList) + (size_t)(channels - 1) * sizeof(AudioBuffer);
+
+	CMBlockBufferRef block = NULL;
+	OSStatus st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+		sampleBuffer, NULL, abl, ablSize, NULL, NULL,
+		kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &block);
+	if (st != noErr) {
+		static BOOL ablLogged = NO;
+		if (!ablLogged) { ablLogged = YES; NSLog(@"katana: audio buffer list err=%d", (int)st); }
+		return;
+	}
+
+	if (!planar || abl->mNumberBuffers == 1) {
+		// Interleaved — отдаём как есть.
+		goSCKAudio(self.handle, abl->mBuffers[0].mData, (int)abl->mBuffers[0].mDataByteSize);
+	} else {
+		// Planar (по буферу на канал) → интерливим в [L R L R ...].
+		int frames = (int)(abl->mBuffers[0].mDataByteSize / sizeof(float));
+		float *out = malloc((size_t)frames * channels * sizeof(float));
+		if (out) {
+			for (int i = 0; i < frames; i++) {
+				for (int c = 0; c < channels; c++) {
+					out[i * channels + c] = ((float *)abl->mBuffers[c].mData)[i];
+				}
+			}
+			goSCKAudio(self.handle, out, frames * channels * (int)sizeof(float));
+			free(out);
+		}
+	}
+	if (block) {
+		CFRelease(block);
+	}
+}
+
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
 }
 @end
@@ -138,6 +201,7 @@ char *sck_list_sources(void) {
 static NSMutableDictionary<NSNumber *, SCStream *> *gStreams;
 static NSMutableDictionary<NSNumber *, KatanaOutput *> *gOutputs;
 static dispatch_queue_t gQueue;
+static dispatch_queue_t gAudioQueue;
 
 // sck_source_size возвращает размер источника в пикселях (без старта потока),
 // чтобы вызывающий мог настроить ffmpeg на нужный video_size.
@@ -183,7 +247,7 @@ int sck_source_size(int kind, unsigned int sid, int *outW, int *outH) {
 
 // sck_start запускает поток захвата выбранного источника. Кадры идут в
 // goSCKFrame(handle, ...). Возвращает 0 при успехе.
-int sck_start(int kind, unsigned int sid, int fps, int handle) {
+int sck_start(int kind, unsigned int sid, int fps, int handle, int audio) {
 	@autoreleasepool {
 		sck_ensure_app();
 		SCShareableContent *content = sck_fetch_content();
@@ -235,6 +299,11 @@ int sck_start(int kind, unsigned int sid, int fps, int handle) {
 		cfg.pixelFormat = kCVPixelFormatType_32BGRA;
 		cfg.queueDepth = 5;
 		cfg.showsCursor = YES;
+		if (audio) {
+			cfg.capturesAudio = YES;
+			cfg.sampleRate = 48000;
+			cfg.channelCount = 2;
+		}
 
 		KatanaOutput *out = [[KatanaOutput alloc] init];
 		out.handle = handle;
@@ -243,7 +312,8 @@ int sck_start(int kind, unsigned int sid, int fps, int handle) {
 		if (!gStreams) {
 			gStreams = [NSMutableDictionary dictionary];
 			gOutputs = [NSMutableDictionary dictionary];
-			gQueue = dispatch_queue_create("katana.sck", DISPATCH_QUEUE_SERIAL);
+			gQueue = dispatch_queue_create("katana.sck.video", DISPATCH_QUEUE_SERIAL);
+			gAudioQueue = dispatch_queue_create("katana.sck.audio", DISPATCH_QUEUE_SERIAL);
 		}
 
 		NSError *addErr = nil;
@@ -252,6 +322,17 @@ int sck_start(int kind, unsigned int sid, int fps, int handle) {
 		          sampleHandlerQueue:gQueue
 		                       error:&addErr]) {
 			return 7;
+		}
+		if (audio) {
+			NSError *aerr = nil;
+			// Если аудио-выход не добавился — продолжаем без звука, не валим поток.
+			BOOL ok = [stream addStreamOutput:out
+			                             type:SCStreamOutputTypeAudio
+			               sampleHandlerQueue:gAudioQueue
+			                            error:&aerr];
+			if (!ok) {
+				NSLog(@"katana: add audio output failed: %@", aerr);
+			}
 		}
 
 		__block int startErr = 0;
