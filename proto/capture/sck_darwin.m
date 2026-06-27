@@ -350,6 +350,42 @@ int sck_start(int kind, unsigned int sid, int fps, int handle, int audio) {
 	}
 }
 
+// sck_source_rect возвращает глобальный прямоугольник источника (origin+size,
+// в точках, top-left) — для маппинга координат мыши. kind: 1=window, 2=app,
+// иначе display. Возвращает 0 при успехе.
+int sck_source_rect(int kind, unsigned int sid, double *x, double *y, double *w, double *h) {
+	@autoreleasepool {
+		SCShareableContent *content = sck_fetch_content();
+		if (!content) {
+			return 1;
+		}
+		CGRect r = CGRectNull;
+		if (kind == 1) {
+			for (SCWindow *win in content.windows) {
+				if (win.windowID == sid) { r = win.frame; break; }
+			}
+		} else if (kind == 2) {
+			SCDisplay *d = content.displays.firstObject;
+			if (d) r = d.frame;
+		} else {
+			for (SCDisplay *d in content.displays) {
+				if (d.displayID == sid) { r = d.frame; break; }
+			}
+			if (CGRectIsNull(r) && content.displays.firstObject) {
+				r = content.displays.firstObject.frame;
+			}
+		}
+		if (CGRectIsNull(r) || r.size.width <= 0 || r.size.height <= 0) {
+			return 2;
+		}
+		*x = r.origin.x;
+		*y = r.origin.y;
+		*w = r.size.width;
+		*h = r.size.height;
+		return 0;
+	}
+}
+
 // sck_stop останавливает поток захвата.
 void sck_stop(int handle) {
 	@autoreleasepool {

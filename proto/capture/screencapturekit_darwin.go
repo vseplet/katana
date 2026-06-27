@@ -9,6 +9,7 @@ package capture
 
 char *sck_list_sources(void);
 int sck_source_size(int kind, unsigned int sid, int *outW, int *outH);
+int sck_source_rect(int kind, unsigned int sid, double *x, double *y, double *w, double *h);
 int sck_start(int kind, unsigned int sid, int fps, int handle, int audio);
 void sck_stop(int handle);
 */
@@ -333,6 +334,22 @@ type Sources struct {
 	Displays []SourceDisplay `json:"displays"`
 	Windows  []SourceWindow  `json:"windows"`
 	Apps     []SourceApp     `json:"apps"`
+}
+
+// Rect — глобальный прямоугольник источника (точки, top-left).
+type Rect struct {
+	X, Y, W, H float64
+}
+
+// SourceRect возвращает положение/размер источника на экране — для маппинга
+// координат мыши из браузера в глобальные координаты. kind: window|app|display.
+func SourceRect(kind string, id int) (Rect, error) {
+	var x, y, w, h C.double
+	rc := C.sck_source_rect(C.int(sckKindCode(kind)), C.uint(id), &x, &y, &w, &h)
+	if rc != 0 {
+		return Rect{}, fmt.Errorf("sck_source_rect rc=%d", int(rc))
+	}
+	return Rect{X: float64(x), Y: float64(y), W: float64(w), H: float64(h)}, nil
 }
 
 // ListSources перечисляет источники захвата через ScreenCaptureKit.

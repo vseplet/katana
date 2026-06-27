@@ -65,6 +65,7 @@ const settings = {
   audio: false, // передавать звук (SCK → Opus); connect-time
   volume: 1, // громкость воспроизведения 0..1 (клиент)
   muted: true, // mute воспроизведения (клиент; true для автоплея)
+  control: false, // управлять мышью хоста (отправлять события)
 };
 
 // Восстанавливаем сохранённые настройки до постройки панели, чтобы контролы
@@ -167,7 +168,9 @@ function toggleFullscreen() {
   }
 }
 gui.add({ fullscreen: toggleFullscreen }, "fullscreen").name("Fullscreen ⤢");
-video.addEventListener("dblclick", toggleFullscreen);
+video.addEventListener("dblclick", () => {
+  if (!settings.control) toggleFullscreen(); // в режиме управления dblclick = два клика
+});
 window.addEventListener("keydown", (e) => {
   if (inPanel(document.activeElement)) return; // не мешаем работе с панелью
   if (e.key === "f" || e.key === "F") toggleFullscreen();
@@ -279,6 +282,7 @@ recv.add(settings, "muted").name("Mute").onChange(() => {
   applyAudioPlayback();
   saveSettings();
 });
+recv.add(settings, "control").name("Control (mouse)").onChange(saveSettings);
 
 const stat = gui.addFolder("Stats");
 stat.domElement.classList.add("f-stats");
@@ -491,6 +495,41 @@ async function initSources() {
   const widthEl = cap.controllers.find((c) => c.property === "width")?.domElement;
   if (widthEl) cap.$children.insertBefore(ctrl.domElement, widthEl);
 }
+
+// --- Управление мышью ---
+// Координаты курсора над видео → нормализованные [0,1] с учётом object-fit:
+// contain (letterbox). Сервер мапит их в глобальные координаты источника.
+function videoCoords(ev) {
+  const r = video.getBoundingClientRect();
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const scale = Math.min(r.width / vw, r.height / vh);
+  const dispW = vw * scale, dispH = vh * scale;
+  const nx = (ev.clientX - r.left - (r.width - dispW) / 2) / dispW;
+  const ny = (ev.clientY - r.top - (r.height - dispH) / 2) / dispH;
+  if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return null; // вне картинки (letterbox)
+  return { x: nx, y: ny };
+}
+
+function sendMouse(ev, action) {
+  if (!settings.control) return;
+  const c = videoCoords(ev);
+  if (!c) return;
+  send({ type: "mouse", mouse: { x: c.x, y: c.y, action, button: ev.button === 2 ? "right" : "left" } });
+}
+
+let lastMove = 0;
+video.addEventListener("mousemove", (ev) => {
+  if (!settings.control) return;
+  if (ev.timeStamp - lastMove < 16) return; // ~60/с
+  lastMove = ev.timeStamp;
+  sendMouse(ev, "move");
+});
+video.addEventListener("mousedown", (ev) => {
+  if (settings.control) ev.preventDefault();
+  sendMouse(ev, "down");
+});
+video.addEventListener("mouseup", (ev) => sendMouse(ev, "up"));
 
 // Старт.
 (async () => {

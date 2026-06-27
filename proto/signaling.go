@@ -18,12 +18,22 @@ import (
 )
 
 // signalMessage — формат сообщений сигналинга (JSON over WS), см. §4 ТЗ.
-// Тип "config" — расширение поверх ТЗ: смена параметров захвата на лету.
+// Типы "config"/"mouse" — расширения поверх ТЗ.
 type signalMessage struct {
 	Type      string                   `json:"type"`
 	SDP       string                   `json:"sdp,omitempty"`
 	Candidate *webrtc.ICECandidateInit `json:"candidate,omitempty"`
 	Config    *configMsg               `json:"config,omitempty"`
+	Mouse     *mouseMsg                `json:"mouse,omitempty"`
+}
+
+// mouseMsg — событие мыши от браузера. X/Y — нормализованные [0,1] координаты
+// относительно содержимого видео.
+type mouseMsg struct {
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Action string  `json:"action"` // move | down | up
+	Button string  `json:"button"` // left | right
 }
 
 // configMsg — настройки захвата, присылаемые браузером. Указатели, чтобы
@@ -166,6 +176,7 @@ func signalingHandler(root context.Context, enc capture.CaptureEncoder, opts cap
 		defer cancel()
 
 		s := &session{conn: conn, base: connOpts}
+		s.setSource(connOpts.SourceKind, connOpts.SourceID) // геометрия для мыши
 		defer func() {
 			_ = conn.CloseNow()
 			log.Printf("signaling: viewer disconnected (%s)", r.RemoteAddr)
@@ -228,6 +239,58 @@ type session struct {
 	str  *streamer
 	base capture.Options // базовые опции (индекс экрана, дефолты)
 	mu   sync.Mutex      // сериализует запись в WS (OnICECandidate + readLoop)
+
+	srcMu sync.Mutex   // защищает геометрию источника
+	rect  capture.Rect // глобальный прямоугольник источника (для маппинга мыши)
+}
+
+// setSource обновляет кэш геометрии источника (для координат мыши). Вызов SCK
+// относительно дорогой, поэтому делаем его при смене источника, а не на каждое
+// событие мыши. window может двигаться — тогда геометрия слегка устаревает.
+func (s *session) setSource(kind string, id int) {
+	r, err := capture.SourceRect(kind, id)
+	if err != nil {
+		return // не SCK-источник или не найден — мышь просто не сработает
+	}
+	s.srcMu.Lock()
+	s.rect = r
+	s.srcMu.Unlock()
+}
+
+// handleMouse мапит нормализованные координаты в глобальные и инжектит событие.
+func (s *session) handleMouse(m *mouseMsg) {
+	s.srcMu.Lock()
+	r := s.rect
+	s.srcMu.Unlock()
+	if r.W <= 0 || r.H <= 0 {
+		return
+	}
+	x := int(r.X + clampF(m.X)*r.W)
+	y := int(r.Y + clampF(m.Y)*r.H)
+	button := "left"
+	if m.Button == "right" {
+		button = "right"
+	}
+	switch m.Action {
+	case "down":
+		moveMouse(x, y)
+		mouseToggle(button, true)
+	case "up":
+		moveMouse(x, y)
+		mouseToggle(button, false)
+	default:
+		moveMouse(x, y)
+	}
+}
+
+func clampF(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
 }
 
 // send сериализует сообщение и пишет его в WS под мьютексом.
@@ -288,7 +351,12 @@ func readLoop(ctx context.Context, s *session) {
 				if err := s.str.reconfigure(newOpts); err != nil {
 					log.Printf("signaling: reconfigure: %v", err)
 				}
+				s.setSource(newOpts.SourceKind, newOpts.SourceID) // обновить геометрию
 			}()
+		case "mouse":
+			if msg.Mouse != nil {
+				s.handleMouse(msg.Mouse)
+			}
 		default:
 			log.Printf("signaling: unknown message type %q", msg.Type)
 		}
