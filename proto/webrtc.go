@@ -59,16 +59,23 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 
 	var wg sync.WaitGroup
 
-	// Видео.
+	// Видео. На ошибке WriteSample НЕ выходим (иначе одна транзиентная ошибка
+	// навсегда останавливает видео — картинка застывает, аудио идёт, лечит
+	// только перезагрузка). Пропускаем кадр и продолжаем; восстановимся на
+	// ближайшем кейфрейме. Логируем первую ошибку, дальше молча.
 	wg.Add(1)
 	frameDur := time.Second / time.Duration(opts.FPS)
 	go func() {
 		defer wg.Done()
 		var n int
+		var loggedErr bool
 		for frame := range stream.Video {
 			if err := s.track.WriteSample(media.Sample{Data: frame, Duration: frameDur}); err != nil {
-				log.Printf("webrtc: write video: %v", err)
-				return
+				if !loggedErr {
+					loggedErr = true
+					log.Printf("webrtc: write video: %v (продолжаю)", err)
+				}
+				continue
 			}
 			n++
 			if n == 1 {
@@ -82,10 +89,14 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			var loggedErr bool
 			for pkt := range stream.Audio {
 				if err := s.audio.WriteSample(media.Sample{Data: pkt, Duration: 20 * time.Millisecond}); err != nil {
-					log.Printf("webrtc: write audio: %v", err)
-					return
+					if !loggedErr {
+						loggedErr = true
+						log.Printf("webrtc: write audio: %v (продолжаю)", err)
+					}
+					continue
 				}
 			}
 		}()
