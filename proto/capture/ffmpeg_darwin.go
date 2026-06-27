@@ -168,7 +168,10 @@ func outputArgs(opts Options, withScale bool) []string {
 
 // Start запускает захват и возвращает канал кадров (VP8 IVF либо H264 AU).
 func (f *FFmpegDarwin) Start(ctx context.Context, opts Options) (<-chan []byte, error) {
-	if opts.SourceKind == "window" || opts.SourceKind == "app" {
+	// Реальный захват — через ScreenCaptureKit (дисплей/окно/приложение).
+	// avfoundation остаётся только как legacy ("screen"); тест-источник — lavfi.
+	if !opts.TestSource &&
+		(opts.SourceKind == "window" || opts.SourceKind == "app" || opts.SourceKind == "display") {
 		return startSCK(ctx, opts)
 	}
 

@@ -40,7 +40,7 @@ func main() {
 	flag.Parse()
 
 	opts := capture.Options{
-		SourceKind:  "screen", // по умолчанию весь экран (avfoundation)
+		SourceKind:  "display", // по умолчанию весь дисплей через ScreenCaptureKit
 		ScreenIndex: *screen,
 		Codec:       capture.Codec(*codec),
 		Width:       *width,

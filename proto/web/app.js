@@ -89,13 +89,10 @@ function saveSettings() {
 }
 
 // Разбирает settings.source ("kind:id") в параметры захвата для сервера.
+// Всё идёт через ScreenCaptureKit: display/window/app по числовому id.
 function sourceParams() {
-  const [kind, idStr] = (settings.source || "screen:-1").split(":");
-  const id = parseInt(idStr, 10);
-  if (kind === "screen") {
-    return id >= 0 ? { sourceKind: kind, screen: id } : { sourceKind: kind };
-  }
-  return { sourceKind: kind, sourceId: id };
+  const [kind, idStr] = (settings.source || "display:0").split(":");
+  return { sourceKind: kind, sourceId: parseInt(idStr, 10) || 0 };
 }
 
 // Живые метрики (readonly-поля панели).
@@ -447,13 +444,14 @@ function addOpt(opts, label, value) {
 // Единый список источников: экраны (avfoundation) + окна и приложения (SCK).
 // Делаем до connect(), чтобы первый захват сразу пошёл с нужного источника.
 async function initSources() {
-  const [disp, src] = await Promise.all([
-    fetch("/api/displays").then((r) => r.json()).catch(() => ({ default: -1, screens: [] })),
-    fetch("/api/sources").then((r) => r.json()).catch(() => ({ windows: [], apps: [] })),
-  ]);
+  const src = await fetch("/api/sources")
+    .then((r) => r.json())
+    .catch(() => ({ displays: [], windows: [], apps: [] }));
 
   const options = {};
-  for (const s of disp.screens || []) addOpt(options, `Screen · ${s.name}`, `screen:${s.index}`);
+  for (const d of src.displays || []) {
+    addOpt(options, `Screen · Display ${d.id} (${d.width}×${d.height})`, `display:${d.id}`);
+  }
   for (const w of src.windows || []) {
     addOpt(options, `Win · ${w.app}: ${w.title}`.slice(0, 58), `window:${w.id}`);
   }
@@ -461,9 +459,9 @@ async function initSources() {
 
   const values = Object.values(options);
   if (!values.includes(settings.source)) {
-    settings.source = disp.default >= 0 ? `screen:${disp.default}` : values[0] || "screen:-1";
+    settings.source = src.displays && src.displays[0] ? `display:${src.displays[0].id}` : values[0] || "display:0";
   }
-  if (!values.length) addOpt(options, "(none)", "screen:-1");
+  if (!values.length) addOpt(options, "(none)", "display:0");
 
   const ctrl = cap.add(settings, "source", options).name("Source").onChange(sendConfig);
   // ставим Source сразу после Encoder (перед Width) — выбор источника важнее.
