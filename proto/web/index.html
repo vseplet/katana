@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>katana · screen share</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      font: 13px/1.3 -apple-system, system-ui, sans-serif;
+      color: #eee;
+    }
+    video {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+    #status {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      padding: 6px 10px;
+      color: #ddd;
+      background: rgba(0, 0, 0, 0.55);
+      border-radius: 6px;
+      pointer-events: none;
+      transition: opacity 0.4s;
+    }
+
+    /* Цветовые акценты папок панели — чтобы блоки различались с одного взгляда. */
+    .lil-gui .f-capture > .title {
+      border-left: 4px solid #4aa3ff;
+      background: linear-gradient(90deg, rgba(74, 163, 255, 0.18), transparent 60%);
+    }
+    .lil-gui .f-receive > .title {
+      border-left: 4px solid #46c46a;
+      background: linear-gradient(90deg, rgba(70, 196, 106, 0.18), transparent 60%);
+    }
+    .lil-gui .f-stats > .title {
+      border-left: 4px solid #e0a23b;
+      background: linear-gradient(90deg, rgba(224, 162, 59, 0.18), transparent 60%);
+    }
+  </style>
+</head>
+<body>
+  <video id="screen" autoplay playsinline muted></video>
+  <div id="status">connecting…</div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
