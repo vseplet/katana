@@ -2,9 +2,19 @@ package capture
 
 import "context"
 
+// Codec — кодек видео. Определяет энкодер ffmpeg, формат вывода и MimeType
+// WebRTC-трека.
+type Codec string
+
+const (
+	CodecVP8  Codec = "vp8"  // libvpx, софтовый
+	CodecH264 Codec = "h264" // h264_videotoolbox, аппаратный (Apple)
+)
+
 // Options описывает параметры захвата+энкода экрана.
 type Options struct {
 	ScreenIndex int    // индекс avfoundation-устройства экрана (см. -list_devices)
+	Codec       Codec  // vp8 | h264
 	Width       int    // целевая ширина в пикселях; 0 = нативное разрешение
 	FPS         int    // частота кадров
 	Bitrate     string // целевой битрейт, напр. "3M"

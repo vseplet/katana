@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"strconv"
 	"sync"
 
 	"github.com/coder/websocket"
@@ -71,6 +73,49 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
+// optsFromQuery строит опции захвата для соединения: базовые (флаги сервера),
+// переопределённые query-параметрами при коннекте. Кодек задаётся только так
+// (на лету не меняется — нужен новый трек), остальное можно менять и через
+// config-сообщения уже в сессии.
+func optsFromQuery(base capture.Options, q url.Values) capture.Options {
+	var c configMsg
+	if v, ok := queryInt(q, "width"); ok {
+		c.Width = &v
+	}
+	if v, ok := queryInt(q, "fps"); ok {
+		c.FPS = &v
+	}
+	if v, ok := queryInt(q, "bitrateKbps"); ok {
+		c.BitrateKbps = &v
+	}
+	if v, ok := queryInt(q, "threads"); ok {
+		c.Threads = &v
+	}
+	if q.Has("dropLate") {
+		b := q.Get("dropLate") == "true"
+		c.DropLate = &b
+	}
+	o := c.apply(base)
+	switch q.Get("codec") {
+	case "h264":
+		o.Codec = capture.CodecH264
+	case "vp8":
+		o.Codec = capture.CodecVP8
+	}
+	return o
+}
+
+func queryInt(q url.Values, key string) (int, bool) {
+	if !q.Has(key) {
+		return 0, false
+	}
+	v, err := strconv.Atoi(q.Get(key))
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
 // signalingHandler возвращает http.HandlerFunc для /ws.
 //
 // На каждое WS-соединение поднимается отдельный PeerConnection с захватом.
@@ -88,20 +133,21 @@ func signalingHandler(root context.Context, enc capture.CaptureEncoder, opts cap
 			log.Printf("signaling: ws accept: %v", err)
 			return
 		}
-		log.Printf("signaling: viewer connected (%s)", r.RemoteAddr)
+		connOpts := optsFromQuery(opts, r.URL.Query())
+		log.Printf("signaling: viewer connected (%s) codec=%s", r.RemoteAddr, connOpts.Codec)
 
 		// Контекст соединения наследуется от корневого: отменяется и при
 		// отключении зрителя (defer cancel), и при остановке сервера (root).
 		ctx, cancel := context.WithCancel(root)
 		defer cancel()
 
-		s := &session{conn: conn, base: opts}
+		s := &session{conn: conn, base: connOpts}
 		defer func() {
 			_ = conn.CloseNow()
 			log.Printf("signaling: viewer disconnected (%s)", r.RemoteAddr)
 		}()
 
-		pc, str, err := newPeerConnection(ctx, enc, opts)
+		pc, str, err := newPeerConnection(ctx, enc, connOpts)
 		if err != nil {
 			log.Printf("signaling: peer connection: %v", err)
 			return

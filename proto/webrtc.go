@@ -97,8 +97,12 @@ func newPeerConnection(ctx context.Context, enc capture.CaptureEncoder, opts cap
 		return nil, nil, fmt.Errorf("new peer connection: %w", err)
 	}
 
+	mime := webrtc.MimeTypeVP8
+	if opts.Codec == capture.CodecH264 {
+		mime = webrtc.MimeTypeH264
+	}
 	track, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
+		webrtc.RTPCodecCapability{MimeType: mime},
 		"screen", "desktop")
 	if err != nil {
 		_ = pc.Close()

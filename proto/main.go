@@ -34,11 +34,13 @@ func main() {
 	width := flag.Int("width", 1280, "целевая ширина в пикселях (0 = нативное)")
 	fps := flag.Int("fps", 30, "частота кадров")
 	bitrate := flag.String("bitrate", "3M", "целевой битрейт видео")
+	codec := flag.String("codec", "vp8", "кодек по умолчанию: vp8 | h264 (клиент может переопределить)")
 	test := flag.Bool("test", false, "использовать синтетический testsrc вместо экрана (отладка без TCC)")
 	flag.Parse()
 
 	opts := capture.Options{
 		ScreenIndex: *screen,
+		Codec:       capture.Codec(*codec),
 		Width:       *width,
 		FPS:         *fps,
 		Bitrate:     *bitrate,

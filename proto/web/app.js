@@ -47,13 +47,14 @@ document.addEventListener("contextmenu", (e) => {
   if (!inPanel(e.target)) e.preventDefault();
 });
 
-// Пустой конфиг: localhost, host-кандидаты, без ICE-серверов.
-const pc = new RTCPeerConnection();
-window.pc = pc; // для отладочной статистики из DevTools
+// pc и ws пересоздаются при смене кодека (новый трек = ренеготиация).
+let pc = null;
+let ws = null;
 
 // --- Настройки (модель для lil-gui) ---
 
 const settings = {
+  codec: "vp8", // vp8 (software) | h264 (VideoToolbox HW)
   width: 1280, // ширина картинки, px; 0 = нативное
   fps: 30,
   bitrate: 3000, // kbps
@@ -63,9 +64,8 @@ const settings = {
 };
 
 // Восстанавливаем сохранённые настройки до постройки панели, чтобы контролы
-// сразу показали их. hadSaved → после коннекта синхронизируем сервер под них.
+// сразу показали их. Стартовые значения уходят в query при коннекте.
 const STORAGE_KEY = "katana.settings";
-let hadSaved = false;
 try {
   const raw = localStorage.getItem(STORAGE_KEY);
   if (raw) {
@@ -74,7 +74,6 @@ try {
     for (const k of Object.keys(settings)) {
       if (typeof saved[k] === typeof settings[k]) settings[k] = saved[k];
     }
-    hadSaved = true;
   }
 } catch (err) {
   console.warn("settings load:", err);
@@ -98,6 +97,7 @@ const metrics = {
 
 // jitterBufferTarget — клиентский рычаг, применяется мгновенно (без ffmpeg).
 function applyBufferTarget() {
+  if (!pc) return;
   for (const r of pc.getReceivers()) {
     if (r.track && r.track.kind === "video" && "jitterBufferTarget" in r) {
       try {
@@ -131,7 +131,7 @@ function sendConfig() {
     // спрятать самим — примерно когда ffmpeg перезапустился и кадры пошли.
     clearTimeout(statusTimer);
     statusTimer = setTimeout(() => {
-      if (pc.connectionState === "connected") setStatus("live", true);
+      if (pc && pc.connectionState === "connected") setStatus("live", true);
     }, 1800);
   }, 250);
 }
@@ -159,6 +159,13 @@ window.addEventListener("keydown", (e) => {
 
 const cap = gui.addFolder("Capture · ffmpeg");
 cap.domElement.classList.add("f-capture");
+cap
+  .add(settings, "codec", { "VP8 · software": "vp8", "H264 · VideoToolbox (HW)": "h264" })
+  .name("Encoder")
+  .onChange(() => {
+    saveSettings();
+    connect(); // смена кодека = новый трек → переподключаемся
+  });
 cap
   .add(settings, "width", {
     "640 px": 640,
@@ -202,78 +209,105 @@ stat.add(metrics, "latency").name("Latency").disable().listen();
 
 // --- WebRTC ---
 
-pc.ontrack = (event) => {
-  applyBufferTarget(); // применить текущий выбор буфера к новому приёмнику
-  if (video.srcObject !== event.streams[0]) {
-    video.srcObject = event.streams[0];
-  }
-};
-
-let syncedOnce = false;
-pc.onconnectionstatechange = () => {
-  switch (pc.connectionState) {
-    case "connected":
-      setStatus("live", true);
-      // Сервер стартует со своих дефолтов. Если есть сохранённые настройки —
-      // один раз досылаем config, чтобы поток совпал с тем, что в панели.
-      if (hadSaved && !syncedOnce) {
-        syncedOnce = true;
-        sendConfig();
-      }
-      break;
-    case "connecting":
-      setStatus("connecting…");
-      break;
-    case "failed":
-      setStatus("connection failed");
-      break;
-    case "disconnected":
-      setStatus("reconnecting…");
-      break;
-  }
-};
-
-const proto = location.protocol === "https:" ? "wss" : "ws";
-const ws = new WebSocket(`${proto}://${location.host}/ws`);
-
-pc.onicecandidate = (event) => {
-  if (event.candidate) {
-    send({ type: "candidate", candidate: event.candidate.toJSON() });
-  }
-};
-
 function send(msg) {
-  if (ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg));
   }
 }
 
-ws.onopen = () => setStatus("waiting for offer…");
-ws.onclose = () => setStatus("server unavailable");
-ws.onerror = () => setStatus("WebSocket error");
+// Стартовые настройки уходят в query — сервер сразу запускает захват с ними
+// (без лишнего reconfig после коннекта). Кодек меняется только так.
+function connectURL() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const q = new URLSearchParams({
+    codec: settings.codec,
+    width: settings.width,
+    fps: settings.fps,
+    bitrateKbps: settings.bitrate,
+    threads: settings.threads,
+    dropLate: settings.dropLate,
+  });
+  return `${proto}://${location.host}/ws?${q}`;
+}
 
-ws.onmessage = async (event) => {
-  const msg = JSON.parse(event.data);
-  switch (msg.type) {
-    case "offer": {
-      await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      send({ type: "answer", sdp: answer.sdp });
-      break;
-    }
-    case "candidate": {
-      try {
-        await pc.addIceCandidate(msg.candidate);
-      } catch (err) {
-        console.error("addIceCandidate:", err);
-      }
-      break;
-    }
-    default:
-      console.warn("неизвестное сообщение:", msg.type);
+function disconnect() {
+  if (ws) {
+    ws.onclose = null; // не показывать "server unavailable" при намеренном закрытии
+    ws.close();
+    ws = null;
   }
-};
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+}
+
+function connect() {
+  disconnect();
+
+  // Пустой конфиг: localhost, host-кандидаты, без ICE-серверов.
+  pc = new RTCPeerConnection();
+  window.pc = pc; // для отладочной статистики из DevTools
+
+  pc.ontrack = (event) => {
+    applyBufferTarget(); // применить текущий выбор буфера к новому приёмнику
+    if (video.srcObject !== event.streams[0]) {
+      video.srcObject = event.streams[0];
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (!pc) return;
+    switch (pc.connectionState) {
+      case "connected":
+        setStatus("live", true);
+        break;
+      case "connecting":
+        setStatus("connecting…");
+        break;
+      case "failed":
+        setStatus("connection failed");
+        break;
+      case "disconnected":
+        setStatus("reconnecting…");
+        break;
+    }
+  };
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      send({ type: "candidate", candidate: event.candidate.toJSON() });
+    }
+  };
+
+  ws = new WebSocket(connectURL());
+  ws.onopen = () => setStatus("waiting for offer…");
+  ws.onclose = () => setStatus("server unavailable");
+  ws.onerror = () => setStatus("WebSocket error");
+
+  ws.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+    switch (msg.type) {
+      case "offer": {
+        await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ type: "answer", sdp: answer.sdp });
+        break;
+      }
+      case "candidate": {
+        try {
+          await pc.addIceCandidate(msg.candidate);
+        } catch (err) {
+          console.error("addIceCandidate:", err);
+        }
+        break;
+      }
+      default:
+        console.warn("неизвестное сообщение:", msg.type);
+    }
+  };
+}
 
 // --- Живые метрики ---
 // ВНИМАНИЕ: задержка здесь — только WebRTC-половина (буфер + декод + RTT).
@@ -284,7 +318,7 @@ ws.onmessage = async (event) => {
 // среднее за минуты почти не реагирует на изменение «здесь и сейчас».
 let prev = null;
 setInterval(async () => {
-  if (pc.connectionState !== "connected") {
+  if (!pc || pc.connectionState !== "connected") {
     metrics.res = metrics.fps = metrics.encoder = metrics.latency = "—";
     prev = null;
     return;
@@ -339,3 +373,6 @@ setInterval(async () => {
     prev = null;
   }
 }, 1000);
+
+// Старт.
+connect();
