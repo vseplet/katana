@@ -66,15 +66,12 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 				return
 			}
 			n++
-			if n == 1 || n%60 == 0 {
-				log.Printf("webrtc: wrote %d frames (last %d bytes)", n, len(frame))
+			if n == 1 {
+				log.Printf("webrtc: first frame on track") // подтверждаем, что кадры пошли
 			}
 		}
-		log.Printf("webrtc: frame loop ended after %d frames", n)
 	}()
 
-	log.Printf("webrtc: (re)configured: width=%d fps=%d bitrate=%s",
-		opts.Width, opts.FPS, opts.Bitrate)
 	return nil
 }
 

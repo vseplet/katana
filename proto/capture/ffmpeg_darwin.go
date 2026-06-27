@@ -25,25 +25,27 @@ func NewFFmpegDarwin() *FFmpegDarwin {
 
 // buildArgs собирает аргументы ffmpeg из опций. Вынесено отдельно для читаемости.
 func buildArgs(opts Options) []string {
-	var args []string
+	// Глушим вывод ffmpeg: без баннера, только ошибки, без строки прогресса —
+	// иначе stdout-лог сервера засоряется на каждый (пере)запуск.
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostats"}
 	if opts.TestSource {
 		// Синтетический движущийся источник — отладка без TCC.
 		w := opts.Width
 		if w <= 0 {
 			w = 1280
 		}
-		args = []string{
+		args = append(args,
 			"-re", // отдавать в реальном темпе, иначе lavfi сыплет кадры быстрее времени
 			"-f", "lavfi",
 			"-i", fmt.Sprintf("testsrc2=size=%dx720:rate=%d", w, opts.FPS),
-		}
+		)
 	} else {
-		args = []string{
+		args = append(args,
 			"-f", "avfoundation",
 			"-capture_cursor", "1",
 			"-framerate", fmt.Sprintf("%d", opts.FPS),
 			"-i", fmt.Sprintf("%d:", opts.ScreenIndex), // "<index>:" = экран, без аудио
-		}
+		)
 		// Даунскейл с Retina — иначе software-VP8 жжёт CPU.
 		if opts.Width > 0 {
 			args = append(args, "-vf", fmt.Sprintf("scale=%d:-2", opts.Width))
@@ -95,8 +97,6 @@ func (f *FFmpegDarwin) Start(ctx context.Context, opts Options) (<-chan []byte, 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start ffmpeg: %w", err)
 	}
-	log.Printf("capture started: screen=%d width=%d fps=%d bitrate=%s",
-		opts.ScreenIndex, opts.Width, opts.FPS, opts.Bitrate)
 
 	frames := make(chan []byte, 32)
 	go func() {
@@ -141,11 +141,17 @@ func (f *FFmpegDarwin) Start(ctx context.Context, opts Options) (<-chan []byte, 
 	return frames, nil
 }
 
-// logStderr построчно льёт stderr ffmpeg в стандартный лог.
+// logStderr построчно льёт stderr ffmpeg в стандартный лог. Шумные строки
+// рантайма (objc-предупреждения) и пустые отбрасываем — при -loglevel error
+// здесь остаются только реальные ошибки.
 func logStderr(r interface{ Read([]byte) (int, error) }) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
-		log.Printf("ffmpeg: %s", sc.Text())
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "objc[") {
+			continue
+		}
+		log.Printf("ffmpeg: %s", line)
 	}
 }

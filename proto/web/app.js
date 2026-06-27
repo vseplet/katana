@@ -54,6 +54,7 @@ function saveSettings() {
 const metrics = {
   res: "—",
   fps: "—",
+  encoder: "—",
   latency: "—",
 };
 
@@ -72,6 +73,7 @@ function applyBufferTarget() {
 
 // Дебаунс серверного reconfig: ffmpeg перезапускается, не дёргаем на каждый шаг.
 let cfgTimer = null;
+let statusTimer = null;
 function sendConfig() {
   saveSettings();
   clearTimeout(cfgTimer);
@@ -85,6 +87,12 @@ function sendConfig() {
       },
     });
     setStatus("applying settings…");
+    // Состояние соединения при reconfig не меняется, поэтому надпись надо
+    // спрятать самим — примерно когда ffmpeg перезапустился и кадры пошли.
+    clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => {
+      if (pc.connectionState === "connected") setStatus("live", true);
+    }, 1800);
   }, 250);
 }
 
@@ -93,20 +101,35 @@ function sendConfig() {
 const gui = new GUI({ title: "katana", width: 310 });
 window.gui = gui; // для отладки из DevTools
 
+// Фуллскрин: кнопка в панели, двойной клик по видео и клавиша F.
+// requestFullscreen требует жеста пользователя — все три варианта им являются.
+function toggleFullscreen() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    document.documentElement.requestFullscreen().catch((err) => console.warn("fullscreen:", err));
+  }
+}
+gui.add({ fullscreen: toggleFullscreen }, "fullscreen").name("Fullscreen ⤢");
+video.addEventListener("dblclick", toggleFullscreen);
+window.addEventListener("keydown", (e) => {
+  if (e.key === "f" || e.key === "F") toggleFullscreen();
+});
+
 const cap = gui.addFolder("Capture · ffmpeg");
 cap.domElement.classList.add("f-capture");
 cap
   .add(settings, "width", {
-    "640p": 640,
-    "960p": 960,
-    "1280p": 1280,
-    "1600p": 1600,
-    "1920p": 1920,
-    "2560p": 2560,
-    "4K (3840p)": 3840,
+    "640 px": 640,
+    "960 px": 960,
+    "1280 px": 1280,
+    "1600 px": 1600,
+    "1920 px": 1920,
+    "2560 px": 2560,
+    "3840 px · 4K": 3840,
     "native": 0,
   })
-  .name("Size")
+  .name("Width")
   .onChange(sendConfig);
 cap.add(settings, "fps", [15, 24, 30, 60]).name("Frame rate").onChange(sendConfig);
 cap
@@ -127,7 +150,8 @@ recv
 const stat = gui.addFolder("Stats");
 stat.domElement.classList.add("f-stats");
 stat.add(metrics, "res").name("Resolution").disable().listen();
-stat.add(metrics, "fps").name("FPS").disable().listen();
+stat.add(metrics, "fps").name("FPS (real/target)").disable().listen();
+stat.add(metrics, "encoder").name("Encoder").disable().listen();
 stat.add(metrics, "latency").name("Latency").disable().listen();
 
 // --- WebRTC ---
@@ -215,7 +239,7 @@ ws.onmessage = async (event) => {
 let prev = null;
 setInterval(async () => {
   if (pc.connectionState !== "connected") {
-    metrics.res = metrics.fps = metrics.latency = "—";
+    metrics.res = metrics.fps = metrics.encoder = metrics.latency = "—";
     prev = null;
     return;
   }
@@ -227,7 +251,21 @@ setInterval(async () => {
   });
 
   metrics.res = video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : "—";
-  metrics.fps = inbound && inbound.framesPerSecond ? `${Math.round(inbound.framesPerSecond)}` : "—";
+
+  // FPS: фактический против целевого. Энкодер перегружен, если реальный fps
+  // заметно ниже цели ИЛИ кадры приходят рывками (джиттер прихода больше
+  // интервала кадра) — софт-VP8 не успевает кодировать в realtime.
+  const targetFps = settings.fps;
+  const actualFps = inbound && inbound.framesPerSecond != null ? inbound.framesPerSecond : null;
+  metrics.fps = actualFps != null ? `${Math.round(actualFps)} / ${targetFps}` : "—";
+
+  const jitterMs = inbound && inbound.jitter != null ? inbound.jitter * 1000 : null;
+  if (actualFps == null || jitterMs == null) {
+    metrics.encoder = "—";
+  } else {
+    const overloaded = actualFps < targetFps * 0.9 || jitterMs > 1000 / targetFps;
+    metrics.encoder = `${overloaded ? "⚠ overload" : "ok"} · jitter ${Math.round(jitterMs)} ms`;
+  }
 
   if (inbound) {
     const cur = {
