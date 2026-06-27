@@ -411,11 +411,17 @@ function connect() {
 // Считаем МГНОВЕННУЮ задержку буфера/декода — дельты между замерами, а не
 // накопительное среднее за сессию. Иначе смена джиттер-буфера не видна:
 // среднее за минуты почти не реагирует на изменение «здесь и сейчас».
+// Watchdog зависания видео: сколько секунд подряд framesDecoded не растёт.
+const WD_STALL_LIMIT = 3;
+let wd = { last: -1, stall: 0 };
+
 let prev = null;
 setInterval(async () => {
   if (!pc || pc.connectionState !== "connected") {
     metrics.res = metrics.fps = metrics.encoder = metrics.latency = "—";
     prev = null;
+    wd.last = -1;
+    wd.stall = 0;
     return;
   }
   let inbound = null, pair = null, remote = null;
@@ -424,6 +430,25 @@ setInterval(async () => {
     if (r.type === "candidate-pair" && r.nominated) pair = r;
     if (r.type === "remote-inbound-rtp" && r.kind === "video") remote = r;
   });
+
+  // Watchdog зависания видео: декодированные кадры перестали расти при живом
+  // соединении (на статике они всё равно растут — тикер повторяет кадр). Если
+  // встало на несколько секунд — бесшовно переподключаемся (как ручной reload).
+  if (inbound && inbound.framesDecoded != null && video.videoWidth > 0) {
+    if (inbound.framesDecoded === wd.last) {
+      if (++wd.stall >= WD_STALL_LIMIT) {
+        console.warn("video frozen → reconnecting");
+        setStatus("video stalled, reconnecting…");
+        wd.last = -1;
+        wd.stall = 0;
+        connect();
+        return;
+      }
+    } else {
+      wd.stall = 0;
+      wd.last = inbound.framesDecoded;
+    }
+  }
 
   metrics.res = video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : "—";
 
