@@ -23,9 +23,10 @@ type streamer struct {
 	track  *webrtc.TrackLocalStaticSample // видео
 	audio  *webrtc.TrackLocalStaticSample // Opus, nil если звук выключен
 
-	mu     sync.Mutex
-	cancel context.CancelFunc // останавливает текущий захват
-	done   chan struct{}      // закрывается, когда писатели кадров вышли
+	mu        sync.Mutex
+	cancel    context.CancelFunc // останавливает текущий захват
+	done      chan struct{}      // закрывается, когда писатели кадров вышли
+	setCursor func(bool)         // живое переключение курсора хоста (без рестарта)
 }
 
 func newStreamer(parent context.Context, enc capture.CaptureEncoder, track, audio *webrtc.TrackLocalStaticSample) *streamer {
@@ -56,6 +57,7 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 	done := make(chan struct{})
 	s.cancel = cancel
 	s.done = done
+	s.setCursor = stream.SetCursor
 
 	var wg sync.WaitGroup
 
@@ -106,6 +108,17 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 
 	go func() { wg.Wait(); close(done) }()
 	return nil
+}
+
+// updateCursor переключает видимость курсора хоста НА ЛЕТУ, без перезапуска
+// захвата (иначе каждый тоггл режима управления = ~1с обрыв видео).
+func (s *streamer) updateCursor(show bool) {
+	s.mu.Lock()
+	fn := s.setCursor
+	s.mu.Unlock()
+	if fn != nil {
+		fn(show)
+	}
 }
 
 // stop останавливает захват.

@@ -393,6 +393,11 @@ func readLoop(ctx context.Context, s *session) {
 			if msg.Scroll != nil {
 				scrollMouse(msg.Scroll.Dx, msg.Scroll.Dy)
 			}
+		case "cursor":
+			// Живое переключение курсора хоста — без перезапуска захвата.
+			if msg.Config != nil && msg.Config.Cursor != nil {
+				s.str.updateCursor(*msg.Config.Cursor)
+			}
 		default:
 			log.Printf("signaling: unknown message type %q", msg.Type)
 		}

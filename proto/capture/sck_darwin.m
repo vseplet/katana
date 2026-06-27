@@ -213,6 +213,7 @@ char *sck_list_sources(void) {
 
 static NSMutableDictionary<NSNumber *, SCStream *> *gStreams;
 static NSMutableDictionary<NSNumber *, KatanaOutput *> *gOutputs;
+static NSMutableDictionary<NSNumber *, SCStreamConfiguration *> *gConfigs;
 static dispatch_queue_t gQueue;
 static dispatch_queue_t gAudioQueue;
 
@@ -325,6 +326,7 @@ int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cu
 		if (!gStreams) {
 			gStreams = [NSMutableDictionary dictionary];
 			gOutputs = [NSMutableDictionary dictionary];
+			gConfigs = [NSMutableDictionary dictionary];
 			gQueue = dispatch_queue_create("katana.sck.video", DISPATCH_QUEUE_SERIAL);
 			gAudioQueue = dispatch_queue_create("katana.sck.audio", DISPATCH_QUEUE_SERIAL);
 		}
@@ -359,6 +361,23 @@ int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cu
 
 		gStreams[@(handle)] = stream;
 		gOutputs[@(handle)] = out;
+		gConfigs[@(handle)] = cfg;
+		return 0;
+	}
+}
+
+// sck_set_cursor меняет видимость курсора хоста в захвате НА ЛЕТУ
+// (updateConfiguration, без перезапуска потока). Возвращает 0 при успехе.
+int sck_set_cursor(int handle, int show) {
+	@autoreleasepool {
+		SCStream *stream = gStreams[@(handle)];
+		SCStreamConfiguration *cfg = gConfigs[@(handle)];
+		if (!stream || !cfg) {
+			return 1;
+		}
+		cfg.showsCursor = show ? YES : NO;
+		[stream updateConfiguration:cfg completionHandler:^(NSError *e) {
+		}];
 		return 0;
 	}
 }
@@ -434,5 +453,6 @@ void sck_stop(int handle) {
 		dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
 		[gStreams removeObjectForKey:@(handle)];
 		[gOutputs removeObjectForKey:@(handle)];
+		[gConfigs removeObjectForKey:@(handle)];
 	}
 }

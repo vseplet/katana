@@ -53,6 +53,9 @@ type Options struct {
 type Stream struct {
 	Video <-chan []byte
 	Audio <-chan []byte
+	// SetCursor меняет видимость курсора хоста в захвате НА ЛЕТУ (без рестарта).
+	// nil для источников, где это не поддерживается (avfoundation/тест).
+	SetCursor func(show bool)
 }
 
 // CaptureEncoder запускает захват+энкод и отдаёт каналы кадров.

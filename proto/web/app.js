@@ -142,6 +142,20 @@ function applyAudioPlayback() {
   video.muted = settings.muted;
 }
 
+// Гарантируем проигрывание. Если autoplay со звуком заблокирован браузером
+// (muted=false), форсим muted и пробуем снова — немой автоплей всегда разрешён,
+// так видео точно появляется без жеста (раньше помогали reload/фуллскрин).
+function tryPlay() {
+  if (!video.srcObject) return;
+  const p = video.play();
+  if (p && p.catch) {
+    p.catch(() => {
+      video.muted = true;
+      video.play().catch(() => {});
+    });
+  }
+}
+
 // jitterBufferTarget + playoutDelayHint — клиентские рычаги задержки приёма.
 // Применяем к ОБОИМ трекам: при наличии аудио Chrome синхронизирует A/V и
 // подтягивает видео под звук, раздувая видео-буфер; playoutDelayHint=0 просит
@@ -396,6 +410,7 @@ function connect() {
       video.srcObject = event.streams[0];
     }
     applyAudioPlayback(); // громкость/mute
+    tryPlay(); // явно запускаем — не полагаемся на autoplay
   };
 
   pc.onconnectionstatechange = () => {
@@ -408,10 +423,15 @@ function connect() {
         setStatus("connecting…");
         break;
       case "failed":
-        setStatus("connection failed");
+        // Сеть разорвалась и ICE не восстановился сам (бывает на Tailscale) —
+        // переподключаемся. Небольшая задержка, чтобы не молотить.
+        setStatus("connection failed, reconnecting…");
+        setTimeout(() => {
+          if (pc && pc.connectionState === "failed") connect();
+        }, 1000);
         break;
       case "disconnected":
-        setStatus("reconnecting…");
+        setStatus("reconnecting…"); // ICE часто восстанавливается сам
         break;
     }
   };
@@ -471,6 +491,10 @@ setInterval(async () => {
     wd.stall = 0;
     return;
   }
+  // Самолечение: соединение живо, но <video> на паузе (autoplay не стартовал) —
+  // пробуем запустить (немой fallback внутри). Лечит «нет видео при старте».
+  if (video.srcObject && video.paused) tryPlay();
+
   let inbound = null, pair = null, remote = null;
   (await pc.getStats()).forEach((r) => {
     if (r.type === "inbound-rtp" && r.kind === "video") inbound = r;
@@ -683,7 +707,8 @@ function setControl(on) {
   video.style.cursor = on ? "crosshair" : "default";
   updateAppsVisibility(); // ленту приложений прячем в режиме управления
   saveSettings();
-  sendConfig(); // showsCursor: при управлении прячем курсор хоста
+  // Курсор хоста меняем на лету (без перезапуска захвата → без обрыва видео).
+  send({ type: "cursor", config: { cursor: !on } });
 }
 
 // --- Лента открытых приложений ---

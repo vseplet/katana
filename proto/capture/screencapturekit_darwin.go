@@ -12,6 +12,7 @@ int sck_source_size(int kind, unsigned int sid, int *outW, int *outH);
 int sck_source_rect(int kind, unsigned int sid, double *x, double *y, double *w, double *h);
 int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cursor);
 void sck_stop(int handle);
+int sck_set_cursor(int handle, int show);
 void inject_scroll(int dx, int dy);
 int activate_app(int pid);
 */
@@ -133,6 +134,8 @@ func b2i(b bool) int {
 
 func sckStop(handle int) { C.sck_stop(C.int(handle)) }
 
+func sckSetCursor(handle int, show bool) { C.sck_set_cursor(C.int(handle), C.int(b2i(show))) }
+
 // startSCK захватывает дисплей/окно/приложение через ScreenCaptureKit:
 // нативный поток шлёт BGRA-кадры в stdin видео-ffmpeg (скейл/энкод), при
 // opts.Audio — ещё и PCM в stdin аудио-ffmpeg (Opus). Читаем оба stdout.
@@ -244,7 +247,11 @@ func startSCK(ctx context.Context, opts Options) (*Stream, error) {
 		}
 	}()
 
-	return &Stream{Video: frames, Audio: audioCh}, nil
+	return &Stream{
+		Video:     frames,
+		Audio:     audioCh,
+		SetCursor: func(show bool) { sckSetCursor(handle, show) },
+	}, nil
 }
 
 // startAudioEncoder поднимает ffmpeg PCM(f32le 48k стерео)→Opus(ogg), читает
