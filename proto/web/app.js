@@ -55,6 +55,7 @@ let ws = null;
 
 const settings = {
   codec: "vp8", // vp8 (software) | h264 (VideoToolbox HW)
+  screen: -1, // индекс монитора avfoundation; -1 = серверный дефолт
   width: 1280, // ширина картинки, px; 0 = нативное
   fps: 30,
   bitrate: 3000, // kbps
@@ -116,16 +117,15 @@ function sendConfig() {
   saveSettings();
   clearTimeout(cfgTimer);
   cfgTimer = setTimeout(() => {
-    send({
-      type: "config",
-      config: {
-        width: settings.width,
-        fps: settings.fps,
-        bitrateKbps: settings.bitrate,
-        threads: settings.threads,
-        dropLate: settings.dropLate,
-      },
-    });
+    const config = {
+      width: settings.width,
+      fps: settings.fps,
+      bitrateKbps: settings.bitrate,
+      threads: settings.threads,
+      dropLate: settings.dropLate,
+    };
+    if (settings.screen >= 0) config.screen = settings.screen;
+    send({ type: "config", config });
     setStatus("applying settings…");
     // Состояние соединения при reconfig не меняется, поэтому надпись надо
     // спрятать самим — примерно когда ffmpeg перезапустился и кадры пошли.
@@ -279,6 +279,7 @@ function connectURL() {
     threads: settings.threads,
     dropLate: settings.dropLate,
   });
+  if (settings.screen >= 0) q.set("screen", settings.screen);
   return `${proto}://${location.host}/ws?${q}`;
 }
 
@@ -426,5 +427,37 @@ setInterval(async () => {
   }
 }, 1000);
 
+// Список мониторов с сервера → дропдаун Display. Делаем до connect(), чтобы
+// первый же захват пошёл с нужного экрана (без лишнего reconfig).
+async function initDisplays() {
+  let data = { default: -1, screens: [] };
+  try {
+    data = await (await fetch("/api/displays")).json();
+  } catch (err) {
+    console.warn("displays:", err);
+  }
+  const screens = data.screens || [];
+
+  // выбираем монитор: сохранённый (если валиден) → серверный дефолт → первый
+  const valid = screens.some((s) => s.index === settings.screen);
+  if (!valid) {
+    settings.screen = data.default >= 0 ? data.default : screens.length ? screens[0].index : -1;
+  }
+
+  const options = {};
+  if (screens.length) {
+    for (const s of screens) options[s.name] = s.index;
+  } else {
+    options["(no screens)"] = -1;
+  }
+  const dispCtrl = cap.add(settings, "screen", options).name("Display").onChange(sendConfig);
+  // ставим Display сразу после Encoder (перед Width) — выбор монитора важнее.
+  const widthEl = cap.controllers.find((c) => c.property === "width")?.domElement;
+  if (widthEl) cap.$children.insertBefore(dispCtrl.domElement, widthEl);
+}
+
 // Старт.
-connect();
+(async () => {
+  await initDisplays();
+  connect();
+})();

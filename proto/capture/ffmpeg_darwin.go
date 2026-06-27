@@ -2,16 +2,72 @@ package capture
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/pion/webrtc/v4/pkg/media/h264reader"
 	"github.com/pion/webrtc/v4/pkg/media/ivfreader"
 )
+
+// Screen — устройство захвата экрана avfoundation.
+type Screen struct {
+	Index int    `json:"index"`
+	Name  string `json:"name"`
+}
+
+var deviceLineRe = regexp.MustCompile(`\[(\d+)\]\s+(.+)$`)
+
+// ListScreens перечисляет экраны (avfoundation video devices типа
+// "Capture screen N"). Индексы плавают между конфигурациями мониторов.
+func ListScreens() []Screen {
+	// ffmpeg печатает список в stderr и завершается с ошибкой (нет входа) —
+	// это ожидаемо, нас интересует только вывод.
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-f", "avfoundation",
+		"-list_devices", "true", "-i", "")
+	var buf bytes.Buffer
+	cmd.Stderr = &buf
+	_ = cmd.Run()
+	return parseScreens(buf.String())
+}
+
+func parseScreens(out string) []Screen {
+	var screens []Screen
+	inVideo := false
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.Contains(line, "AVFoundation video devices:"):
+			inVideo = true
+			continue
+		case strings.Contains(line, "AVFoundation audio devices:"):
+			inVideo = false
+			continue
+		}
+		if !inVideo {
+			continue
+		}
+		m := deviceLineRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		name := strings.TrimSpace(m[2])
+		if !strings.Contains(strings.ToLower(name), "capture screen") {
+			continue // только экраны, не камеры
+		}
+		idx, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
+		screens = append(screens, Screen{Index: idx, Name: name})
+	}
+	return screens
+}
 
 // FFmpegDarwin реализует CaptureEncoder через ffmpeg + avfoundation на macOS.
 //

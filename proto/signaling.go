@@ -29,6 +29,7 @@ type signalMessage struct {
 // configMsg — настройки захвата, присылаемые браузером. Указатели, чтобы
 // отличать «не задано» от нуля; незаданные поля сохраняют текущее значение.
 type configMsg struct {
+	Screen      *int  `json:"screen,omitempty"`
 	Width       *int  `json:"width,omitempty"`
 	FPS         *int  `json:"fps,omitempty"`
 	BitrateKbps *int  `json:"bitrateKbps,omitempty"`
@@ -41,6 +42,9 @@ type configMsg struct {
 // произвольный текст в аргументы ffmpeg.
 func (c *configMsg) apply(base capture.Options) capture.Options {
 	o := base
+	if c.Screen != nil {
+		o.ScreenIndex = clamp(*c.Screen, 0, 64)
+	}
 	if c.Width != nil {
 		if *c.Width == 0 {
 			o.Width = 0 // нативное разрешение (без даунскейла)
@@ -79,6 +83,9 @@ func clamp(v, lo, hi int) int {
 // config-сообщения уже в сессии.
 func optsFromQuery(base capture.Options, q url.Values) capture.Options {
 	var c configMsg
+	if v, ok := queryInt(q, "screen"); ok {
+		c.Screen = &v
+	}
 	if v, ok := queryInt(q, "width"); ok {
 		c.Width = &v
 	}

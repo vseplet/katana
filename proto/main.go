@@ -65,6 +65,7 @@ func main() {
 	mux.Handle("/", http.FileServer(http.FS(static)))
 	mux.HandleFunc("/ws", signalingHandler(ctx, enc, opts))
 	registerPermissionRoutes(mux)
+	registerDisplayRoutes(mux, opts.ScreenIndex)
 
 	// Запрашиваем запись экрана при старте (показывает системный диалог, если
 	// решение ещё не принято). Без разрешения захват вернёт чёрный кадр (§7 ТЗ).
