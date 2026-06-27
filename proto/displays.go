@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/vseplet/katana/proto/capture"
 )
@@ -24,5 +25,19 @@ func registerDisplayRoutes(mux *http.ServeMux, defaultScreen int) {
 			return
 		}
 		writeJSON(w, sources)
+	})
+
+	// Вывести приложение (по pid) на передний план на хосте.
+	mux.HandleFunc("/api/activate", func(w http.ResponseWriter, r *http.Request) {
+		pid, err := strconv.Atoi(r.URL.Query().Get("pid"))
+		if err != nil {
+			http.Error(w, "bad pid", http.StatusBadRequest)
+			return
+		}
+		if err := capture.ActivateApp(pid); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 }

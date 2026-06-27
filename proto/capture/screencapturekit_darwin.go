@@ -12,6 +12,8 @@ int sck_source_size(int kind, unsigned int sid, int *outW, int *outH);
 int sck_source_rect(int kind, unsigned int sid, double *x, double *y, double *w, double *h);
 int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cursor);
 void sck_stop(int handle);
+void inject_scroll(int dx, int dy);
+int activate_app(int pid);
 */
 import "C"
 
@@ -343,6 +345,18 @@ type Sources struct {
 // Rect — глобальный прямоугольник источника (точки, top-left).
 type Rect struct {
 	X, Y, W, H float64
+}
+
+// InjectScroll постит пиксельно-точный скролл (как трекпад): dx — горизонталь,
+// dy — вертикаль, в пикселях.
+func InjectScroll(dx, dy int) { C.inject_scroll(C.int(dx), C.int(dy)) }
+
+// ActivateApp выводит приложение (по pid) на передний план на хосте.
+func ActivateApp(pid int) error {
+	if rc := C.activate_app(C.int(pid)); rc != 0 {
+		return fmt.Errorf("activate_app rc=%d", int(rc))
+	}
+	return nil
 }
 
 // SourceRect возвращает положение/размер источника на экране — для маппинга

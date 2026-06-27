@@ -73,13 +73,26 @@ char *sck_list_sources(void) {
 				}
 
 				NSMutableArray *apps = [NSMutableArray array];
+				NSMutableSet *seenApps = [NSMutableSet set];
 				for (SCRunningApplication *a in content.applications) {
 					NSString *name = a.applicationName ?: @"";
 					if (name.length == 0) {
 						continue;
 					}
+					// Только «обычные» приложения (есть в доке) — отсекаем Dock,
+					// Control Center, Wallpaper, хелперы и т.п. Плюс дедуп по pid.
+					NSRunningApplication *ra =
+						[NSRunningApplication runningApplicationWithProcessIdentifier:a.processID];
+					if (ra && ra.activationPolicy != NSApplicationActivationPolicyRegular) {
+						continue;
+					}
+					NSNumber *pid = @(a.processID);
+					if ([seenApps containsObject:pid]) {
+						continue;
+					}
+					[seenApps addObject:pid];
 					[apps addObject:@{
-						@"pid": @(a.processID),
+						@"pid": pid,
 						@"bundleId": a.bundleIdentifier ?: @"",
 						@"name": name,
 					}];
@@ -383,6 +396,29 @@ int sck_source_rect(int kind, unsigned int sid, double *x, double *y, double *w,
 		*w = r.size.width;
 		*h = r.size.height;
 		return 0;
+	}
+}
+
+// inject_scroll постит пиксельно-точный скролл (как трекпад): dy — вертикаль,
+// dx — горизонталь, в пикселях. Требует Accessibility.
+void inject_scroll(int dx, int dy) {
+	CGEventRef ev = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitPixel, 2, dy, dx);
+	if (ev) {
+		CGEventPost(kCGHIDEventTap, ev);
+		CFRelease(ev);
+	}
+}
+
+// activate_app выводит приложение (по pid) на передний план на хосте.
+int activate_app(int pid) {
+	@autoreleasepool {
+		NSRunningApplication *app =
+			[NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
+		if (!app) {
+			return 1;
+		}
+		BOOL ok = [app activateWithOptions:NSApplicationActivateAllWindows];
+		return ok ? 0 : 2;
 	}
 }
 

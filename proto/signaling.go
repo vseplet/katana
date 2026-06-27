@@ -259,6 +259,7 @@ type session struct {
 	rect  capture.Rect // глобальный прямоугольник источника (для маппинга мыши)
 
 	btnDown string // зажатая кнопка мыши ("" если нет) — для drag; только из readLoop
+	dragged bool   // были ли move с зажатой кнопкой (отличить drag от чистого клика)
 }
 
 // setSource обновляет кэш геометрии источника (для координат мыши). Вызов SCK
@@ -293,17 +294,21 @@ func (s *session) handleMouse(m *mouseMsg) {
 		moveMouse(x, y)
 		mouseToggle(button, true)
 		s.btnDown = button
+		s.dragged = false
 	case "up":
-		if s.btnDown != "" {
-			dragMouse(x, y, s.btnDown) // довести drag до точки отпускания
-		} else {
-			moveMouse(x, y)
+		// dragMouse шлём ТОЛЬКО если реально был drag (приходили move). Иначе
+		// (чистый клик) — просто отпускаем: без события Dragged, чтобы тап не
+		// принимался за перетаскивание/выделение.
+		if s.btnDown != "" && s.dragged {
+			dragMouse(x, y, s.btnDown)
 		}
 		mouseToggle(button, false)
 		s.btnDown = ""
+		s.dragged = false
 	default: // move
 		if s.btnDown != "" {
 			dragMouse(x, y, s.btnDown) // зажата кнопка → drag-событие
+			s.dragged = true
 		} else {
 			moveMouse(x, y)
 		}

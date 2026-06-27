@@ -67,7 +67,7 @@ const settings = {
   muted: true, // mute воспроизведения (клиент; true для автоплея)
   control: false, // управлять мышью хоста (отправлять события)
   // тюнинг ввода (клиентский):
-  scrollDiv: 6, // px на 1 «клик» скролла; меньше = чувствительнее
+  scrollSpeed: 1, // множитель скролла; 1 = пиксель-в-пиксель (1:1, как трекпад)
   invertScrollX: false,
   invertScrollY: false,
   dragDeadzone: 8, // px порога, после которого тап превращается в drag
@@ -324,7 +324,7 @@ recv.add(settings, "muted").name("Mute").onChange(() => {
 // Тюнинг ввода (клиентский) — чтобы подобрать дефолты по ощущениям.
 const inp = gui.addFolder("Input · tuning");
 inp.domElement.classList.add("f-input");
-inp.add(settings, "scrollDiv", 1, 30, 1).name("Scroll px/click").onChange(saveSettings);
+inp.add(settings, "scrollSpeed", 0.2, 3, 0.1).name("Scroll speed").onChange(saveSettings);
 inp.add(settings, "invertScrollX").name("Invert scroll X").onChange(saveSettings);
 inp.add(settings, "invertScrollY").name("Invert scroll Y").onChange(saveSettings);
 inp.add(settings, "dragDeadzone", 0, 30, 1).name("Drag deadzone px").onChange(saveSettings);
@@ -627,17 +627,18 @@ function ctrlUp(clientX, clientY, button) {
   press = null;
 }
 
-// Скролл: накапливаем пиксели и шлём целыми «кликами» колеса.
+// Скролл пиксель-в-пиксель (как трекпад): шлём ровно столько пикселей, на
+// сколько свайпнули × scrollSpeed. Дробный остаток копим, чтобы не терять.
 let scrollAcc = { x: 0, y: 0 };
 function sendScroll(dxPx, dyPx) {
-  const div = Math.max(1, settings.scrollDiv);
-  scrollAcc.x += dxPx;
-  scrollAcc.y += dyPx;
-  let dx = Math.trunc(scrollAcc.x / div);
-  let dy = Math.trunc(scrollAcc.y / div);
+  const s = settings.scrollSpeed;
+  scrollAcc.x += dxPx * s;
+  scrollAcc.y += dyPx * s;
+  let dx = Math.trunc(scrollAcc.x);
+  let dy = Math.trunc(scrollAcc.y);
   if (!dx && !dy) return;
-  scrollAcc.x -= dx * div;
-  scrollAcc.y -= dy * div;
+  scrollAcc.x -= dx;
+  scrollAcc.y -= dy;
   if (settings.invertScrollX) dx = -dx;
   if (settings.invertScrollY) dy = -dy;
   send({ type: "scroll", scroll: { dx, dy } });
@@ -680,9 +681,35 @@ function setControl(on) {
   settings.control = on;
   btnControl.classList.toggle("active", on);
   video.style.cursor = on ? "crosshair" : "default";
+  updateAppsVisibility(); // ленту приложений прячем в режиме управления
   saveSettings();
   sendConfig(); // showsCursor: при управлении прячем курсор хоста
 }
+
+// --- Лента открытых приложений ---
+const appsEl = document.getElementById("apps");
+async function refreshApps() {
+  if (settings.control) return; // в режиме управления лента скрыта
+  try {
+    const src = await fetch("/api/sources").then((r) => r.json());
+    appsEl.innerHTML = "";
+    for (const a of src.apps || []) {
+      const b = document.createElement("button");
+      b.textContent = a.name;
+      b.addEventListener("click", () => {
+        fetch("/api/activate?pid=" + a.pid, { method: "POST" }).catch(() => {});
+      });
+      appsEl.appendChild(b);
+    }
+  } catch (err) {
+    console.warn("apps:", err);
+  }
+}
+function updateAppsVisibility() {
+  appsEl.classList.toggle("hidden", settings.control);
+  if (!settings.control) refreshApps();
+}
+setInterval(refreshApps, 5000); // refreshApps сам не делает ничего в режиме управления
 
 // --- Ввод: в режиме control → на хост, иначе → навигация вьюпорта ---
 let lastMove = 0;
@@ -823,6 +850,7 @@ document.getElementById("btn-reset").addEventListener("click", resetView);
 btnControl.addEventListener("click", () => setControl(!settings.control));
 btnControl.classList.toggle("active", settings.control);
 video.style.cursor = settings.control ? "crosshair" : "default";
+updateAppsVisibility(); // показать ленту приложений (если не режим управления)
 
 // Старт.
 (async () => {

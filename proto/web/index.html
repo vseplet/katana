@@ -52,6 +52,42 @@
       transition: opacity 0.4s;
     }
 
+    /* Лента открытых приложений (вверху). Скроллится пальцем; тап = на передний
+       план на хосте. Прячется в режиме управления. */
+    #apps {
+      position: fixed;
+      /* в одном ряду с HUD (внизу слева), справа от его трёх кнопок */
+      left: calc(env(safe-area-inset-left) + 184px);
+      right: 12px;
+      bottom: max(12px, env(safe-area-inset-bottom));
+      height: 48px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      overflow-x: auto;
+      overflow-y: hidden;
+      white-space: nowrap;
+      z-index: 9;
+      touch-action: pan-x; /* разрешаем горизонтальный скролл ленты */
+      scrollbar-width: none;
+    }
+    #apps::-webkit-scrollbar { display: none; }
+    #apps.hidden { display: none; }
+    #apps button {
+      flex: 0 0 auto;
+      padding: 7px 14px;
+      font: 13px -apple-system, system-ui, sans-serif;
+      color: #eee;
+      background: rgba(30, 30, 34, 0.82);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 16px;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      touch-action: manipulation;
+    }
+    #apps button:active { background: rgba(60, 60, 66, 0.9); }
+
     /* HUD-кластер в левом нижнем углу: управление / фуллскрин / reset view. */
     #hud {
       position: fixed;
@@ -134,6 +170,7 @@
 <body>
   <video id="screen" autoplay playsinline muted></video>
   <div id="status">connecting…</div>
+  <div id="apps"></div>
   <div id="hud">
     <button id="btn-control" title="Управление мышью (вкл/выкл)" aria-label="control">
       <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16">
