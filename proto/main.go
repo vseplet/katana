@@ -21,6 +21,7 @@ import (
 	"syscall"
 
 	"github.com/vseplet/katana/proto/capture"
+	"github.com/vseplet/katana/proto/permissions"
 )
 
 //go:embed web
@@ -63,6 +64,19 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(static)))
 	mux.HandleFunc("/ws", signalingHandler(ctx, enc, opts))
+	registerPermissionRoutes(mux)
+
+	// Запрашиваем запись экрана при старте (показывает системный диалог, если
+	// решение ещё не принято). Без разрешения захват вернёт чёрный кадр (§7 ТЗ).
+	// ВАЖНО: для bare-CLI macOS привязывает доступ к «ответственному» приложению —
+	// терминалу (Ghostty/Terminal/iTerm), а не к самому katana (см. README).
+	if !*test {
+		if permissions.RequestScreenCapture() {
+			log.Printf("permissions: запись экрана разрешена")
+		} else {
+			log.Printf("permissions: нет доступа к записи экрана — выдай в диалоге/System Settings и перезапусти терминал")
+		}
+	}
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
 

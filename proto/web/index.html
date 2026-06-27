@@ -64,6 +64,33 @@
       border-left: 4px solid #e0a23b;
       background: linear-gradient(90deg, rgba(224, 162, 59, 0.18), transparent 60%);
     }
+    .lil-gui .f-perms > .title {
+      border-left: 4px solid #c061cb;
+      background: linear-gradient(90deg, rgba(192, 97, 203, 0.18), transparent 60%);
+    }
+
+    /* Пара кнопок в один ряд внутри панели. */
+    .lil-gui .btn-row {
+      display: flex;
+      gap: 4px;
+      padding: 2px 6px 4px;
+    }
+    .lil-gui .btn-row button {
+      flex: 1;
+      padding: 5px 6px;
+      font: inherit;
+      color: #ddd;
+      background: #2a2a2e;
+      border: 1px solid #454549;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    .lil-gui .btn-row button:hover {
+      background: #35353b;
+    }
+    .lil-gui .btn-row button:active {
+      background: #1f1f23;
+    }
   </style>
 </head>
 <body>

@@ -157,6 +157,58 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "f" || e.key === "F") toggleFullscreen();
 });
 
+// --- Разрешения macOS ---
+const perms = { screen: "—", control: "—" };
+
+async function refreshPerms() {
+  try {
+    const j = await (await fetch("/api/permissions")).json();
+    perms.screen = j.screen ? "✓ granted" : "✗ denied";
+    perms.control = j.accessibility ? "✓ granted" : "✗ denied";
+  } catch (err) {
+    console.warn("permissions:", err);
+  }
+}
+async function requestPerm(path) {
+  try {
+    await fetch("/api/permissions/" + path, { method: "POST" });
+  } catch (err) {
+    console.warn("permissions:", err);
+  }
+  await refreshPerms();
+}
+function openPermSettings(target) {
+  fetch("/api/permissions/open?target=" + target, { method: "POST" }).catch(() => {});
+}
+
+// Кладёт пару кнопок в один ряд (lil-gui по умолчанию стакает вертикально).
+function buttonRow(folder, buttons) {
+  const row = document.createElement("div");
+  row.className = "btn-row";
+  for (const b of buttons) {
+    const el = document.createElement("button");
+    el.textContent = b.label;
+    el.addEventListener("click", b.onClick);
+    row.appendChild(el);
+  }
+  folder.$children.appendChild(row);
+}
+
+const perm = gui.addFolder("Permissions · macOS");
+perm.domElement.classList.add("f-perms");
+perm.add(perms, "screen").name("Screen recording").disable().listen();
+buttonRow(perm, [
+  { label: "Request", onClick: () => requestPerm("screen") },
+  { label: "Open settings", onClick: () => openPermSettings("screen") },
+]);
+perm.add(perms, "control").name("Control · a11y").disable().listen();
+buttonRow(perm, [
+  { label: "Request", onClick: () => requestPerm("accessibility") },
+  { label: "Open settings", onClick: () => openPermSettings("accessibility") },
+]);
+refreshPerms();
+setInterval(refreshPerms, 5000);
+
 const cap = gui.addFolder("Capture · ffmpeg");
 cap.domElement.classList.add("f-capture");
 cap
