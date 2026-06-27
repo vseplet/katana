@@ -140,6 +140,7 @@ function sendConfig() {
       bitrateKbps: settings.bitrate,
       threads: settings.threads,
       dropLate: settings.dropLate,
+      cursor: !settings.control, // при управлении прячем курсор хоста в захвате
       ...sourceParams(),
     };
     send({ type: "config", config });
@@ -282,7 +283,10 @@ recv.add(settings, "muted").name("Mute").onChange(() => {
   applyAudioPlayback();
   saveSettings();
 });
-recv.add(settings, "control").name("Control (mouse)").onChange(saveSettings);
+recv.add(settings, "control").name("Control (mouse)").onChange(() => {
+  saveSettings();
+  sendConfig(); // обновить showsCursor на сервере (прятать курсор хоста при управлении)
+});
 
 const stat = gui.addFolder("Stats");
 stat.domElement.classList.add("f-stats");
@@ -311,6 +315,7 @@ function connectURL() {
     threads: settings.threads,
     dropLate: settings.dropLate,
     audio: settings.audio,
+    cursor: !settings.control,
     ...sourceParams(),
   });
   return `${proto}://${location.host}/ws?${q}`;
@@ -511,10 +516,12 @@ function videoCoords(ev) {
   return { x: nx, y: ny };
 }
 
+let lastCoords = null;
 function sendMouse(ev, action) {
   if (!settings.control) return;
-  const c = videoCoords(ev);
+  const c = videoCoords(ev) || (action === "up" ? lastCoords : null);
   if (!c) return;
+  lastCoords = c;
   send({ type: "mouse", mouse: { x: c.x, y: c.y, action, button: ev.button === 2 ? "right" : "left" } });
 }
 
@@ -529,7 +536,9 @@ video.addEventListener("mousedown", (ev) => {
   if (settings.control) ev.preventDefault();
   sendMouse(ev, "down");
 });
-video.addEventListener("mouseup", (ev) => sendMouse(ev, "up"));
+// mouseup ловим на window: отпускание долетит, даже если курсор ушёл за видео
+// (иначе drag «залипнет» с зажатой кнопкой на хосте).
+window.addEventListener("mouseup", (ev) => sendMouse(ev, "up"));
 
 // Старт.
 (async () => {

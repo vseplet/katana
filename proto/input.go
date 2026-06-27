@@ -13,3 +13,6 @@ func mouseToggle(button string, down bool) {
 	}
 	robotgo.Toggle(button, state)
 }
+
+// dragMouse постит событие перетаскивания (мышь с зажатой кнопкой) в (x, y).
+func dragMouse(x, y int, button string) { robotgo.Drag(x, y, button) }

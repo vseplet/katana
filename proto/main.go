@@ -41,6 +41,7 @@ func main() {
 
 	opts := capture.Options{
 		SourceKind:  "display", // по умолчанию весь дисплей через ScreenCaptureKit
+		Cursor:      true,      // показывать курсор хоста (выключается при управлении)
 		ScreenIndex: *screen,
 		Codec:       capture.Codec(*codec),
 		Width:       *width,

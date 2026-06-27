@@ -247,7 +247,7 @@ int sck_source_size(int kind, unsigned int sid, int *outW, int *outH) {
 
 // sck_start запускает поток захвата выбранного источника. Кадры идут в
 // goSCKFrame(handle, ...). Возвращает 0 при успехе.
-int sck_start(int kind, unsigned int sid, int fps, int handle, int audio) {
+int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cursor) {
 	@autoreleasepool {
 		sck_ensure_app();
 		SCShareableContent *content = sck_fetch_content();
@@ -298,7 +298,7 @@ int sck_start(int kind, unsigned int sid, int fps, int handle, int audio) {
 		cfg.minimumFrameInterval = CMTimeMake(1, fps > 0 ? fps : 30);
 		cfg.pixelFormat = kCVPixelFormatType_32BGRA;
 		cfg.queueDepth = 5;
-		cfg.showsCursor = YES;
+		cfg.showsCursor = cursor ? YES : NO;
 		if (audio) {
 			cfg.capturesAudio = YES;
 			cfg.sampleRate = 48000;

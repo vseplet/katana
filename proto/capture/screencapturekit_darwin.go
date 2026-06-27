@@ -10,7 +10,7 @@ package capture
 char *sck_list_sources(void);
 int sck_source_size(int kind, unsigned int sid, int *outW, int *outH);
 int sck_source_rect(int kind, unsigned int sid, double *x, double *y, double *w, double *h);
-int sck_start(int kind, unsigned int sid, int fps, int handle, int audio);
+int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cursor);
 void sck_stop(int handle);
 */
 import "C"
@@ -114,15 +114,19 @@ func sckSourceSize(kind, id int) (int, int, error) {
 	return int(w), int(h), nil
 }
 
-func sckStart(kind, id, fps, handle int, audio bool) error {
-	a := 0
-	if audio {
-		a = 1
-	}
-	if rc := C.sck_start(C.int(kind), C.uint(id), C.int(fps), C.int(handle), C.int(a)); rc != 0 {
+func sckStart(kind, id, fps, handle int, audio, cursor bool) error {
+	if rc := C.sck_start(C.int(kind), C.uint(id), C.int(fps), C.int(handle),
+		C.int(b2i(audio)), C.int(b2i(cursor))); rc != 0 {
 		return fmt.Errorf("sck_start rc=%d", int(rc))
 	}
 	return nil
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func sckStop(handle int) { C.sck_stop(C.int(handle)) }
@@ -179,7 +183,7 @@ func startSCK(ctx context.Context, opts Options) (*Stream, error) {
 		}
 	}
 
-	if err := sckStart(kind, opts.SourceID, opts.FPS, handle, opts.Audio); err != nil {
+	if err := sckStart(kind, opts.SourceID, opts.FPS, handle, opts.Audio, opts.Cursor); err != nil {
 		sckUnregister(handle)
 		_ = stdin.Close()
 		if audioStop != nil {

@@ -47,6 +47,7 @@ type configMsg struct {
 	BitrateKbps *int    `json:"bitrateKbps,omitempty"`
 	Threads     *int    `json:"threads,omitempty"`
 	DropLate    *bool   `json:"dropLate,omitempty"`
+	Cursor      *bool   `json:"cursor,omitempty"`
 }
 
 // apply накладывает настройки на базовые опции с клампингом разумных границ.
@@ -81,6 +82,9 @@ func (c *configMsg) apply(base capture.Options) capture.Options {
 	}
 	if c.DropLate != nil {
 		o.DropLate = *c.DropLate
+	}
+	if c.Cursor != nil {
+		o.Cursor = *c.Cursor
 	}
 	return o
 }
@@ -126,6 +130,10 @@ func optsFromQuery(base capture.Options, q url.Values) capture.Options {
 	if q.Has("dropLate") {
 		b := q.Get("dropLate") == "true"
 		c.DropLate = &b
+	}
+	if q.Has("cursor") {
+		b := q.Get("cursor") == "true"
+		c.Cursor = &b
 	}
 	o := c.apply(base)
 	switch q.Get("codec") {
@@ -242,6 +250,8 @@ type session struct {
 
 	srcMu sync.Mutex   // защищает геометрию источника
 	rect  capture.Rect // глобальный прямоугольник источника (для маппинга мыши)
+
+	btnDown string // зажатая кнопка мыши ("" если нет) — для drag; только из readLoop
 }
 
 // setSource обновляет кэш геометрии источника (для координат мыши). Вызов SCK
@@ -275,11 +285,21 @@ func (s *session) handleMouse(m *mouseMsg) {
 	case "down":
 		moveMouse(x, y)
 		mouseToggle(button, true)
+		s.btnDown = button
 	case "up":
-		moveMouse(x, y)
+		if s.btnDown != "" {
+			dragMouse(x, y, s.btnDown) // довести drag до точки отпускания
+		} else {
+			moveMouse(x, y)
+		}
 		mouseToggle(button, false)
-	default:
-		moveMouse(x, y)
+		s.btnDown = ""
+	default: // move
+		if s.btnDown != "" {
+			dragMouse(x, y, s.btnDown) // зажата кнопка → drag-событие
+		} else {
+			moveMouse(x, y)
+		}
 	}
 }
 
