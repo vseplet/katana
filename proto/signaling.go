@@ -25,6 +25,13 @@ type signalMessage struct {
 	Candidate *webrtc.ICECandidateInit `json:"candidate,omitempty"`
 	Config    *configMsg               `json:"config,omitempty"`
 	Mouse     *mouseMsg                `json:"mouse,omitempty"`
+	Scroll    *scrollMsg               `json:"scroll,omitempty"`
+}
+
+// scrollMsg — событие прокрутки от браузера (в «кликах» колеса).
+type scrollMsg struct {
+	Dx int `json:"dx"`
+	Dy int `json:"dy"`
 }
 
 // mouseMsg — событие мыши от браузера. X/Y — нормализованные [0,1] координаты
@@ -376,6 +383,10 @@ func readLoop(ctx context.Context, s *session) {
 		case "mouse":
 			if msg.Mouse != nil {
 				s.handleMouse(msg.Mouse)
+			}
+		case "scroll":
+			if msg.Scroll != nil {
+				scrollMouse(msg.Scroll.Dx, msg.Scroll.Dy)
 			}
 		default:
 			log.Printf("signaling: unknown message type %q", msg.Type)

@@ -66,6 +66,11 @@ const settings = {
   volume: 1, // громкость воспроизведения 0..1 (клиент)
   muted: true, // mute воспроизведения (клиент; true для автоплея)
   control: false, // управлять мышью хоста (отправлять события)
+  // тюнинг ввода (клиентский):
+  scrollDiv: 6, // px на 1 «клик» скролла; меньше = чувствительнее
+  invertScrollX: false,
+  invertScrollY: false,
+  dragDeadzone: 8, // px порога, после которого тап превращается в drag
 };
 
 // Восстанавливаем сохранённые настройки до постройки панели, чтобы контролы
@@ -90,6 +95,30 @@ function saveSettings() {
   } catch (err) {
     console.warn("settings save:", err);
   }
+}
+
+// Состояние свёрнутости секций панели — отдельно от настроек захвата.
+const UI_KEY = "katana.ui";
+let uiState = {};
+try {
+  uiState = JSON.parse(localStorage.getItem(UI_KEY) || "{}");
+} catch (err) {
+  console.warn("ui state load:", err);
+}
+
+// persistFolder восстанавливает свёрнутость папки и сохраняет её при изменении.
+// Если состояния нет в localStorage — применяем defaultClosed.
+function persistFolder(folder, name, defaultClosed = false) {
+  const closed = name in uiState ? uiState[name] : defaultClosed;
+  closed ? folder.close() : folder.open();
+  folder.onOpenClose((f) => {
+    uiState[name] = f._closed;
+    try {
+      localStorage.setItem(UI_KEY, JSON.stringify(uiState));
+    } catch (err) {
+      console.warn("ui state save:", err);
+    }
+  });
 }
 
 // Разбирает settings.source ("kind:id") в параметры захвата для сервера.
@@ -174,10 +203,6 @@ function toggleFullscreen() {
     document.documentElement.requestFullscreen().catch((err) => console.warn("fullscreen:", err));
   }
 }
-gui.add({ fullscreen: toggleFullscreen }, "fullscreen").name("Fullscreen ⤢");
-video.addEventListener("dblclick", () => {
-  if (!settings.control) toggleFullscreen(); // в режиме управления dblclick = два клика
-});
 window.addEventListener("keydown", (e) => {
   if (inPanel(document.activeElement)) return; // не мешаем работе с панелью
   if (e.key === "f" || e.key === "F") toggleFullscreen();
@@ -295,10 +320,14 @@ recv.add(settings, "muted").name("Mute").onChange(() => {
   applyAudioPlayback();
   saveSettings();
 });
-recv.add(settings, "control").name("Control (mouse)").onChange(() => {
-  saveSettings();
-  sendConfig(); // обновить showsCursor на сервере (прятать курсор хоста при управлении)
-});
+
+// Тюнинг ввода (клиентский) — чтобы подобрать дефолты по ощущениям.
+const inp = gui.addFolder("Input · tuning");
+inp.domElement.classList.add("f-input");
+inp.add(settings, "scrollDiv", 1, 30, 1).name("Scroll px/click").onChange(saveSettings);
+inp.add(settings, "invertScrollX").name("Invert scroll X").onChange(saveSettings);
+inp.add(settings, "invertScrollY").name("Invert scroll Y").onChange(saveSettings);
+inp.add(settings, "dragDeadzone", 0, 30, 1).name("Drag deadzone px").onChange(saveSettings);
 
 const stat = gui.addFolder("Stats");
 stat.domElement.classList.add("f-stats");
@@ -306,6 +335,15 @@ stat.add(metrics, "res").name("Resolution").disable().listen();
 stat.add(metrics, "fps").name("FPS (real/target)").disable().listen();
 stat.add(metrics, "encoder").name("Encoder").disable().listen();
 stat.add(metrics, "latency").name("Latency").disable().listen();
+
+// Восстановить/сохранять свёрнутость секций. По умолчанию подсекции свёрнуты
+// (root открыт, чтобы заголовки были видны); сохранённое состояние переопределяет.
+persistFolder(gui, "root", false);
+persistFolder(cap, "capture", true);
+persistFolder(recv, "receive", true);
+persistFolder(inp, "input", true);
+persistFolder(stat, "stats", true);
+persistFolder(perm, "perms", true);
 
 // --- WebRTC ---
 
@@ -554,28 +592,237 @@ function videoCoords(ev) {
 }
 
 let lastCoords = null;
-function sendMouse(ev, action) {
-  if (!settings.control) return;
-  const c = videoCoords(ev) || (action === "up" ? lastCoords : null);
+function sendMouseAt(clientX, clientY, action, button) {
+  const c = videoCoords({ clientX, clientY }) || (action === "up" ? lastCoords : null);
   if (!c) return;
   lastCoords = c;
-  send({ type: "mouse", mouse: { x: c.x, y: c.y, action, button: ev.button === 2 ? "right" : "left" } });
+  send({ type: "mouse", mouse: { x: c.x, y: c.y, action, button } });
 }
 
+// Нажатие с дедзоной (settings.dragDeadzone): move не шлём, пока не сдвинулись
+// больше порога от точки down. Иначе на тач любой тап дёргается → drag.
+let press = null; // { x, y, button, moved }
+
+function ctrlDown(clientX, clientY, button) {
+  press = { x: clientX, y: clientY, button, moved: false };
+  sendMouseAt(clientX, clientY, "down", button);
+}
+function ctrlMove(clientX, clientY) {
+  if (!press) {
+    sendMouseAt(clientX, clientY, "move", "left"); // hover мышью (кнопка не зажата)
+    return;
+  }
+  if (!press.moved) {
+    if (Math.hypot(clientX - press.x, clientY - press.y) < settings.dragDeadzone) return; // дедзона
+    press.moved = true;
+  }
+  sendMouseAt(clientX, clientY, "move", press.button);
+}
+function ctrlUp(clientX, clientY, button) {
+  if (press && !press.moved) {
+    clientX = press.x; // не двигались дальше дедзоны → отпускаем точно в точке нажатия
+    clientY = press.y;
+  }
+  sendMouseAt(clientX, clientY, "up", button);
+  press = null;
+}
+
+// Скролл: накапливаем пиксели и шлём целыми «кликами» колеса.
+let scrollAcc = { x: 0, y: 0 };
+function sendScroll(dxPx, dyPx) {
+  const div = Math.max(1, settings.scrollDiv);
+  scrollAcc.x += dxPx;
+  scrollAcc.y += dyPx;
+  let dx = Math.trunc(scrollAcc.x / div);
+  let dy = Math.trunc(scrollAcc.y / div);
+  if (!dx && !dy) return;
+  scrollAcc.x -= dx * div;
+  scrollAcc.y -= dy * div;
+  if (settings.invertScrollX) dx = -dx;
+  if (settings.invertScrollY) dy = -dy;
+  send({ type: "scroll", scroll: { dx, dy } });
+}
+
+// --- Вьюпорт: зум и пан (клиентские, через CSS-transform видео) ---
+// Маппинг координат для управления (videoCoords) берёт getBoundingClientRect,
+// который УЖЕ учитывает transform — поэтому клики попадают верно и при зуме.
+const view = { zoom: 1, panX: 0, panY: 0 };
+
+function clampPan() {
+  const w = window.innerWidth, h = window.innerHeight;
+  view.panX = Math.min(0, Math.max(w * (1 - view.zoom), view.panX));
+  view.panY = Math.min(0, Math.max(h * (1 - view.zoom), view.panY));
+}
+function applyView() {
+  clampPan();
+  video.style.transform = `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom})`;
+}
+function resetView() {
+  view.zoom = 1;
+  view.panX = 0;
+  view.panY = 0;
+  applyView();
+}
+// Зум к точке экрана (cx,cy): точка под курсором/пальцем остаётся на месте.
+function zoomAt(cx, cy, factor) {
+  const z0 = view.zoom;
+  const z1 = Math.min(5, Math.max(1, z0 * factor));
+  if (z1 === z0) return;
+  view.panX = cx - (cx - view.panX) * (z1 / z0);
+  view.panY = cy - (cy - view.panY) * (z1 / z0);
+  view.zoom = z1;
+  applyView();
+}
+
+// --- Режим управления ---
+const btnControl = document.getElementById("btn-control");
+function setControl(on) {
+  settings.control = on;
+  btnControl.classList.toggle("active", on);
+  video.style.cursor = on ? "crosshair" : "default";
+  saveSettings();
+  sendConfig(); // showsCursor: при управлении прячем курсор хоста
+}
+
+// --- Ввод: в режиме control → на хост, иначе → навигация вьюпорта ---
 let lastMove = 0;
-video.addEventListener("mousemove", (ev) => {
-  if (!settings.control) return;
-  if (ev.timeStamp - lastMove < 16) return; // ~60/с
-  lastMove = ev.timeStamp;
-  sendMouse(ev, "move");
-});
+let panning = null; // мышиный пан в режиме просмотра
+
 video.addEventListener("mousedown", (ev) => {
-  if (settings.control) ev.preventDefault();
-  sendMouse(ev, "down");
+  ev.preventDefault();
+  if (settings.control) {
+    ctrlDown(ev.clientX, ev.clientY, ev.button === 2 ? "right" : "left");
+  } else {
+    panning = { x: ev.clientX, y: ev.clientY, panX: view.panX, panY: view.panY };
+  }
 });
-// mouseup ловим на window: отпускание долетит, даже если курсор ушёл за видео
-// (иначе drag «залипнет» с зажатой кнопкой на хосте).
-window.addEventListener("mouseup", (ev) => sendMouse(ev, "up"));
+video.addEventListener("mousemove", (ev) => {
+  if (settings.control) {
+    if (ev.timeStamp - lastMove < 16) return; // ~60/с
+    lastMove = ev.timeStamp;
+    ctrlMove(ev.clientX, ev.clientY);
+  } else if (panning) {
+    view.panX = panning.panX + (ev.clientX - panning.x);
+    view.panY = panning.panY + (ev.clientY - panning.y);
+    applyView();
+  }
+});
+window.addEventListener("mouseup", (ev) => {
+  if (settings.control) ctrlUp(ev.clientX, ev.clientY, ev.button === 2 ? "right" : "left");
+  panning = null;
+});
+video.addEventListener(
+  "wheel",
+  (ev) => {
+    ev.preventDefault();
+    if (settings.control) {
+      sendScroll(ev.deltaX, ev.deltaY); // режим управления: колесо → скролл хоста
+    } else {
+      zoomAt(ev.clientX, ev.clientY, ev.deltaY < 0 ? 1.15 : 1 / 1.15); // просмотр: зум
+    }
+  },
+  { passive: false }
+);
+
+// Тач. Просмотр: 1 палец = пан, 2 пальца = пинч-зум вьюпорта.
+// Управление: 1 палец = курсор/тап/drag (отложенно), 2 пальца = скролл хоста.
+const tDist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+const tMid = (a, b) => ({ x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 });
+let pinch = null, touchPan = null;
+let tCtrl = null; // отложенный 1-палец в режиме управления: {x,y,sent}
+let tScroll = null; // центр 2-пальцевого скролла
+
+video.addEventListener(
+  "touchstart",
+  (ev) => {
+    ev.preventDefault();
+    if (settings.control) {
+      if (ev.touches.length >= 2) {
+        // два пальца → скролл. Отменяем отложенный палец (если уже был drag — отпускаем).
+        if (tCtrl && tCtrl.sent) sendMouseAt(tCtrl.x, tCtrl.y, "up", "left");
+        tCtrl = null;
+        tScroll = tMid(ev.touches[0], ev.touches[1]);
+      } else {
+        const t = ev.touches[0];
+        tCtrl = { x: t.clientX, y: t.clientY, sent: false }; // down пошлём, когда поймём тап/drag
+      }
+    } else if (ev.touches.length === 2) {
+      pinch = { dist: tDist(ev.touches[0], ev.touches[1]), mid: tMid(ev.touches[0], ev.touches[1]) };
+      touchPan = null;
+    } else {
+      const t = ev.touches[0];
+      touchPan = { x: t.clientX, y: t.clientY, panX: view.panX, panY: view.panY };
+    }
+  },
+  { passive: false }
+);
+video.addEventListener(
+  "touchmove",
+  (ev) => {
+    ev.preventDefault();
+    if (settings.control) {
+      if (tScroll && ev.touches.length >= 2) {
+        const mid = tMid(ev.touches[0], ev.touches[1]);
+        sendScroll(mid.x - tScroll.x, mid.y - tScroll.y);
+        tScroll = mid;
+      } else if (tCtrl) {
+        const t = ev.touches[0];
+        if (!t || ev.timeStamp - lastMove < 16) return;
+        lastMove = ev.timeStamp;
+        if (!tCtrl.sent) {
+          if (Math.hypot(t.clientX - tCtrl.x, t.clientY - tCtrl.y) < settings.dragDeadzone) return; // дедзона
+          sendMouseAt(tCtrl.x, tCtrl.y, "down", "left"); // начинаем drag с точки нажатия
+          tCtrl.sent = true;
+        }
+        sendMouseAt(t.clientX, t.clientY, "move", "left");
+      }
+    } else if (ev.touches.length === 2 && pinch) {
+      const dist = tDist(ev.touches[0], ev.touches[1]), mid = tMid(ev.touches[0], ev.touches[1]);
+      view.panX += mid.x - pinch.mid.x; // следуем за центром щипка
+      view.panY += mid.y - pinch.mid.y;
+      zoomAt(mid.x, mid.y, dist / (pinch.dist || dist));
+      pinch = { dist, mid };
+    } else if (touchPan) {
+      const t = ev.touches[0];
+      view.panX = touchPan.panX + (t.clientX - touchPan.x);
+      view.panY = touchPan.panY + (t.clientY - touchPan.y);
+      applyView();
+    }
+  },
+  { passive: false }
+);
+video.addEventListener(
+  "touchend",
+  (ev) => {
+    if (settings.control) {
+      if (tScroll && ev.touches.length < 2) {
+        tScroll = null;
+        tCtrl = null; // оставшийся палец не превращаем в клик
+      } else if (tCtrl && ev.touches.length === 0) {
+        if (!tCtrl.sent) {
+          // тап → чистый клик в точке нажатия
+          sendMouseAt(tCtrl.x, tCtrl.y, "down", "left");
+          sendMouseAt(tCtrl.x, tCtrl.y, "up", "left");
+        } else {
+          const t = ev.changedTouches && ev.changedTouches[0];
+          sendMouseAt(t ? t.clientX : tCtrl.x, t ? t.clientY : tCtrl.y, "up", "left");
+        }
+        tCtrl = null;
+      }
+    } else {
+      if (ev.touches.length < 2) pinch = null;
+      if (ev.touches.length === 0) touchPan = null;
+    }
+  },
+  { passive: false }
+);
+
+// HUD-кнопки.
+document.getElementById("btn-fullscreen").addEventListener("click", toggleFullscreen);
+document.getElementById("btn-reset").addEventListener("click", resetView);
+btnControl.addEventListener("click", () => setControl(!settings.control));
+btnControl.classList.toggle("active", settings.control);
+video.style.cursor = settings.control ? "crosshair" : "default";
 
 // Старт.
 (async () => {
