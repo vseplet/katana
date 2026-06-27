@@ -55,7 +55,7 @@ let ws = null;
 
 const settings = {
   codec: "vp8", // vp8 (software) | h264 (VideoToolbox HW)
-  screen: -1, // индекс монитора avfoundation; -1 = серверный дефолт
+  source: "", // "screen:<idx>" | "window:<id>" | "app:<pid>"
   width: 1280, // ширина картинки, px; 0 = нативное
   fps: 30,
   bitrate: 3000, // kbps
@@ -86,6 +86,16 @@ function saveSettings() {
   } catch (err) {
     console.warn("settings save:", err);
   }
+}
+
+// Разбирает settings.source ("kind:id") в параметры захвата для сервера.
+function sourceParams() {
+  const [kind, idStr] = (settings.source || "screen:-1").split(":");
+  const id = parseInt(idStr, 10);
+  if (kind === "screen") {
+    return id >= 0 ? { sourceKind: kind, screen: id } : { sourceKind: kind };
+  }
+  return { sourceKind: kind, sourceId: id };
 }
 
 // Живые метрики (readonly-поля панели).
@@ -123,8 +133,8 @@ function sendConfig() {
       bitrateKbps: settings.bitrate,
       threads: settings.threads,
       dropLate: settings.dropLate,
+      ...sourceParams(),
     };
-    if (settings.screen >= 0) config.screen = settings.screen;
     send({ type: "config", config });
     setStatus("applying settings…");
     // Состояние соединения при reconfig не меняется, поэтому надпись надо
@@ -278,8 +288,8 @@ function connectURL() {
     bitrateKbps: settings.bitrate,
     threads: settings.threads,
     dropLate: settings.dropLate,
+    ...sourceParams(),
   });
-  if (settings.screen >= 0) q.set("screen", settings.screen);
   return `${proto}://${location.host}/ws?${q}`;
 }
 
@@ -427,37 +437,42 @@ setInterval(async () => {
   }
 }, 1000);
 
-// Список мониторов с сервера → дропдаун Display. Делаем до connect(), чтобы
-// первый же захват пошёл с нужного экрана (без лишнего reconfig).
-async function initDisplays() {
-  let data = { default: -1, screens: [] };
-  try {
-    data = await (await fetch("/api/displays")).json();
-  } catch (err) {
-    console.warn("displays:", err);
-  }
-  const screens = data.screens || [];
+// Добавляет опцию с уникальным ключом (lil-gui не любит дубли меток).
+function addOpt(opts, label, value) {
+  let key = label;
+  for (let n = 2; key in opts; n++) key = `${label} (${n})`;
+  opts[key] = value;
+}
 
-  // выбираем монитор: сохранённый (если валиден) → серверный дефолт → первый
-  const valid = screens.some((s) => s.index === settings.screen);
-  if (!valid) {
-    settings.screen = data.default >= 0 ? data.default : screens.length ? screens[0].index : -1;
-  }
+// Единый список источников: экраны (avfoundation) + окна и приложения (SCK).
+// Делаем до connect(), чтобы первый захват сразу пошёл с нужного источника.
+async function initSources() {
+  const [disp, src] = await Promise.all([
+    fetch("/api/displays").then((r) => r.json()).catch(() => ({ default: -1, screens: [] })),
+    fetch("/api/sources").then((r) => r.json()).catch(() => ({ windows: [], apps: [] })),
+  ]);
 
   const options = {};
-  if (screens.length) {
-    for (const s of screens) options[s.name] = s.index;
-  } else {
-    options["(no screens)"] = -1;
+  for (const s of disp.screens || []) addOpt(options, `Screen · ${s.name}`, `screen:${s.index}`);
+  for (const w of src.windows || []) {
+    addOpt(options, `Win · ${w.app}: ${w.title}`.slice(0, 58), `window:${w.id}`);
   }
-  const dispCtrl = cap.add(settings, "screen", options).name("Display").onChange(sendConfig);
-  // ставим Display сразу после Encoder (перед Width) — выбор монитора важнее.
+  for (const a of src.apps || []) addOpt(options, `App · ${a.name}`, `app:${a.pid}`);
+
+  const values = Object.values(options);
+  if (!values.includes(settings.source)) {
+    settings.source = disp.default >= 0 ? `screen:${disp.default}` : values[0] || "screen:-1";
+  }
+  if (!values.length) addOpt(options, "(none)", "screen:-1");
+
+  const ctrl = cap.add(settings, "source", options).name("Source").onChange(sendConfig);
+  // ставим Source сразу после Encoder (перед Width) — выбор источника важнее.
   const widthEl = cap.controllers.find((c) => c.property === "width")?.domElement;
-  if (widthEl) cap.$children.insertBefore(dispCtrl.domElement, widthEl);
+  if (widthEl) cap.$children.insertBefore(ctrl.domElement, widthEl);
 }
 
 // Старт.
 (async () => {
-  await initDisplays();
+  await initSources();
   connect();
 })();

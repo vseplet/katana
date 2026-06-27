@@ -13,6 +13,11 @@ const (
 
 // Options описывает параметры захвата+энкода экрана.
 type Options struct {
+	// SourceKind — что захватываем: "screen" (avfoundation, весь экран по
+	// ScreenIndex), "window" или "app" (ScreenCaptureKit по SourceID).
+	SourceKind string
+	SourceID   int // windowID (для window) или pid (для app)
+
 	ScreenIndex int    // индекс avfoundation-устройства экрана (см. -list_devices)
 	Codec       Codec  // vp8 | h264
 	Width       int    // целевая ширина в пикселях; 0 = нативное разрешение

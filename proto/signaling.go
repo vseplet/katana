@@ -29,12 +29,14 @@ type signalMessage struct {
 // configMsg — настройки захвата, присылаемые браузером. Указатели, чтобы
 // отличать «не задано» от нуля; незаданные поля сохраняют текущее значение.
 type configMsg struct {
-	Screen      *int  `json:"screen,omitempty"`
-	Width       *int  `json:"width,omitempty"`
-	FPS         *int  `json:"fps,omitempty"`
-	BitrateKbps *int  `json:"bitrateKbps,omitempty"`
-	Threads     *int  `json:"threads,omitempty"`
-	DropLate    *bool `json:"dropLate,omitempty"`
+	SourceKind  *string `json:"sourceKind,omitempty"` // screen | window | app
+	SourceID    *int    `json:"sourceId,omitempty"`   // windowID / pid (для window/app)
+	Screen      *int    `json:"screen,omitempty"`     // индекс avfoundation (для screen)
+	Width       *int    `json:"width,omitempty"`
+	FPS         *int    `json:"fps,omitempty"`
+	BitrateKbps *int    `json:"bitrateKbps,omitempty"`
+	Threads     *int    `json:"threads,omitempty"`
+	DropLate    *bool   `json:"dropLate,omitempty"`
 }
 
 // apply накладывает настройки на базовые опции с клампингом разумных границ.
@@ -42,6 +44,12 @@ type configMsg struct {
 // произвольный текст в аргументы ffmpeg.
 func (c *configMsg) apply(base capture.Options) capture.Options {
 	o := base
+	if c.SourceKind != nil {
+		o.SourceKind = *c.SourceKind
+	}
+	if c.SourceID != nil {
+		o.SourceID = *c.SourceID
+	}
 	if c.Screen != nil {
 		o.ScreenIndex = clamp(*c.Screen, 0, 64)
 	}
@@ -83,6 +91,13 @@ func clamp(v, lo, hi int) int {
 // config-сообщения уже в сессии.
 func optsFromQuery(base capture.Options, q url.Values) capture.Options {
 	var c configMsg
+	if q.Has("sourceKind") {
+		v := q.Get("sourceKind")
+		c.SourceKind = &v
+	}
+	if v, ok := queryInt(q, "sourceId"); ok {
+		c.SourceID = &v
+	}
 	if v, ok := queryInt(q, "screen"); ok {
 		c.Screen = &v
 	}

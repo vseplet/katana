@@ -15,4 +15,14 @@ func registerDisplayRoutes(mux *http.ServeMux, defaultScreen int) {
 			"screens": capture.ListScreens(),
 		})
 	})
+
+	// Источники ScreenCaptureKit: окна и приложения (для захвата окна/приложения).
+	mux.HandleFunc("/api/sources", func(w http.ResponseWriter, r *http.Request) {
+		sources, err := capture.ListSources()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, sources)
+	})
 }
