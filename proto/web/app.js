@@ -61,7 +61,7 @@ const settings = {
   bitrate: 3000, // kbps
   threads: 0, // потоки энкодера ffmpeg; 0 = авто
   dropLate: false, // выкидывать старые кадры под нагрузкой
-  buffer: 0, // целевой джиттер-буфер приёмника, мс
+  buffer: -1, // джиттер-буфер приёмника, мс; -1 = auto (адаптивный, для сети)
   audio: false, // передавать звук (SCK → Opus); connect-time
   volume: 1, // громкость воспроизведения 0..1 (клиент)
   muted: true, // mute воспроизведения (клиент; true для автоплея)
@@ -119,11 +119,14 @@ function applyAudioPlayback() {
 // минимальную задержку проигрывания и противодействует этому.
 function applyBufferTarget() {
   if (!pc) return;
+  // auto (<0): не форсим — Chrome сам растит буфер под джиттер/потери сети.
+  // Фиксированное значение (0/50/…): форсим (0 = минимум, только для loopback).
+  const auto = settings.buffer < 0;
   for (const r of pc.getReceivers()) {
     if (!r.track) continue;
     try {
-      if ("jitterBufferTarget" in r) r.jitterBufferTarget = settings.buffer;
-      if ("playoutDelayHint" in r) r.playoutDelayHint = settings.buffer / 1000; // сек
+      if ("jitterBufferTarget" in r) r.jitterBufferTarget = auto ? null : settings.buffer;
+      if ("playoutDelayHint" in r) r.playoutDelayHint = auto ? null : settings.buffer / 1000;
     } catch (err) {
       console.warn("buffer hint:", err);
     }
@@ -272,7 +275,13 @@ cap.add(settings, "audio").name("Audio (transmit)").onChange(() => {
 const recv = gui.addFolder("Receive · browser");
 recv.domElement.classList.add("f-receive");
 recv
-  .add(settings, "buffer", { "0 · min latency": 0, "50 ms": 50, "100 ms": 100, "200 ms · smoother": 200 })
+  .add(settings, "buffer", {
+    "auto · adaptive": -1,
+    "0 · min latency": 0,
+    "50 ms": 50,
+    "100 ms": 100,
+    "200 ms · smoother": 200,
+  })
   .name("Jitter buffer")
   .onChange(() => {
     applyBufferTarget();
