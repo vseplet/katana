@@ -64,6 +64,7 @@ func buildArgs(opts Options) []string {
 		"-deadline", "realtime",
 		"-cpu-used", "8",
 		"-lag-in-frames", "0", // без lookahead — убирает скрытую задержку энкодера
+		"-threads", fmt.Sprintf("%d", opts.Threads), // 0 = авто (по ядрам)
 		"-b:v", opts.Bitrate,
 		// кейфрейм раз в секунду: новый зритель быстро получает картинку
 		// (компенсация отсутствия PLI-on-demand в прототипе).
@@ -98,7 +99,9 @@ func (f *FFmpegDarwin) Start(ctx context.Context, opts Options) (<-chan []byte, 
 		return nil, fmt.Errorf("start ffmpeg: %w", err)
 	}
 
-	frames := make(chan []byte, 32)
+	// Небольшой буфер: длинная очередь = скрытая задержка. При DropLate
+	// держим только свежие кадры, при выключенном — даём backpressure ffmpeg.
+	frames := make(chan []byte, 4)
 	go func() {
 		defer close(frames)
 		defer func() {
@@ -130,10 +133,30 @@ func (f *FFmpegDarwin) Start(ctx context.Context, opts Options) (<-chan []byte, 
 				}
 				return
 			}
-			select {
-			case frames <- frame:
-			case <-ctx.Done():
-				return
+			if opts.DropLate {
+				// Неблокирующая отправка: если буфер полон, выкидываем самый
+				// старый кадр и кладём свежий — потребитель всегда видит актуальное.
+				select {
+				case frames <- frame:
+				case <-ctx.Done():
+					return
+				default:
+					select {
+					case <-frames: // выкинуть старый
+					default:
+					}
+					select {
+					case frames <- frame:
+					default:
+					}
+				}
+			} else {
+				// Backpressure: ждём место в буфере (тормозит ffmpeg, без пропусков).
+				select {
+				case frames <- frame:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()

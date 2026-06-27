@@ -11,6 +11,42 @@ function setStatus(text, hide = false) {
   statusEl.style.opacity = hide ? "0" : "1";
 }
 
+// --- Блокировка случайных жестов масштабирования/прокрутки ---
+// Особенно важно на мобильных. Панель lil-gui исключаем, чтобы она работала.
+const inPanel = (target) => !!(target && target.closest && target.closest(".lil-gui"));
+
+// iOS Safari pinch-zoom (нестандартные gesture-события).
+for (const ev of ["gesturestart", "gesturechange", "gestureend"]) {
+  document.addEventListener(ev, (e) => e.preventDefault(), { passive: false });
+}
+
+// Ctrl/⌘ + колесо = зум страницы на десктопе (трекпад-щипок шлёт ctrlKey).
+window.addEventListener(
+  "wheel",
+  (e) => {
+    if (e.ctrlKey || e.metaKey) e.preventDefault();
+  },
+  { passive: false }
+);
+
+// Двойной тап для зума (iOS) — глушим вне панели.
+let lastTap = 0;
+document.addEventListener(
+  "touchend",
+  (e) => {
+    if (inPanel(e.target)) return;
+    const now = e.timeStamp;
+    if (now - lastTap < 350) e.preventDefault();
+    lastTap = now;
+  },
+  { passive: false }
+);
+
+// Контекстное меню / iOS callout по долгому нажатию — вне панели.
+document.addEventListener("contextmenu", (e) => {
+  if (!inPanel(e.target)) e.preventDefault();
+});
+
 // Пустой конфиг: localhost, host-кандидаты, без ICE-серверов.
 const pc = new RTCPeerConnection();
 window.pc = pc; // для отладочной статистики из DevTools
@@ -21,6 +57,8 @@ const settings = {
   width: 1280, // ширина картинки, px; 0 = нативное
   fps: 30,
   bitrate: 3000, // kbps
+  threads: 0, // потоки энкодера ffmpeg; 0 = авто
+  dropLate: false, // выкидывать старые кадры под нагрузкой
   buffer: 0, // целевой джиттер-буфер приёмника, мс
 };
 
@@ -32,9 +70,9 @@ try {
   const raw = localStorage.getItem(STORAGE_KEY);
   if (raw) {
     const saved = JSON.parse(raw);
-    // берём только известные ключи — на случай смены схемы настроек
+    // берём только известные ключи того же типа — на случай смены схемы
     for (const k of Object.keys(settings)) {
-      if (typeof saved[k] === "number") settings[k] = saved[k];
+      if (typeof saved[k] === typeof settings[k]) settings[k] = saved[k];
     }
     hadSaved = true;
   }
@@ -84,6 +122,8 @@ function sendConfig() {
         width: settings.width,
         fps: settings.fps,
         bitrateKbps: settings.bitrate,
+        threads: settings.threads,
+        dropLate: settings.dropLate,
       },
     });
     setStatus("applying settings…");
@@ -113,6 +153,7 @@ function toggleFullscreen() {
 gui.add({ fullscreen: toggleFullscreen }, "fullscreen").name("Fullscreen ⤢");
 video.addEventListener("dblclick", toggleFullscreen);
 window.addEventListener("keydown", (e) => {
+  if (inPanel(document.activeElement)) return; // не мешаем работе с панелью
   if (e.key === "f" || e.key === "F") toggleFullscreen();
 });
 
@@ -136,6 +177,11 @@ cap
   .add(settings, "bitrate", { "1 Mbps": 1000, "2 Mbps": 2000, "3 Mbps": 3000, "6 Mbps": 6000 })
   .name("Quality")
   .onChange(sendConfig);
+cap
+  .add(settings, "threads", { auto: 0, "1": 1, "2": 2, "4": 4, "8": 8 })
+  .name("Encoder threads")
+  .onChange(sendConfig);
+cap.add(settings, "dropLate").name("Drop late frames").onChange(sendConfig);
 
 const recv = gui.addFolder("Receive · browser");
 recv.domElement.classList.add("f-receive");

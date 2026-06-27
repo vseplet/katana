@@ -27,9 +27,11 @@ type signalMessage struct {
 // configMsg — настройки захвата, присылаемые браузером. Указатели, чтобы
 // отличать «не задано» от нуля; незаданные поля сохраняют текущее значение.
 type configMsg struct {
-	Width       *int `json:"width,omitempty"`
-	FPS         *int `json:"fps,omitempty"`
-	BitrateKbps *int `json:"bitrateKbps,omitempty"`
+	Width       *int  `json:"width,omitempty"`
+	FPS         *int  `json:"fps,omitempty"`
+	BitrateKbps *int  `json:"bitrateKbps,omitempty"`
+	Threads     *int  `json:"threads,omitempty"`
+	DropLate    *bool `json:"dropLate,omitempty"`
 }
 
 // apply накладывает настройки на базовые опции с клампингом разумных границ.
@@ -49,6 +51,12 @@ func (c *configMsg) apply(base capture.Options) capture.Options {
 	}
 	if c.BitrateKbps != nil {
 		o.Bitrate = fmt.Sprintf("%dk", clamp(*c.BitrateKbps, 100, 20000))
+	}
+	if c.Threads != nil {
+		o.Threads = clamp(*c.Threads, 0, 16)
+	}
+	if c.DropLate != nil {
+		o.DropLate = *c.DropLate
 	}
 	return o
 }
