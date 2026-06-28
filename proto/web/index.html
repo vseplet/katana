@@ -7,6 +7,7 @@
     content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
   />
   <title>katana · screen share</title>
+  <link rel="stylesheet" href="vendor/xterm/xterm.css" />
   <style>
     html, body {
       margin: 0;
@@ -31,8 +32,52 @@
     .lil-gui {
       touch-action: auto;
     }
-    video {
+    /* Панель настроек — слева (по умолчанию lil-gui клеит её справа). */
+    .lil-gui.autoPlace {
+      left: 0 !important;
+      right: auto !important;
+    }
+    /* Сцена: рабочий стол и терминал в панелях (раскладка desktop/split/terminal). */
+    #stage {
       position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: row;
+      --term-pct: 50; /* доля терминала в сплите (%), меняется разделителем */
+    }
+    #video-pane, #term-pane {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+    #video-pane { flex: calc(100 - var(--term-pct)) 1 0; background: #000; }
+    #term-pane { flex: var(--term-pct) 1 0; background: #0b0e14; display: none; touch-action: auto; }
+    #term-body { position: absolute; inset: 0; padding: 4px 6px; }
+    /* Разделитель: виден только в сплите; тащим — меняем соотношение. */
+    #divider { display: none; flex: 0 0 8px; background: rgba(255, 255, 255, 0.08); position: relative; z-index: 8; touch-action: none; }
+    #divider::after {
+      content: ""; position: absolute; inset: 0; margin: auto;
+      width: 4px; height: 36px; border-radius: 3px; background: rgba(255, 255, 255, 0.35);
+    }
+    #divider:active { background: rgba(120, 230, 150, 0.4); }
+    /* раскладки */
+    body[data-layout="desktop"] #term-pane { display: none; }
+    body[data-layout="terminal"] #video-pane { display: none; }
+    body[data-layout="terminal"] #term-pane { display: block; }
+    body[data-layout="split"] #term-pane { display: block; }
+    body[data-layout="split"] #divider { display: block; cursor: col-resize; }
+    /* на узких экранах (портрет) — стопка вместо колонок; терминал сверху,
+       рабочий стол снизу (column-reverse: term-pane в DOM второй → наверх) */
+    @media (orientation: portrait) {
+      #stage { flex-direction: column-reverse; }
+      #divider { flex: 0 0 8px; }
+      #divider::after { width: 36px; height: 4px; }
+      body[data-layout="split"] #divider { cursor: row-resize; }
+    }
+
+    video {
+      position: absolute;
       inset: 0;
       width: 100%;
       height: 100%;
@@ -43,7 +88,8 @@
     #status {
       position: fixed;
       top: 12px;
-      left: 12px;
+      left: 50%;
+      transform: translateX(-50%);
       padding: 6px 10px;
       color: #ddd;
       background: rgba(0, 0, 0, 0.55);
@@ -56,8 +102,8 @@
        план на хосте. Прячется в режиме управления. */
     #apps {
       position: fixed;
-      /* в одном ряду с HUD (внизу слева), справа от его трёх кнопок */
-      left: calc(env(safe-area-inset-left) + 184px);
+      /* в одном ряду с HUD (внизу слева), справа от его четырёх кнопок */
+      left: calc(env(safe-area-inset-left) + 240px);
       right: 12px;
       bottom: max(12px, env(safe-area-inset-bottom));
       height: 48px;
@@ -114,8 +160,8 @@
     }
     #hud button svg { width: 22px; height: 22px; }
     #hud button:active { background: rgba(40, 40, 44, 0.85); }
-    /* Активный режим управления — заметная подсветка. */
-    #btn-control.active {
+    /* Активный режим (управление / терминал виден) — заметная зелёная подсветка. */
+    #btn-control.active, #btn-layout.active {
       color: #fff;
       background: rgba(70, 160, 90, 0.85);
       border-color: rgba(120, 230, 150, 0.9);
@@ -168,10 +214,24 @@
   </style>
 </head>
 <body>
-  <video id="screen" autoplay playsinline muted></video>
+  <div id="stage">
+    <div id="video-pane">
+      <video id="screen" autoplay playsinline muted></video>
+    </div>
+    <div id="divider"></div>
+    <div id="term-pane">
+      <div id="term-body"></div>
+    </div>
+  </div>
   <div id="status">connecting…</div>
   <div id="apps"></div>
   <div id="hud">
+    <button id="btn-layout" title="Раскладка: рабочий стол / сплит / терминал" aria-label="layout">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16">
+        <path d="M6 9a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3A.5.5 0 0 1 6 9M3.854 4.146a.5.5 0 1 0-.708.708L4.793 6.5 3.146 8.146a.5.5 0 1 0 .708.708l2-2a.5.5 0 0 0 0-.708z"/>
+        <path d="M2 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2zm12 1a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"/>
+      </svg>
+    </button>
     <button id="btn-control" title="Управление мышью (вкл/выкл)" aria-label="control">
       <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16">
         <path d="M8 3a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 3m4 8a4 4 0 0 1-8 0V5a4 4 0 1 1 8 0zM8 0a5 5 0 0 0-5 5v6a5 5 0 0 0 10 0V5a5 5 0 0 0-5-5"/>
@@ -189,6 +249,9 @@
       </svg>
     </button>
   </div>
+  <script src="vendor/xterm/xterm.js"></script>
+  <script src="vendor/xterm/addon-fit.js"></script>
+  <script src="term.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

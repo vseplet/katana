@@ -67,6 +67,8 @@ const settings = {
   volume: 1, // громкость воспроизведения 0..1 (клиент)
   muted: true, // mute воспроизведения (клиент; true для автоплея)
   control: false, // управлять мышью хоста (отправлять события)
+  layout: "desktop", // раскладка: desktop | split | terminal
+  termPct: 50, // доля терминала в сплите, % (разделитель)
   // тюнинг ввода (клиентский):
   scrollSpeed: 1, // множитель скролла; 1 = пиксель-в-пиксель (1:1, как трекпад)
   invertScrollX: false,
@@ -415,9 +417,12 @@ function connect() {
   pc = new RTCPeerConnection();
   window.pc = pc; // для отладочной статистики из DevTools
 
-  // Канал ввода создаёт сервер (офферер) — ловим его здесь.
+  // Каналы создаёт сервер (офферер) — ловим их здесь.
   pc.ondatachannel = (e) => {
     if (e.channel.label === "input") inputDC = e.channel;
+    if (e.channel.label === "term" && window.katanaTerm) {
+      window.katanaTerm.setChannel(e.channel);
+    }
   };
 
   pc.ontrack = (event) => {
@@ -885,6 +890,58 @@ video.addEventListener(
   { passive: false }
 );
 
+// --- Раскладка: рабочий стол / сплит / терминал ---
+const btnLayout = document.getElementById("btn-layout");
+const LAYOUTS = ["desktop", "split", "terminal"];
+function applyLayout() {
+  document.body.dataset.layout = settings.layout;
+  // Терминал виден в split/terminal — показываем/подключаем его и подгоняем сетку.
+  const termVisible = settings.layout !== "desktop";
+  btnLayout.classList.toggle("active", termVisible);
+  if (window.katanaTerm) {
+    if (termVisible) window.katanaTerm.show();
+    else window.katanaTerm.hide();
+  }
+}
+function cycleLayout() {
+  const i = LAYOUTS.indexOf(settings.layout);
+  settings.layout = LAYOUTS[(i + 1) % LAYOUTS.length];
+  saveSettings();
+  applyLayout();
+}
+btnLayout.addEventListener("click", cycleLayout);
+
+// Соотношение панелей в сплите (CSS-переменная) + перетаскиваемый разделитель.
+const stageEl = document.getElementById("stage");
+function applyTermPct() {
+  stageEl.style.setProperty("--term-pct", String(settings.termPct));
+}
+const dividerEl = document.getElementById("divider");
+let dragSplit = false;
+dividerEl.addEventListener("pointerdown", (e) => {
+  dragSplit = true;
+  dividerEl.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+dividerEl.addEventListener("pointermove", (e) => {
+  if (!dragSplit) return;
+  const r = stageEl.getBoundingClientRect();
+  // Портрет: терминал сверху → доля = высота сверху. Альбом: терминал справа.
+  const portrait = window.matchMedia("(orientation: portrait)").matches;
+  const pct = portrait
+    ? ((e.clientY - r.top) / r.height) * 100
+    : ((r.right - e.clientX) / r.width) * 100;
+  settings.termPct = Math.max(15, Math.min(85, Math.round(pct)));
+  applyTermPct();
+  if (window.katanaTerm) window.katanaTerm.refit();
+});
+dividerEl.addEventListener("pointerup", (e) => {
+  if (!dragSplit) return;
+  dragSplit = false;
+  try { dividerEl.releasePointerCapture(e.pointerId); } catch (_) {}
+  saveSettings();
+});
+
 // HUD-кнопки.
 document.getElementById("btn-fullscreen").addEventListener("click", toggleFullscreen);
 document.getElementById("btn-reset").addEventListener("click", resetView);
@@ -892,6 +949,8 @@ btnControl.addEventListener("click", () => setControl(!settings.control));
 btnControl.classList.toggle("active", settings.control);
 video.style.cursor = settings.control ? "crosshair" : "default";
 updateAppsVisibility(); // показать ленту приложений (если не режим управления)
+applyTermPct(); // применить сохранённое соотношение панелей
+applyLayout(); // применить сохранённую раскладку
 
 // Старт.
 (async () => {

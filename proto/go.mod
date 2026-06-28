@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/dblohm7/wingoes v0.0.0-20250822163801-6d8e6105c62d // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/gen2brain/shm v0.2.1 // indirect

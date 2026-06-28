@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -37,6 +38,7 @@ func main() {
 	bitrate := flag.String("bitrate", "3M", "целевой битрейт видео")
 	codec := flag.String("codec", "vp8", "кодек по умолчанию: vp8 | h264 (клиент может переопределить)")
 	test := flag.Bool("test", false, "использовать синтетический testsrc вместо экрана (отладка без TCC)")
+	dev := flag.Bool("dev", false, "отдавать web/ с диска (правки фронта без пересборки бинаря)")
 	flag.Parse()
 
 	opts := capture.Options{
@@ -51,10 +53,22 @@ func main() {
 	}
 	enc := capture.NewFFmpegDarwin()
 
-	// Статика из web/ (через embed — бинарь самодостаточен).
-	static, err := fs.Sub(webFS, "web")
-	if err != nil {
-		log.Fatalf("embed sub: %v", err)
+	// Статика из web/. По умолчанию — из embed (бинарь самодостаточен).
+	// С --dev отдаём с диска (./web) без кеша, чтобы править фронт без пересборки.
+	var static fs.FS
+	if *dev {
+		static = os.DirFS("web")
+		log.Printf("dev: web/ отдаётся с диска (без кеша)")
+	} else {
+		sub, err := fs.Sub(webFS, "web")
+		if err != nil {
+			log.Fatalf("embed sub: %v", err)
+		}
+		static = sub
+	}
+	fileHandler := http.FileServer(http.FS(static))
+	if *dev {
+		fileHandler = noCache(fileHandler)
 	}
 
 	// Корневой контекст: отменяется по SIGINT/SIGTERM. Все захваты
@@ -64,7 +78,7 @@ func main() {
 	defer stop()
 
 	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.FS(static)))
+	mux.Handle("/", fileHandler)
 	mux.HandleFunc("/ws", signalingHandler(ctx, enc, opts))
 	registerPermissionRoutes(mux)
 	registerDisplayRoutes(mux, opts.ScreenIndex)
@@ -95,4 +109,13 @@ func main() {
 	shutdownCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+}
+
+// noCache отключает кеширование статики (для --dev: правки фронта видны без
+// хард-релоада и без пересборки бинаря).
+func noCache(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, must-revalidate")
+		h.ServeHTTP(w, r)
+	})
 }

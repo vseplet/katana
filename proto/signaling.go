@@ -245,6 +245,14 @@ func signalingHandler(root context.Context, enc capture.CaptureEncoder, opts cap
 			})
 		}
 
+		// Канал терминала (ordered+reliable): PTY поверх того же соединения.
+		// Шелл поднимается лениво на первый resize (когда зритель открыл терминал).
+		if dc, err := pc.CreateDataChannel("term", nil); err != nil {
+			log.Printf("signaling: term channel: %v", err)
+		} else {
+			sharedTerminal.bind(dc)
+		}
+
 		// Go офферит первым.
 		offer, err := pc.CreateOffer(nil)
 		if err != nil {
