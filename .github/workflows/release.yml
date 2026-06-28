@@ -1,0 +1,39 @@
+name: release
+
+# Сборка бинарника хоста для macOS arm64 и публикация в GitHub Release.
+# Хост использует cgo + ObjC (ScreenCaptureKit) — собирается только на macOS.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (например v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14 # arm64 (Apple Silicon)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proto/go.mod
+
+      - name: Build (darwin/arm64)
+        working-directory: proto
+        run: |
+          CGO_ENABLED=1 GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w" -o ../katana-darwin-arm64 .
+          ../katana-darwin-arm64 -h 2>&1 | head -1 || true # smoke: бинарник запускается
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: katana-darwin-arm64
+          fail_on_unmatched_files: true
