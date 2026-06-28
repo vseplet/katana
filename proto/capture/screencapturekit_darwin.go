@@ -140,6 +140,10 @@ func sckSetCursor(handle int, show bool) { C.sck_set_cursor(C.int(handle), C.int
 // нативный поток шлёт BGRA-кадры в stdin видео-ffmpeg (скейл/энкод), при
 // opts.Audio — ещё и PCM в stdin аудио-ffmpeg (Opus). Читаем оба stdout.
 func startSCK(ctx context.Context, opts Options) (*Stream, error) {
+	ff := FFmpegPath()
+	if ff == "" {
+		return nil, errNoFFmpeg
+	}
 	kind := sckKindCode(opts.SourceKind)
 	w, h, err := sckSourceSize(kind, opts.SourceID)
 	if err != nil {
@@ -147,7 +151,7 @@ func startSCK(ctx context.Context, opts Options) (*Stream, error) {
 	}
 
 	args := buildSCKArgs(opts, w, h)
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, ff, args...)
 	log.Printf("capture: sck %s/%d %dx%d audio=%v | ffmpeg %s",
 		opts.SourceKind, opts.SourceID, w, h, opts.Audio, strings.Join(args, " "))
 
@@ -265,7 +269,7 @@ func startAudioEncoder(ctx context.Context) (io.Writer, chan []byte, func(), err
 		"-page_duration", "20000", // одна opus-страница ≈ 20 мс
 		"-f", "ogg", "-",
 	}
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, FFmpegPath(), args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, nil, nil, err

@@ -70,6 +70,13 @@ func main() {
 		}
 	}
 
+	// ffmpeg обязателен (энкодер): ~/.katana/bin/ffmpeg → PATH → иначе падаем сразу.
+	if ff := capture.FFmpegPath(); ff == "" {
+		log.Fatalf("ffmpeg не найден: положи бинарник в ~/.katana/bin/ffmpeg или установи ffmpeg (brew install ffmpeg)")
+	} else {
+		log.Printf("ffmpeg: %s", ff)
+	}
+
 	log.Printf("katana host: session %s через %s", sessionID, *broker)
 	runBrokerHost(ctx, *broker, sessionID, enc, opts)
 	log.Printf("остановлено")

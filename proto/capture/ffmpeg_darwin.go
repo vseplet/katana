@@ -29,7 +29,7 @@ var deviceLineRe = regexp.MustCompile(`\[(\d+)\]\s+(.+)$`)
 func ListScreens() []Screen {
 	// ffmpeg печатает список в stderr и завершается с ошибкой (нет входа) —
 	// это ожидаемо, нас интересует только вывод.
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-f", "avfoundation",
+	cmd := exec.Command(FFmpegPath(), "-hide_banner", "-f", "avfoundation",
 		"-list_devices", "true", "-i", "")
 	var buf bytes.Buffer
 	cmd.Stderr = &buf
@@ -175,8 +175,12 @@ func (f *FFmpegDarwin) Start(ctx context.Context, opts Options) (*Stream, error)
 		return startSCK(ctx, opts)
 	}
 
+	ff := FFmpegPath()
+	if ff == "" {
+		return nil, errNoFFmpeg
+	}
 	args := buildArgs(opts)
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, ff, args...)
 	log.Printf("capture: ffmpeg %s", strings.Join(args, " "))
 
 	stdout, err := cmd.StdoutPipe()
