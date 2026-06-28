@@ -182,7 +182,7 @@ func startSCK(ctx context.Context, opts Options) (*Stream, error) {
 	if opts.Audio {
 		ai, ach, stop, aerr := startAudioEncoder(ctx)
 		if aerr != nil {
-			log.Printf("capture: audio encoder: %v (продолжаю без звука)", aerr)
+			log.Printf("capture: audio encoder: %v (continuing without audio)", aerr)
 		} else {
 			sink.mu.Lock()
 			sink.audio = ai

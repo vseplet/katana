@@ -77,7 +77,7 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 				// логируем один раз и продолжаем, восстановимся на кейфрейме.
 				if !loggedErr {
 					loggedErr = true
-					log.Printf("webrtc: write video: %v (продолжаю)", err)
+					log.Printf("webrtc: write video: %v (continuing)", err)
 				}
 				continue
 			}
@@ -98,7 +98,7 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 				if err := s.audio.WriteSample(media.Sample{Data: pkt, Duration: 20 * time.Millisecond}); err != nil {
 					if !loggedErr {
 						loggedErr = true
-						log.Printf("webrtc: write audio: %v (продолжаю)", err)
+						log.Printf("webrtc: write audio: %v (continuing)", err)
 					}
 					continue
 				}

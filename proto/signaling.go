@@ -129,10 +129,10 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 	wsURL := fmt.Sprintf("%s?session=%s&role=host",
 		strings.TrimRight(brokerURL, "/"), url.QueryEscape(sessionID))
 	for ctx.Err() == nil {
-		log.Printf("broker: подключаюсь к %s (session %s)", brokerURL, sessionID)
+		log.Printf("broker: connecting to %s (session %s)", brokerURL, sessionID)
 		conn, _, err := websocket.Dial(ctx, wsURL, nil)
 		if err != nil {
-			log.Printf("broker: dial: %v (повтор через 3с)", err)
+			log.Printf("broker: dial: %v (retry in 3s)", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -140,10 +140,10 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 			}
 			continue
 		}
-		log.Printf("broker: подключён, жду зрителя")
+		log.Printf("broker: connected, waiting for viewer")
 		serveSession(ctx, conn, enc, opts, "broker:"+sessionID)
 		if ctx.Err() == nil {
-			log.Printf("broker: сессия завершена, переподключаюсь")
+			log.Printf("broker: session ended, reconnecting")
 			select {
 			case <-ctx.Done():
 				return
@@ -281,7 +281,7 @@ func (s *session) renegotiateTracks(ctx context.Context, opts capture.Options) {
 		return
 	}
 	s.send(ctx, signalMessage{Type: "offer", SDP: offer.SDP})
-	log.Printf("broker: ренеготиация (codec=%s audio=%v) — без разрыва", opts.Codec, opts.Audio)
+	log.Printf("broker: renegotiating (codec=%s audio=%v) — no reconnect", opts.Codec, opts.Audio)
 
 	// Рестарт захвата под новые треки — в фоне (~1с), чтобы не блокировать readLoop.
 	go func() {
@@ -477,7 +477,7 @@ func readLoop(ctx context.Context, s *session) {
 		if err != nil {
 			// 1008 — брокер закрыл: сессия неизвестна/не авторизована.
 			if websocket.CloseStatus(err) == websocket.StatusPolicyViolation {
-				log.Printf("broker: сессия не найдена или не авторизована — проверь --session (полный UUID) и что она создана на том же сайте")
+				log.Printf("broker: session not found or unauthorized — check --session (full UUID) and that it was created on the same site")
 			} else if ctx.Err() == nil && websocket.CloseStatus(err) == -1 && !errors.Is(err, context.Canceled) {
 				log.Printf("signaling: ws read: %v", err)
 			}
@@ -504,7 +504,7 @@ func readLoop(ctx context.Context, s *session) {
 				case webrtc.PeerConnectionStateConnected,
 					webrtc.PeerConnectionStateFailed,
 					webrtc.PeerConnectionStateDisconnected:
-					log.Printf("broker: повторный hello (%s) — пересоздаю сессию", s.pc.ConnectionState())
+					log.Printf("broker: repeated hello (%s) — recreating session", s.pc.ConnectionState())
 					return
 				default:
 					continue // рукопожатие идёт — игнорируем дубль hello

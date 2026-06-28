@@ -40,7 +40,7 @@ func main() {
 		sessionID = *id
 	}
 	if sessionID == "" {
-		log.Fatalf("нужен --session=<uuid> (код сессии брокера; создаётся на сайте katana-saas)")
+		log.Fatalf("--session=<uuid> is required (broker session code; created on the katana-saas site)")
 	}
 
 	opts := capture.Options{
@@ -64,9 +64,9 @@ func main() {
 	// запущено (не к самому бинарю).
 	if !*test {
 		if permissions.RequestScreenCapture() {
-			log.Printf("permissions: запись экрана разрешена")
+			log.Printf("permissions: screen recording granted")
 		} else {
-			log.Printf("permissions: нет доступа к записи экрана — выдай в System Settings → Screen Recording и перезапусти терминал")
+			log.Printf("permissions: no screen recording access — grant it in System Settings → Screen Recording and restart the terminal")
 		}
 	}
 
@@ -77,7 +77,7 @@ func main() {
 		log.Printf("ffmpeg: %s", ff)
 	}
 
-	log.Printf("katana host: session %s через %s", sessionID, *broker)
+	log.Printf("katana host: session %s via %s", sessionID, *broker)
 	runBrokerHost(ctx, *broker, sessionID, enc, opts)
-	log.Printf("остановлено")
+	log.Printf("stopped")
 }
