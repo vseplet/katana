@@ -67,6 +67,7 @@ const settings = {
   volume: 1, // громкость воспроизведения 0..1 (клиент)
   muted: true, // mute воспроизведения (клиент; true для автоплея)
   control: false, // управлять мышью хоста (отправлять события)
+  kbd: false, // пробрасывать клавиатуру на хост
   layout: "desktop", // раскладка: desktop | split | terminal
   termPct: 50, // доля терминала в сплите, % (разделитель)
   // тюнинг ввода (клиентский):
@@ -726,10 +727,18 @@ function setControl(on) {
   settings.control = on;
   btnControl.classList.toggle("active", on);
   video.style.cursor = on ? "crosshair" : "default";
-  updateAppsVisibility(); // ленту приложений прячем в режиме управления
+  updateAppsVisibility(); // ленту приложений прячем в режиме управления мышью
   saveSettings();
   // Курсор хоста меняем на лету (без перезапуска захвата → без обрыва видео).
   sendInput({ type: "cursor", config: { cursor: !on } });
+}
+
+// Управление клавиатурой — отдельно от мыши.
+const btnKbd = document.getElementById("btn-kbd");
+function setKbd(on) {
+  settings.kbd = on;
+  btnKbd.classList.toggle("active", on);
+  saveSettings();
 }
 
 // --- Лента открытых приложений ---
@@ -813,7 +822,7 @@ function mapKey(e) {
   return null; // голые модификаторы (Shift/Control/…) и неизвестное — игнор
 }
 window.addEventListener("keydown", (e) => {
-  if (!settings.control) return;
+  if (!settings.kbd) return;
   // В терминале/панели клавиатура обрабатывается на месте — не перехватываем.
   if (e.target && e.target.closest && e.target.closest("#term-pane, .lil-gui")) return;
   const printable = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
@@ -827,7 +836,7 @@ window.addEventListener("keydown", (e) => {
     if (e.altKey) mods.push("alt");
     if (e.metaKey) mods.push("cmd");
     if (e.shiftKey) mods.push("shift");
-    sendInput({ type: "key", key: k, mods });
+    sendInput({ type: "key", key: { key: k, mods } }); // сервер ждёт keyMsg{key,mods}
   }
   e.preventDefault();
 });
@@ -982,6 +991,8 @@ document.getElementById("btn-fullscreen").addEventListener("click", toggleFullsc
 document.getElementById("btn-reset").addEventListener("click", resetView);
 btnControl.addEventListener("click", () => setControl(!settings.control));
 btnControl.classList.toggle("active", settings.control);
+btnKbd.addEventListener("click", () => setKbd(!settings.kbd));
+btnKbd.classList.toggle("active", settings.kbd);
 video.style.cursor = settings.control ? "crosshair" : "default";
 updateAppsVisibility(); // показать ленту приложений (если не режим управления)
 applyTermPct(); // применить сохранённое соотношение панелей

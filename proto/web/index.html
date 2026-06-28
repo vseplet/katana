@@ -54,6 +54,9 @@
     #video-pane { flex: calc(100 - var(--term-pct)) 1 0; background: #000; }
     #term-pane { flex: var(--term-pct) 1 0; background: #0b0e14; display: none; touch-action: auto; }
     #term-body { position: absolute; inset: 0; padding: 4px 6px; }
+    /* Прячем постоянный скроллбар xterm (overflow-y:scroll); скролл колесом/тачем работает. */
+    .xterm-viewport { scrollbar-width: none; }
+    .xterm-viewport::-webkit-scrollbar { width: 0; height: 0; }
     /* Разделитель: виден только в сплите; тащим — меняем соотношение. */
     #divider { display: none; flex: 0 0 8px; background: rgba(255, 255, 255, 0.08); position: relative; z-index: 8; touch-action: none; }
     #divider::after {
@@ -102,8 +105,8 @@
        план на хосте. Прячется в режиме управления. */
     #apps {
       position: fixed;
-      /* в одном ряду с HUD (внизу слева), справа от его четырёх кнопок */
-      left: calc(env(safe-area-inset-left) + 240px);
+      /* в одном ряду с HUD (внизу слева), справа от его пяти кнопок */
+      left: calc(env(safe-area-inset-left) + 296px);
       right: 12px;
       bottom: max(12px, env(safe-area-inset-bottom));
       height: 48px;
@@ -161,7 +164,7 @@
     #hud button svg { width: 22px; height: 22px; }
     #hud button:active { background: rgba(40, 40, 44, 0.85); }
     /* Активный режим (управление / терминал виден) — заметная зелёная подсветка. */
-    #btn-control.active, #btn-layout.active {
+    #btn-control.active, #btn-layout.active, #btn-kbd.active {
       color: #fff;
       background: rgba(70, 160, 90, 0.85);
       border-color: rgba(120, 230, 150, 0.9);
@@ -232,9 +235,15 @@
         <path d="M2 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2zm12 1a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"/>
       </svg>
     </button>
-    <button id="btn-control" title="Управление мышью (вкл/выкл)" aria-label="control">
+    <button id="btn-control" title="Управление мышью (вкл/выкл)" aria-label="mouse control">
       <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16">
         <path d="M8 3a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 3m4 8a4 4 0 0 1-8 0V5a4 4 0 1 1 8 0zM8 0a5 5 0 0 0-5 5v6a5 5 0 0 0 10 0V5a5 5 0 0 0-5-5"/>
+      </svg>
+    </button>
+    <button id="btn-kbd" title="Управление клавиатурой (вкл/выкл)" aria-label="keyboard control">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16">
+        <path d="M14 5a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zM2 4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"/>
+        <path d="M13 10.25a.25.25 0 0 1 .25-.25h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5a.25.25 0 0 1-.25-.25zm0-2a.25.25 0 0 1 .25-.25h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5a.25.25 0 0 1-.25-.25zm-5 0A.25.25 0 0 1 8.25 8h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5A.25.25 0 0 1 8 8.75zm2 0a.25.25 0 0 1 .25-.25h1.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-1.5a.25.25 0 0 1-.25-.25zm1 2a.25.25 0 0 1 .25-.25h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5a.25.25 0 0 1-.25-.25zm-5-2A.25.25 0 0 1 6.25 8h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5A.25.25 0 0 1 6 8.75zm-2 0A.25.25 0 0 1 4.25 8h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5A.25.25 0 0 1 4 8.75zm-2 0A.25.25 0 0 1 2.25 8h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5A.25.25 0 0 1 2 8.75zm11-2a.25.25 0 0 1 .25-.25h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5a.25.25 0 0 1-.25-.25zm-2 0a.25.25 0 0 1 .25-.25h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5a.25.25 0 0 1-.25-.25zm-2 0A.25.25 0 0 1 9.25 6h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5A.25.25 0 0 1 9 6.75zm-2 0A.25.25 0 0 1 7.25 6h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5A.25.25 0 0 1 7 6.75zm-2 0A.25.25 0 0 1 5.25 6h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5A.25.25 0 0 1 5 6.75zm-3 0A.25.25 0 0 1 2.25 6h1.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-1.5A.25.25 0 0 1 2 6.75zm0 4a.25.25 0 0 1 .25-.25h.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-.5a.25.25 0 0 1-.25-.25zm2 0a.25.25 0 0 1 .25-.25h5.5a.25.25 0 0 1 .25.25v.5a.25.25 0 0 1-.25.25h-5.5a.25.25 0 0 1-.25-.25z"/>
       </svg>
     </button>
     <button id="btn-fullscreen" title="Fullscreen" aria-label="fullscreen">
