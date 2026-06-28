@@ -10,7 +10,7 @@ import (
 )
 
 // errNoFFmpeg — ffmpeg не найден ни рядом, ни в PATH.
-var errNoFFmpeg = errors.New("ffmpeg не найден: положи бинарник в ~/.katana/bin/ffmpeg или установи ffmpeg (brew install ffmpeg)")
+var errNoFFmpeg = errors.New("ffmpeg not found: place a binary at ~/.katana/bin/ffmpeg or install ffmpeg (e.g. brew install ffmpeg)")
 
 var (
 	ffmpegOnce sync.Once
