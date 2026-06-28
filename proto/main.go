@@ -30,7 +30,7 @@ func main() {
 	width := flag.Int("width", 1280, "целевая ширина в пикселях (0 = нативное)")
 	fps := flag.Int("fps", 30, "частота кадров")
 	bitrate := flag.String("bitrate", "3M", "целевой битрейт видео")
-	codec := flag.String("codec", "vp8", "кодек: vp8 | h264 (VideoToolbox)")
+	codec := flag.String("codec", "h264", "кодек: h264 (VideoToolbox) | vp8")
 	audio := flag.Bool("audio", false, "передавать звук (SCK → Opus)")
 	test := flag.Bool("test", false, "синтетический testsrc вместо экрана (отладка без TCC)")
 	flag.Parse()

@@ -178,6 +178,120 @@ func serveSession(parent context.Context, conn *websocket.Conn, enc capture.Capt
 	readLoop(ctx, s)
 }
 
+// buildOpts накладывает выбор зрителя (config + codec + audio) на базовые опции.
+func (s *session) buildOpts(msg signalMessage) capture.Options {
+	opts := s.base
+	if msg.Config != nil {
+		opts = msg.Config.apply(s.base)
+	}
+	switch msg.Codec {
+	case "h264":
+		opts.Codec = capture.CodecH264
+	case "vp8":
+		opts.Codec = capture.CodecVP8
+	}
+	if msg.Audio != nil {
+		opts.Audio = *msg.Audio
+	}
+	return opts
+}
+
+// offerStream стартует захват и шлёт offer зрителю. true при успехе.
+func (s *session) offerStream(ctx context.Context, opts capture.Options) bool {
+	if err := s.startStream(ctx, opts); err != nil {
+		log.Printf("signaling: start stream: %v", err)
+		return false
+	}
+	offer, err := s.pc.CreateOffer(nil)
+	if err != nil {
+		log.Printf("signaling: create offer: %v", err)
+		return false
+	}
+	if err := s.pc.SetLocalDescription(offer); err != nil {
+		log.Printf("signaling: set local description: %v", err)
+		return false
+	}
+	s.send(ctx, signalMessage{Type: "offer", SDP: offer.SDP})
+	return true
+}
+
+// renegotiateTracks меняет треки на УЖЕ установленном pc и шлёт оффер
+// ренеготиации — без пересоздания соединения. Видео-трек пересоздаём всегда
+// (новый SSRC → Chrome заводит свежий декодер: H264 не переживает смену
+// параметров на лету по интернету; заодно меняется кодек). Opus-дорожку
+// добавляем/снимаем по opts.Audio. Выполняется в readLoop (последовательно).
+func (s *session) renegotiateTracks(ctx context.Context, opts capture.Options) {
+	s.str.stop() // остановить захват перед подменой треков
+
+	if s.videoSender != nil {
+		_ = s.pc.RemoveTrack(s.videoSender)
+	}
+	mime := webrtc.MimeTypeVP8
+	if opts.Codec == capture.CodecH264 {
+		mime = webrtc.MimeTypeH264
+	}
+	vtrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: mime}, "screen", "desktop")
+	if err != nil {
+		log.Printf("reneg: new video track: %v", err)
+		s.cancel()
+		return
+	}
+	vsender, err := s.pc.AddTrack(vtrack)
+	if err != nil {
+		log.Printf("reneg: add video track: %v", err)
+		s.cancel()
+		return
+	}
+	go readRTCP(vsender)
+	s.videoSender = vsender
+
+	var atrack *webrtc.TrackLocalStaticSample
+	if opts.Audio {
+		atrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "audio")
+		if err != nil {
+			log.Printf("reneg: new audio track: %v", err)
+			s.cancel()
+			return
+		}
+		asender, err := s.pc.AddTrack(atrack)
+		if err != nil {
+			log.Printf("reneg: add audio track: %v", err)
+			s.cancel()
+			return
+		}
+		go readRTCP(asender)
+		s.audioSender = asender
+	} else if s.audioSender != nil {
+		_ = s.pc.RemoveTrack(s.audioSender)
+		s.audioSender = nil
+	}
+	s.str.setTracks(vtrack, atrack)
+
+	// Оффер ренеготиации — сразу после смены треков (медиа польётся, когда
+	// захват перезапустится ниже; SDP описывает треки, а не кадры).
+	offer, err := s.pc.CreateOffer(nil)
+	if err != nil {
+		log.Printf("reneg: create offer: %v", err)
+		s.cancel()
+		return
+	}
+	if err := s.pc.SetLocalDescription(offer); err != nil {
+		log.Printf("reneg: set local description: %v", err)
+		s.cancel()
+		return
+	}
+	s.send(ctx, signalMessage{Type: "offer", SDP: offer.SDP})
+	log.Printf("broker: ренеготиация (codec=%s audio=%v) — без разрыва", opts.Codec, opts.Audio)
+
+	// Рестарт захвата под новые треки — в фоне (~1с), чтобы не блокировать readLoop.
+	go func() {
+		if err := s.str.reconfigure(opts); err != nil {
+			log.Printf("reneg: reconfigure: %v", err)
+		}
+		s.setSource(opts.SourceKind, opts.SourceID)
+	}()
+}
+
 // startStream строит PeerConnection с выбранными зрителем кодеком/аудио, вешает
 // каналы данных (input/term) и стартует захват. Вызывается из "hello".
 func (s *session) startStream(ctx context.Context, opts capture.Options) error {
@@ -187,6 +301,19 @@ func (s *session) startStream(ctx context.Context, opts capture.Options) error {
 	}
 	s.pc = pc
 	s.str = str
+	// Запоминаем сендеры — для замены треков при ренеготиации (без нового pc).
+	s.videoSender, s.audioSender = nil, nil
+	for _, snd := range pc.GetSenders() {
+		if snd.Track() == nil {
+			continue
+		}
+		switch snd.Track().Kind() {
+		case webrtc.RTPCodecTypeVideo:
+			s.videoSender = snd
+		case webrtc.RTPCodecTypeAudio:
+			s.audioSender = snd
+		}
+	}
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -250,10 +377,12 @@ type session struct {
 	conn   *websocket.Conn
 	enc    capture.CaptureEncoder
 	cancel context.CancelFunc // отменяет контекст сессии (по разрыву PC)
-	pc     *webrtc.PeerConnection
-	str    *streamer
-	base   capture.Options // базовые опции (источник/экран/дефолты)
-	mu     sync.Mutex      // сериализует запись в WS (OnICECandidate + readLoop)
+	pc          *webrtc.PeerConnection
+	str         *streamer
+	videoSender *webrtc.RTPSender // для замены видео-трека при ренеготиации
+	audioSender *webrtc.RTPSender // для добавления/снятия Opus-дорожки
+	base        capture.Options   // базовые опции (источник/экран/дефолты)
+	mu          sync.Mutex        // сериализует запись в WS (OnICECandidate + readLoop)
 
 	srcMu sync.Mutex   // защищает геометрию источника
 	rect  capture.Rect // глобальный прямоугольник источника (для маппинга мыши)
@@ -381,36 +510,18 @@ func readLoop(ctx context.Context, s *session) {
 					continue // рукопожатие идёт — игнорируем дубль hello
 				}
 			}
-			// Строим PeerConnection и захват под настройки зрителя из hello
-			// (width/fps/bitrate/… + codec/audio), чтобы reconnect не сбрасывал
-			// их к дефолтам хоста.
-			opts := s.base
-			if msg.Config != nil {
-				opts = msg.Config.apply(s.base)
-			}
-			switch msg.Codec {
-			case "h264":
-				opts.Codec = capture.CodecH264
-			case "vp8":
-				opts.Codec = capture.CodecVP8
-			}
-			if msg.Audio != nil {
-				opts.Audio = *msg.Audio
-			}
-			if err := s.startStream(ctx, opts); err != nil {
-				log.Printf("signaling: start stream: %v", err)
+			if !s.offerStream(ctx, s.buildOpts(msg)) {
 				return
 			}
-			offer, err := s.pc.CreateOffer(nil)
-			if err != nil {
-				log.Printf("signaling: create offer: %v", err)
-				return
+		case "renegotiate":
+			// Смена codec/audio/(H264-настроек) БЕЗ разрыва соединения: на ТОМ ЖЕ
+			// pc подменяем видео-трек (новый SSRC → Chrome поднимает свежий
+			// декодер, H264 иначе виснет) и добавляем/снимаем Opus-дорожку, затем
+			// шлём оффер ренеготиации. pc не закрывается → нет гонок/рандеву.
+			if s.pc == nil || s.str == nil {
+				continue // нет активного потока — ждём hello
 			}
-			if err := s.pc.SetLocalDescription(offer); err != nil {
-				log.Printf("signaling: set local description: %v", err)
-				return
-			}
-			s.send(ctx, signalMessage{Type: "offer", SDP: offer.SDP})
+			s.renegotiateTracks(ctx, s.buildOpts(msg))
 		case "answer":
 			if s.pc == nil {
 				continue // ещё не было hello

@@ -110,6 +110,16 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 	return nil
 }
 
+// setTracks подменяет треки, в которые пишет захват (для ренеготиации: новый
+// видео-трек с новым SSRC и/или добавление/снятие аудио). Вызывать ТОЛЬКО при
+// остановленном захвате (между stop и reconfigure), иначе писатель гонится.
+func (s *streamer) setTracks(video, audio *webrtc.TrackLocalStaticSample) {
+	s.mu.Lock()
+	s.track = video
+	s.audio = audio
+	s.mu.Unlock()
+}
+
 // updateCursor переключает видимость курсора хоста НА ЛЕТУ, без перезапуска
 // захвата (иначе каждый тоггл режима управления = ~1с обрыв видео).
 func (s *streamer) updateCursor(show bool) {
