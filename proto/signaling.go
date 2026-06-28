@@ -26,12 +26,20 @@ type signalMessage struct {
 	Config    *configMsg               `json:"config,omitempty"`
 	Mouse     *mouseMsg                `json:"mouse,omitempty"`
 	Scroll    *scrollMsg               `json:"scroll,omitempty"`
+	Key       *keyMsg                  `json:"key,omitempty"`
+	Text      string                   `json:"text,omitempty"` // для "type": набор текста
 }
 
 // scrollMsg — событие прокрутки от браузера (в «кликах» колеса).
 type scrollMsg struct {
 	Dx int `json:"dx"`
 	Dy int `json:"dy"`
+}
+
+// keyMsg — нажатие клавиши с модификаторами (спец-клавиши и шорткаты).
+type keyMsg struct {
+	Key  string   `json:"key"`
+	Mods []string `json:"mods,omitempty"`
 }
 
 // mouseMsg — событие мыши от браузера. X/Y — нормализованные [0,1] координаты
@@ -408,7 +416,7 @@ func readLoop(ctx context.Context, s *session) {
 				}
 				s.setSource(newOpts.SourceKind, newOpts.SourceID) // обновить геометрию
 			}()
-		case "mouse", "scroll", "cursor":
+		case "mouse", "scroll", "cursor", "key", "type":
 			s.dispatchInput(&msg) // фолбэк, если DataChannel ещё не открыт
 		default:
 			log.Printf("signaling: unknown message type %q", msg.Type)
@@ -431,6 +439,14 @@ func (s *session) dispatchInput(msg *signalMessage) {
 	case "cursor":
 		if msg.Config != nil && msg.Config.Cursor != nil {
 			s.str.updateCursor(*msg.Config.Cursor)
+		}
+	case "key":
+		if msg.Key != nil && msg.Key.Key != "" {
+			tapKey(msg.Key.Key, msg.Key.Mods)
+		}
+	case "type":
+		if msg.Text != "" {
+			typeText(msg.Text)
 		}
 	}
 }

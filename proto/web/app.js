@@ -797,6 +797,41 @@ video.addEventListener(
   { passive: false }
 );
 
+// Клавиатура: в режиме управления keydown с окна уходит на хост. Печатные
+// символы (без ctrl/cmd/alt) шлём как текст — TypeStr корректно набирает
+// регистр/символы; спец-клавиши и шорткаты — как key+модификаторы.
+const NAMED_KEYS = {
+  Enter: "enter", Tab: "tab", Escape: "escape", Backspace: "backspace",
+  Delete: "delete", ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left",
+  ArrowRight: "right", Home: "home", End: "end", PageUp: "pageup",
+  PageDown: "pagedown", " ": "space",
+};
+function mapKey(e) {
+  if (NAMED_KEYS[e.key]) return NAMED_KEYS[e.key];
+  if (/^F\d{1,2}$/.test(e.key)) return e.key.toLowerCase(); // F1 → f1
+  if (e.key.length === 1) return e.key.toLowerCase(); // шорткат: Cmd+C → "c"
+  return null; // голые модификаторы (Shift/Control/…) и неизвестное — игнор
+}
+window.addEventListener("keydown", (e) => {
+  if (!settings.control) return;
+  // В терминале/панели клавиатура обрабатывается на месте — не перехватываем.
+  if (e.target && e.target.closest && e.target.closest("#term-pane, .lil-gui")) return;
+  const printable = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+  if (printable) {
+    sendInput({ type: "type", text: e.key });
+  } else {
+    const k = mapKey(e);
+    if (!k) return;
+    const mods = [];
+    if (e.ctrlKey) mods.push("ctrl");
+    if (e.altKey) mods.push("alt");
+    if (e.metaKey) mods.push("cmd");
+    if (e.shiftKey) mods.push("shift");
+    sendInput({ type: "key", key: k, mods });
+  }
+  e.preventDefault();
+});
+
 // Тач. Просмотр: 1 палец = пан, 2 пальца = пинч-зум вьюпорта.
 // Управление: 1 палец = курсор/тап/drag (отложенно), 2 пальца = скролл хоста.
 const tDist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
