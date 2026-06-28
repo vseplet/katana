@@ -363,12 +363,23 @@ func readLoop(ctx context.Context, s *session) {
 
 		switch msg.Type {
 		case "hello":
-			// Зритель повторяет hello, пока не получит оффер; после оффера он
-			// перестаёт. Поэтому hello при УЖЕ созданном PC = переподключение
-			// (reload/watchdog) → завершаем сессию, runBrokerHost поднимет свежую.
+			// Зритель повторяет hello каждые ~1.5с, пока не получит оффер. Если
+			// PC уже есть:
+			//  - connected/failed/disconnected → реальное переподключение зрителя
+			//    (reload) → пересоздаём сессию;
+			//  - new/connecting → это просто дубль hello во время рукопожатия
+			//    (старт захвата ~секунда) → игнорируем, иначе порвём собственную
+			//    только что созданную сессию (петля «жду зрителя»).
 			if s.pc != nil {
-				log.Printf("broker: повторный hello — пересоздаю сессию")
-				return
+				switch s.pc.ConnectionState() {
+				case webrtc.PeerConnectionStateConnected,
+					webrtc.PeerConnectionStateFailed,
+					webrtc.PeerConnectionStateDisconnected:
+					log.Printf("broker: повторный hello (%s) — пересоздаю сессию", s.pc.ConnectionState())
+					return
+				default:
+					continue // рукопожатие идёт — игнорируем дубль hello
+				}
 			}
 			// Строим PeerConnection и захват под настройки зрителя из hello
 			// (width/fps/bitrate/… + codec/audio), чтобы reconnect не сбрасывал
