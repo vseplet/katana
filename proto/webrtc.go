@@ -175,9 +175,8 @@ func newPeerConnection(ctx context.Context, enc capture.CaptureEncoder, opts cap
 	// смена требует переподключения: добавление трека = ренеготиация).
 	var audio *webrtc.TrackLocalStaticSample
 	if opts.Audio {
-		// ВАЖНО: отдельный streamID (не "desktop") — иначе видео и аудио в одном
-		// MediaStream, и Chrome жёстко синхронит A/V, раздувая видео-буфер под
-		// звук на джиттерном канале. Разные стримы → независимые буферы.
+		// Отдельный streamID (не "desktop") → видео и аудио в РАЗНЫХ MediaStream,
+		// Chrome не синхронит A/V и не раздувает видео-буфер под звук.
 		audio, err = webrtc.NewTrackLocalStaticSample(
 			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
 			"audio", "audio")

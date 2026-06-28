@@ -218,8 +218,7 @@ static dispatch_queue_t gQueue;
 static dispatch_queue_t gAudioQueue;
 
 // app_main_window — главное (крупнейшее видимое) окно приложения pid, или nil.
-// Захват приложения = захват этого окна: тесный кадр, который ещё и следует за
-// окном при перемещении (в отличие от кропа по дисплею).
+// Захват приложения = захват этого окна: тесный кадр, следует за окном.
 static SCWindow *app_main_window(SCShareableContent *content, pid_t pid) {
 	SCWindow *best = nil;
 	CGFloat bestArea = 0;
@@ -254,7 +253,7 @@ int sck_source_size(int kind, unsigned int sid, int *outW, int *outH) {
 				}
 			}
 		} else if (kind == 2) {
-			SCWindow *win = app_main_window(content, (pid_t)sid); // главное окно
+			SCWindow *win = app_main_window(content, (pid_t)sid);
 			if (win) {
 				w = (int)win.frame.size.width;
 				h = (int)win.frame.size.height;
@@ -419,7 +418,7 @@ int sck_source_rect(int kind, unsigned int sid, double *x, double *y, double *w,
 				if (win.windowID == sid) { r = win.frame; break; }
 			}
 		} else if (kind == 2) {
-			SCWindow *win = app_main_window(content, (pid_t)sid); // окно приложения
+			SCWindow *win = app_main_window(content, (pid_t)sid);
 			if (win) r = win.frame;
 			if (CGRectIsNull(r)) {
 				SCDisplay *d = content.displays.firstObject;
