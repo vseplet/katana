@@ -217,6 +217,24 @@ static NSMutableDictionary<NSNumber *, SCStreamConfiguration *> *gConfigs;
 static dispatch_queue_t gQueue;
 static dispatch_queue_t gAudioQueue;
 
+// app_main_window — главное (крупнейшее видимое) окно приложения pid, или nil.
+// Захват приложения = захват этого окна: тесный кадр, который ещё и следует за
+// окном при перемещении (в отличие от кропа по дисплею).
+static SCWindow *app_main_window(SCShareableContent *content, pid_t pid) {
+	SCWindow *best = nil;
+	CGFloat bestArea = 0;
+	for (SCWindow *x in content.windows) {
+		if (x.owningApplication.processID != pid) continue;
+		if (!x.onScreen) continue;
+		CGFloat area = x.frame.size.width * x.frame.size.height;
+		if (area > bestArea) {
+			bestArea = area;
+			best = x;
+		}
+	}
+	return best;
+}
+
 // sck_source_size возвращает размер источника в пикселях (без старта потока),
 // чтобы вызывающий мог настроить ffmpeg на нужный video_size.
 // kind: 1=window, 2=app, иначе display. Возвращает 0 при успехе.
@@ -236,18 +254,29 @@ int sck_source_size(int kind, unsigned int sid, int *outW, int *outH) {
 				}
 			}
 		} else if (kind == 2) {
-			SCDisplay *d = content.displays.firstObject;
-			if (d) {
-				w = (int)d.width;
-				h = (int)d.height;
-			}
-		} else {
-			for (SCDisplay *d in content.displays) {
-				if (d.displayID == sid) {
+			SCWindow *win = app_main_window(content, (pid_t)sid); // главное окно
+			if (win) {
+				w = (int)win.frame.size.width;
+				h = (int)win.frame.size.height;
+			} else {
+				SCDisplay *d = content.displays.firstObject;
+				if (d) {
 					w = (int)d.width;
 					h = (int)d.height;
+				}
+			}
+		} else {
+			SCDisplay *disp = nil;
+			for (SCDisplay *d in content.displays) {
+				if (d.displayID == sid) {
+					disp = d;
 					break;
 				}
+			}
+			if (!disp) disp = content.displays.firstObject; // sid==0/не найден → главный
+			if (disp) {
+				w = (int)disp.width;
+				h = (int)disp.height;
 			}
 		}
 		if (w <= 0 || h <= 0) {
@@ -280,19 +309,12 @@ int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cu
 			filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:win];
 			w = (int)win.frame.size.width;
 			h = (int)win.frame.size.height;
-		} else if (kind == 2) { // приложение
-			SCRunningApplication *app = nil;
-			for (SCRunningApplication *a in content.applications) {
-				if (a.processID == (pid_t)sid) { app = a; break; }
-			}
-			if (!app) return 3;
-			SCDisplay *disp = content.displays.firstObject;
-			if (!disp) return 4;
-			filter = [[SCContentFilter alloc] initWithDisplay:disp
-			                            includingApplications:@[ app ]
-			                                  exceptingWindows:@[]];
-			w = (int)disp.width;
-			h = (int)disp.height;
+		} else if (kind == 2) { // приложение → его главное окно (тесно, следует за окном)
+			SCWindow *win = app_main_window(content, (pid_t)sid);
+			if (!win) return 3;
+			filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:win];
+			w = (int)win.frame.size.width;
+			h = (int)win.frame.size.height;
 		} else { // дисплей
 			SCDisplay *disp = nil;
 			for (SCDisplay *d in content.displays) {
@@ -397,8 +419,12 @@ int sck_source_rect(int kind, unsigned int sid, double *x, double *y, double *w,
 				if (win.windowID == sid) { r = win.frame; break; }
 			}
 		} else if (kind == 2) {
-			SCDisplay *d = content.displays.firstObject;
-			if (d) r = d.frame;
+			SCWindow *win = app_main_window(content, (pid_t)sid); // окно приложения
+			if (win) r = win.frame;
+			if (CGRectIsNull(r)) {
+				SCDisplay *d = content.displays.firstObject;
+				if (d) r = d.frame;
+			}
 		} else {
 			for (SCDisplay *d in content.displays) {
 				if (d.displayID == sid) { r = d.frame; break; }

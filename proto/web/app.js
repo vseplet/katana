@@ -414,8 +414,11 @@ function disconnect() {
 function connect() {
   disconnect();
 
-  // Пустой конфиг: localhost, host-кандидаты, без ICE-серверов.
-  pc = new RTCPeerConnection();
+  // Публичный STUN — srflx-кандидаты для P2P через NAT (loopback/Tailscale
+  // обошлись бы host-кандидатами). TURN-relay пока нет.
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
   window.pc = pc; // для отладочной статистики из DevTools
 
   // Каналы создаёт сервер (офферер) — ловим их здесь.

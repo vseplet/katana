@@ -133,12 +133,18 @@ func (s *streamer) stop() {
 }
 
 // newPeerConnection создаёт PeerConnection с одним sendonly VP8-треком и
-// streamer'ом под ним, запускает начальный захват с opts.
+// streamer'ом под ним. Захват НЕ стартует — это делается лениво (по hello).
 //
 // Возвращает PeerConnection и streamer — вызывающий обязан Close()/stop() их.
 func newPeerConnection(ctx context.Context, enc capture.CaptureEncoder, opts capture.Options) (*webrtc.PeerConnection, *streamer, error) {
-	// Пустой конфиг: localhost, host-кандидаты, без STUN/TURN.
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	// Публичный STUN — собираем srflx-кандидаты для P2P через NAT (для loopback/
+	// Tailscale хватило бы host-кандидатов, но для выхода наружу STUN нужен).
+	// TURN-relay пока нет — symmetric NAT не пробьётся.
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		},
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("new peer connection: %w", err)
 	}
@@ -169,9 +175,12 @@ func newPeerConnection(ctx context.Context, enc capture.CaptureEncoder, opts cap
 	// смена требует переподключения: добавление трека = ренеготиация).
 	var audio *webrtc.TrackLocalStaticSample
 	if opts.Audio {
+		// ВАЖНО: отдельный streamID (не "desktop") — иначе видео и аудио в одном
+		// MediaStream, и Chrome жёстко синхронит A/V, раздувая видео-буфер под
+		// звук на джиттерном канале. Разные стримы → независимые буферы.
 		audio, err = webrtc.NewTrackLocalStaticSample(
 			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
-			"audio", "desktop")
+			"audio", "audio")
 		if err != nil {
 			_ = pc.Close()
 			return nil, nil, fmt.Errorf("new audio track: %w", err)
@@ -184,12 +193,9 @@ func newPeerConnection(ctx context.Context, enc capture.CaptureEncoder, opts cap
 		go readRTCP(asender)
 	}
 
+	// Захват НЕ стартуем здесь — лениво, по приходу зрителя (hello), чтобы
+	// ffmpeg/SCK не крутились вхолостую, пока никто не подключился.
 	s := newStreamer(ctx, enc, track, audio)
-	if err := s.reconfigure(opts); err != nil {
-		_ = pc.Close()
-		return nil, nil, err
-	}
-
 	return pc, s, nil
 }
 

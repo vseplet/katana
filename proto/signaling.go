@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"net/url"
-	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
@@ -28,6 +28,14 @@ type signalMessage struct {
 	Scroll    *scrollMsg               `json:"scroll,omitempty"`
 	Key       *keyMsg                  `json:"key,omitempty"`
 	Text      string                   `json:"text,omitempty"` // для "type": набор текста
+	// Параметры для "hello" — зритель выбирает кодек и звук при подключении
+	// (как кодек/аудио меняются: новый трек = нужен новый PeerConnection).
+	Codec string `json:"codec,omitempty"`
+	Audio *bool  `json:"audio,omitempty"`
+	// Источники захвата: запрос ("sources") и ответ хоста (Sources); активация
+	// приложения ("activate" + PID). Раньше это было HTTP-API хоста.
+	Sources *capture.Sources `json:"sources,omitempty"`
+	PID     int              `json:"pid,omitempty"`
 }
 
 // scrollMsg — событие прокрутки от браузера (в «кликах» колеса).
@@ -114,177 +122,138 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
-// optsFromQuery строит опции захвата для соединения: базовые (флаги сервера),
-// переопределённые query-параметрами при коннекте. Кодек задаётся только так
-// (на лету не меняется — нужен новый трек), остальное можно менять и через
-// config-сообщения уже в сессии.
-func optsFromQuery(base capture.Options, q url.Values) capture.Options {
-	var c configMsg
-	if q.Has("sourceKind") {
-		v := q.Get("sourceKind")
-		c.SourceKind = &v
+// runBrokerHost подключается исходящим WS к рандеву-брокеру как host и ведёт
+// сессию через него (режим: katana --id=<uuid>). После ухода зрителя
+// переподключается, чтобы ждать следующего.
+func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture.CaptureEncoder, opts capture.Options) {
+	wsURL := fmt.Sprintf("%s?session=%s&role=host",
+		strings.TrimRight(brokerURL, "/"), url.QueryEscape(sessionID))
+	for ctx.Err() == nil {
+		log.Printf("broker: подключаюсь к %s (session %s)", brokerURL, sessionID)
+		conn, _, err := websocket.Dial(ctx, wsURL, nil)
+		if err != nil {
+			log.Printf("broker: dial: %v (повтор через 3с)", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
+		log.Printf("broker: подключён, жду зрителя")
+		serveSession(ctx, conn, enc, opts, "broker:"+sessionID)
+		if ctx.Err() == nil {
+			log.Printf("broker: сессия завершена, переподключаюсь")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
 	}
-	if v, ok := queryInt(q, "sourceId"); ok {
-		c.SourceID = &v
-	}
-	if v, ok := queryInt(q, "screen"); ok {
-		c.Screen = &v
-	}
-	if v, ok := queryInt(q, "width"); ok {
-		c.Width = &v
-	}
-	if v, ok := queryInt(q, "fps"); ok {
-		c.FPS = &v
-	}
-	if v, ok := queryInt(q, "bitrateKbps"); ok {
-		c.BitrateKbps = &v
-	}
-	if v, ok := queryInt(q, "threads"); ok {
-		c.Threads = &v
-	}
-	if q.Has("dropLate") {
-		b := q.Get("dropLate") == "true"
-		c.DropLate = &b
-	}
-	if q.Has("cursor") {
-		b := q.Get("cursor") == "true"
-		c.Cursor = &b
-	}
-	o := c.apply(base)
-	switch q.Get("codec") {
-	case "h264":
-		o.Codec = capture.CodecH264
-	case "vp8":
-		o.Codec = capture.CodecVP8
-	}
-	// Звук — только при коннекте (добавление дорожки = ренеготиация).
-	o.Audio = q.Get("audio") == "true"
-	return o
 }
 
-func queryInt(q url.Values, key string) (int, bool) {
-	if !q.Has(key) {
-		return 0, false
-	}
-	v, err := strconv.Atoi(q.Get(key))
-	if err != nil {
-		return 0, false
-	}
-	return v, true
-}
+// serveSession ведёт одну сессию поверх готового WS-соединения. Host —
+// инициатор оффера; оффер шлётся в ответ на "hello" от зрителя (в broker-режиме
+// хост подключается раньше зрителя, поэтому сразу слать оффер нельзя).
+func serveSession(parent context.Context, conn *websocket.Conn, enc capture.CaptureEncoder, connOpts capture.Options, label string) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 
-// signalingHandler возвращает http.HandlerFunc для /ws.
-//
-// На каждое WS-соединение поднимается отдельный PeerConnection с захватом.
-// Go — инициатор оффера, браузер отвечает (см. §4 ТЗ).
-//
-// root — корневой контекст сервера: его отмена (SIGINT/SIGTERM) останавливает
-// захваты всех активных зрителей.
-func signalingHandler(root context.Context, enc capture.CaptureEncoder, opts capture.Options) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			// localhost-прототип: не привередничаем к Origin.
-			InsecureSkipVerify: true,
-		})
-		if err != nil {
-			log.Printf("signaling: ws accept: %v", err)
-			return
+	s := &session{conn: conn, enc: enc, cancel: cancel, base: connOpts}
+	defer func() {
+		if s.str != nil {
+			s.str.stop()
 		}
-		connOpts := optsFromQuery(opts, r.URL.Query())
-		log.Printf("signaling: viewer connected (%s) codec=%s", r.RemoteAddr, connOpts.Codec)
-
-		// Контекст соединения наследуется от корневого: отменяется и при
-		// отключении зрителя (defer cancel), и при остановке сервера (root).
-		ctx, cancel := context.WithCancel(root)
-		defer cancel()
-
-		s := &session{conn: conn, base: connOpts}
-		s.setSource(connOpts.SourceKind, connOpts.SourceID) // геометрия для мыши
-		defer func() {
-			_ = conn.CloseNow()
-			log.Printf("signaling: viewer disconnected (%s)", r.RemoteAddr)
-		}()
-
-		pc, str, err := newPeerConnection(ctx, enc, connOpts)
-		if err != nil {
-			log.Printf("signaling: peer connection: %v", err)
-			return
-		}
-		defer func() {
-			str.stop()
-			if err := pc.Close(); err != nil {
+		if s.pc != nil {
+			if err := s.pc.Close(); err != nil {
 				log.Printf("signaling: pc close: %v", err)
 			}
-		}()
-		s.pc = pc
-		s.str = str
-
-		// Трикл ICE: каждый локальный кандидат уходит зрителю.
-		pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-			if c == nil {
-				return // сбор кандидатов завершён
-			}
-			init := c.ToJSON()
-			s.send(ctx, signalMessage{Type: "candidate", Candidate: &init})
-		})
-
-		pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-			log.Printf("signaling: connection state -> %s", state)
-			switch state {
-			case webrtc.PeerConnectionStateFailed,
-				webrtc.PeerConnectionStateClosed,
-				webrtc.PeerConnectionStateDisconnected:
-				cancel()
-			}
-		})
-
-		// Канал ввода (ordered+reliable) поверх того же peer-соединения — низкая
-		// задержка, единый транспорт. Go создаёт его до оффера; браузер шлёт сюда
-		// mouse/scroll/cursor. Создаём ДО CreateOffer, чтобы попал в SDP.
-		if dc, err := pc.CreateDataChannel("input", nil); err != nil {
-			log.Printf("signaling: data channel: %v", err)
-		} else {
-			dc.OnMessage(func(m webrtc.DataChannelMessage) {
-				var im signalMessage
-				if json.Unmarshal(m.Data, &im) != nil {
-					return
-				}
-				s.dispatchInput(&im)
-			})
 		}
+		_ = conn.CloseNow()
+		log.Printf("signaling: session ended (%s)", label)
+	}()
 
-		// Канал терминала (ordered+reliable): PTY поверх того же соединения.
-		// Шелл поднимается лениво на первый resize (когда зритель открыл терминал).
-		if dc, err := pc.CreateDataChannel("term", nil); err != nil {
-			log.Printf("signaling: term channel: %v", err)
-		} else {
-			sharedTerminal.bind(dc)
-		}
+	// PeerConnection и захват создаются лениво по "hello" (с кодеком/аудио зрителя).
+	readLoop(ctx, s)
+}
 
-		// Go офферит первым.
-		offer, err := pc.CreateOffer(nil)
-		if err != nil {
-			log.Printf("signaling: create offer: %v", err)
-			return
-		}
-		if err := pc.SetLocalDescription(offer); err != nil {
-			log.Printf("signaling: set local description: %v", err)
-			return
-		}
-		s.send(ctx, signalMessage{Type: "offer", SDP: offer.SDP})
-
-		// Цикл чтения: answer + кандидаты от браузера.
-		readLoop(ctx, s)
+// startStream строит PeerConnection с выбранными зрителем кодеком/аудио, вешает
+// каналы данных (input/term) и стартует захват. Вызывается из "hello".
+func (s *session) startStream(ctx context.Context, opts capture.Options) error {
+	pc, str, err := newPeerConnection(ctx, s.enc, opts)
+	if err != nil {
+		return err
 	}
+	s.pc = pc
+	s.str = str
+
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		init := c.ToJSON()
+		s.send(ctx, signalMessage{Type: "candidate", Candidate: &init})
+	})
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("signaling: connection state -> %s", state)
+		switch state {
+		case webrtc.PeerConnectionStateFailed,
+			webrtc.PeerConnectionStateClosed,
+			webrtc.PeerConnectionStateDisconnected:
+			s.cancel()
+		}
+	})
+
+	// Каналы данных создаём ДО оффера → попадут в SDP.
+	if dc, err := pc.CreateDataChannel("input", nil); err != nil {
+		log.Printf("signaling: data channel: %v", err)
+	} else {
+		dc.OnMessage(func(m webrtc.DataChannelMessage) {
+			var im signalMessage
+			if json.Unmarshal(m.Data, &im) != nil {
+				return
+			}
+			switch im.Type {
+			case "sources":
+				// Список источников захвата — ответ по тому же каналу (P2P).
+				if src, err := capture.ListSources(); err == nil {
+					if b, err := json.Marshal(signalMessage{Type: "sources", Sources: &src}); err == nil {
+						_ = dc.SendText(string(b))
+					}
+				}
+			case "activate":
+				if im.PID > 0 {
+					_ = capture.ActivateApp(im.PID)
+				}
+			default:
+				s.dispatchInput(&im)
+			}
+		})
+	}
+	if dc, err := pc.CreateDataChannel("term", nil); err != nil {
+		log.Printf("signaling: term channel: %v", err)
+	} else {
+		sharedTerminal.bind(dc)
+	}
+
+	if err := str.reconfigure(opts); err != nil {
+		return err
+	}
+	s.setSource(opts.SourceKind, opts.SourceID)
+	return nil
 }
 
 // session держит WS-соединение, PeerConnection и streamer одного зрителя.
+// pc/str создаются лениво по "hello" (с кодеком/аудио зрителя).
 type session struct {
-	conn *websocket.Conn
-	pc   *webrtc.PeerConnection
-	str  *streamer
-	base capture.Options // базовые опции (индекс экрана, дефолты)
-	mu   sync.Mutex      // сериализует запись в WS (OnICECandidate + readLoop)
+	conn   *websocket.Conn
+	enc    capture.CaptureEncoder
+	cancel context.CancelFunc // отменяет контекст сессии (по разрыву PC)
+	pc     *webrtc.PeerConnection
+	str    *streamer
+	base   capture.Options // базовые опции (источник/экран/дефолты)
+	mu     sync.Mutex      // сериализует запись в WS (OnICECandidate + readLoop)
 
 	srcMu sync.Mutex   // защищает геометрию источника
 	rect  capture.Rect // глобальный прямоугольник источника (для маппинга мыши)
@@ -377,8 +346,10 @@ func readLoop(ctx context.Context, s *session) {
 	for {
 		_, data, err := s.conn.Read(ctx)
 		if err != nil {
-			// Нормальное закрытие или отмена контекста.
-			if ctx.Err() == nil && websocket.CloseStatus(err) == -1 && !errors.Is(err, context.Canceled) {
+			// 1008 — брокер закрыл: сессия неизвестна/не авторизована.
+			if websocket.CloseStatus(err) == websocket.StatusPolicyViolation {
+				log.Printf("broker: сессия не найдена или не авторизована — проверь --session (полный UUID) и что она создана на том же сайте")
+			} else if ctx.Err() == nil && websocket.CloseStatus(err) == -1 && !errors.Is(err, context.Canceled) {
 				log.Printf("signaling: ws read: %v", err)
 			}
 			return
@@ -391,20 +362,61 @@ func readLoop(ctx context.Context, s *session) {
 		}
 
 		switch msg.Type {
+		case "hello":
+			// Зритель повторяет hello, пока не получит оффер; после оффера он
+			// перестаёт. Поэтому hello при УЖЕ созданном PC = переподключение
+			// (reload/watchdog) → завершаем сессию, runBrokerHost поднимет свежую.
+			if s.pc != nil {
+				log.Printf("broker: повторный hello — пересоздаю сессию")
+				return
+			}
+			// Строим PeerConnection и захват под настройки зрителя из hello
+			// (width/fps/bitrate/… + codec/audio), чтобы reconnect не сбрасывал
+			// их к дефолтам хоста.
+			opts := s.base
+			if msg.Config != nil {
+				opts = msg.Config.apply(s.base)
+			}
+			switch msg.Codec {
+			case "h264":
+				opts.Codec = capture.CodecH264
+			case "vp8":
+				opts.Codec = capture.CodecVP8
+			}
+			if msg.Audio != nil {
+				opts.Audio = *msg.Audio
+			}
+			if err := s.startStream(ctx, opts); err != nil {
+				log.Printf("signaling: start stream: %v", err)
+				return
+			}
+			offer, err := s.pc.CreateOffer(nil)
+			if err != nil {
+				log.Printf("signaling: create offer: %v", err)
+				return
+			}
+			if err := s.pc.SetLocalDescription(offer); err != nil {
+				log.Printf("signaling: set local description: %v", err)
+				return
+			}
+			s.send(ctx, signalMessage{Type: "offer", SDP: offer.SDP})
 		case "answer":
+			if s.pc == nil {
+				continue // ещё не было hello
+			}
 			ans := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: msg.SDP}
 			if err := s.pc.SetRemoteDescription(ans); err != nil {
 				log.Printf("signaling: set remote description: %v", err)
 			}
 		case "candidate":
-			if msg.Candidate == nil {
+			if s.pc == nil || msg.Candidate == nil {
 				continue
 			}
 			if err := s.pc.AddICECandidate(*msg.Candidate); err != nil {
 				log.Printf("signaling: add ice candidate: %v", err)
 			}
 		case "config":
-			if msg.Config == nil {
+			if msg.Config == nil || s.str == nil {
 				continue
 			}
 			// Перезапуск ffmpeg может занять ~секунду — делаем в отдельной
@@ -437,7 +449,7 @@ func (s *session) dispatchInput(msg *signalMessage) {
 			scrollMouse(msg.Scroll.Dx, msg.Scroll.Dy)
 		}
 	case "cursor":
-		if msg.Config != nil && msg.Config.Cursor != nil {
+		if s.str != nil && msg.Config != nil && msg.Config.Cursor != nil {
 			s.str.updateCursor(*msg.Config.Cursor)
 		}
 	case "key":
