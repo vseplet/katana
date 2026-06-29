@@ -218,6 +218,10 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 	}
 }
 
+// captureGrace — сколько держать захват живым после ухода последнего зрителя,
+// чтобы краткий реконнект (особенно на мобильной сети) не перезапускал SCK.
+const captureGrace = 10 * time.Second
+
 // hub — хост-узел: одно WS-соединение с брокером, ОДИН общий захват и набор
 // зрителей (peer). Видео/аудио-треки общие: pion раздаёт WriteSample во все
 // привязанные PeerConnection, поэтому экран кодируется один раз на всех.
@@ -241,6 +245,7 @@ type hub struct {
 	vtrack     *webrtc.TrackLocalStaticSample
 	atrack     *webrtc.TrackLocalStaticSample
 	peers      map[string]*peer
+	stopTimer  *time.Timer // отложенная остановка захвата при 0 зрителей (grace)
 
 	srcMu sync.Mutex   // защищает геометрию источника (для координат мыши)
 	rect  capture.Rect // глобальный прямоугольник общего источника
@@ -276,6 +281,10 @@ func serveHub(parent context.Context, conn *websocket.Conn, enc capture.CaptureE
 	}
 	defer func() {
 		h.mu.Lock()
+		if h.stopTimer != nil {
+			h.stopTimer.Stop()
+			h.stopTimer = nil
+		}
 		for pid, p := range h.peers {
 			p.closePC()
 			delete(h.peers, pid)
@@ -377,6 +386,12 @@ func (h *hub) peer(pid string) *peer {
 // стартует общий захват; при последующих — берёт текущие (липкие) настройки.
 func (h *hub) onHello(pid string, msg signalMessage) {
 	h.mu.Lock()
+	// Пришёл зритель — отменяем отложенную остановку захвата (grace). Если захват
+	// ещё жив, ниже он переиспользуется (str != nil), без перезапуска.
+	if h.stopTimer != nil {
+		h.stopTimer.Stop()
+		h.stopTimer = nil
+	}
 	// Уже есть peer с таким pid?
 	if p := h.peers[pid]; p != nil {
 		switch p.pc.ConnectionState() {
@@ -478,8 +493,21 @@ func (h *hub) removePeer(pid string) {
 	delete(h.peers, pid)
 	log.Printf("broker: viewer %s left (%d remaining)", pid, len(h.peers))
 	if len(h.peers) == 0 {
-		h.stopCaptureLocked()
-		log.Printf("broker: no viewers — capture stopped (settings kept)")
+		// Захват не глушим сразу: на мобильной сети зритель часто рвётся и
+		// возвращается за пару секунд. Даём grace-период — если за него никто
+		// не подключился, тогда останавливаем. Реконнект в пределах grace
+		// переиспользует живой захват без перезапуска SCK/VideoToolbox.
+		if h.stopTimer != nil {
+			h.stopTimer.Stop()
+		}
+		h.stopTimer = time.AfterFunc(captureGrace, func() {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if len(h.peers) == 0 && h.str != nil {
+				h.stopCaptureLocked()
+				log.Printf("broker: no viewers for %s — capture stopped (settings kept)", captureGrace)
+			}
+		})
 	}
 }
 
