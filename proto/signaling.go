@@ -255,6 +255,8 @@ type peer struct {
 	videoSender *webrtc.RTPSender
 	audioSender *webrtc.RTPSender
 
+	gotAnswer bool // получили ли answer (рукопожатие завершено) — под hub.mu
+
 	btnDown string // зажатая кнопка мыши ("" если нет) — для drag
 	dragged bool   // были ли move с зажатой кнопкой (отличить drag от клика)
 }
@@ -340,6 +342,10 @@ func (h *hub) readLoop() {
 				ans := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: msg.SDP}
 				if err := p.pc.SetRemoteDescription(ans); err != nil {
 					log.Printf("signaling: set remote description: %v", err)
+				} else {
+					h.mu.Lock()
+					p.gotAnswer = true // рукопожатие завершено — больше не переслать offer
+					h.mu.Unlock()
 				}
 			}
 		case "candidate":
@@ -382,8 +388,20 @@ func (h *hub) onHello(pid string, msg signalMessage) {
 			p.closePC()
 			delete(h.peers, pid)
 		default:
+			// Рукопожатие ещё идёт. На Deno Deploy BroadcastChannel доставляет
+			// только уже подписанным изолятам, поэтому наш offer мог потеряться —
+			// пока зритель не прислал answer, переотправляем offer на каждый
+			// повторный hello, иначе зритель вечно висит на "waiting for host".
+			if !p.gotAnswer {
+				off := p.pc.LocalDescription()
+				h.mu.Unlock()
+				if off != nil {
+					h.send(signalMessage{Type: "offer", SDP: off.SDP}, pid)
+				}
+				return
+			}
 			h.mu.Unlock()
-			return // дубль hello во время рукопожатия — игнор
+			return // answer уже получен, идёт ICE — дубль hello игнорируем
 		}
 	}
 
