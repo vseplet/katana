@@ -30,6 +30,12 @@ type signalMessage struct {
 	Scroll    *scrollMsg               `json:"scroll,omitempty"`
 	Key       *keyMsg                  `json:"key,omitempty"`
 	Text      string                   `json:"text,omitempty"` // для "type": набор текста
+	// Vid — идентификатор зрителя (viewer/peer id). Несколько зрителей делят один
+	// WS хоста через брокер; vid адресует сигналинг конкретному зрителю. Зритель
+	// генерирует его при подключении и проставляет во все свои сообщения; хост
+	// возвращает тот же vid в offer/candidate/state, чтобы зритель отфильтровал
+	// чужие. (Отдельно от app-PID ниже — у activate своё числовое поле "pid".)
+	Vid string `json:"vid,omitempty"`
 	// Параметры для "hello" — зритель выбирает кодек и звук при подключении
 	// (как кодек/аудио меняются: новый трек = нужен новый PeerConnection).
 	Codec string `json:"codec,omitempty"`
@@ -141,9 +147,49 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
+func clampF(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// optsToState строит "state"-сообщение с ТЕКУЩИМИ настройками трансляции для
+// зрителя — чтобы его UI синхронизировался с уже идущим потоком, а не показывал
+// собственные дефолты (и не отправлял их обратно).
+func optsToState(o capture.Options) signalMessage {
+	codec := "vp8"
+	if o.Codec == capture.CodecH264 {
+		codec = "h264"
+	}
+	audio := o.Audio
+	kind := o.SourceKind
+	sid := o.SourceID
+	screen := o.ScreenIndex
+	width := o.Width
+	fps := o.FPS
+	cursor := o.Cursor
+	return signalMessage{
+		Type:  "state",
+		Codec: codec,
+		Audio: &audio,
+		Config: &configMsg{
+			SourceKind: &kind,
+			SourceID:   &sid,
+			Screen:     &screen,
+			Width:      &width,
+			FPS:        &fps,
+			Cursor:     &cursor,
+		},
+	}
+}
+
 // runBrokerHost подключается исходящим WS к рандеву-брокеру как host и ведёт
-// сессию через него (режим: katana --id=<uuid>). После ухода зрителя
-// переподключается, чтобы ждать следующего.
+// сессию через него (режим: katana --id=<uuid>). WS живёт постоянно, пока хост
+// запущен; несколько зрителей подключаются и отключаются через него.
 func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture.CaptureEncoder, opts capture.Options) {
 	wsURL := fmt.Sprintf("%s?session=%s&role=host",
 		strings.TrimRight(brokerURL, "/"), url.QueryEscape(sessionID))
@@ -159,10 +205,10 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 			}
 			continue
 		}
-		log.Printf("broker: connected, waiting for viewer")
-		serveSession(ctx, conn, enc, opts, "broker:"+sessionID)
+		log.Printf("broker: connected, waiting for viewers")
+		serveHub(ctx, conn, enc, opts, "broker:"+sessionID)
 		if ctx.Err() == nil {
-			log.Printf("broker: session ended, reconnecting")
+			log.Printf("broker: connection lost, reconnecting")
 			select {
 			case <-ctx.Done():
 				return
@@ -172,36 +218,379 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 	}
 }
 
-// serveSession ведёт одну сессию поверх готового WS-соединения. Host —
-// инициатор оффера; оффер шлётся в ответ на "hello" от зрителя (в broker-режиме
-// хост подключается раньше зрителя, поэтому сразу слать оффер нельзя).
-func serveSession(parent context.Context, conn *websocket.Conn, enc capture.CaptureEncoder, connOpts capture.Options, label string) {
+// hub — хост-узел: одно WS-соединение с брокером, ОДИН общий захват и набор
+// зрителей (peer). Видео/аудио-треки общие: pion раздаёт WriteSample во все
+// привязанные PeerConnection, поэтому экран кодируется один раз на всех.
+//
+// Настройки трансляции (кодек/источник/разрешение/аудио) — «липкие»: их задаёт
+// первый зритель, дальше они живут в hub и применяются ко всем; новый зритель
+// синхронизируется с ними, а не навязывает свои.
+type hub struct {
+	ctx  context.Context
+	enc  capture.CaptureEncoder
+	base capture.Options
+	ws   *websocket.Conn
+	cnl  context.CancelFunc
+
+	writeMu sync.Mutex // сериализует запись в общий WS
+
+	mu         sync.Mutex // защищает всё ниже
+	configured bool       // задавались ли уже настройки трансляции
+	curOpts    capture.Options
+	str        *streamer
+	vtrack     *webrtc.TrackLocalStaticSample
+	atrack     *webrtc.TrackLocalStaticSample
+	peers      map[string]*peer
+
+	srcMu sync.Mutex   // защищает геометрию источника (для координат мыши)
+	rect  capture.Rect // глобальный прямоугольник общего источника
+}
+
+// peer — один зритель: своё PeerConnection поверх общих треков хаба и свои
+// data-каналы (input/term). Видео/аудио-треки НЕ свои — общие из hub.
+type peer struct {
+	h           *hub
+	pid         string
+	pc          *webrtc.PeerConnection
+	videoSender *webrtc.RTPSender
+	audioSender *webrtc.RTPSender
+
+	btnDown string // зажатая кнопка мыши ("" если нет) — для drag
+	dragged bool   // были ли move с зажатой кнопкой (отличить drag от клика)
+}
+
+// serveHub ведёт хост-узел поверх готового WS-соединения с брокером.
+func serveHub(parent context.Context, conn *websocket.Conn, enc capture.CaptureEncoder, connOpts capture.Options, label string) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	s := &session{conn: conn, enc: enc, cancel: cancel, base: connOpts}
+	h := &hub{
+		ctx:   ctx,
+		enc:   enc,
+		base:  connOpts,
+		ws:    conn,
+		cnl:   cancel,
+		peers: map[string]*peer{},
+	}
 	defer func() {
-		if s.str != nil {
-			s.str.stop()
+		h.mu.Lock()
+		for pid, p := range h.peers {
+			p.closePC()
+			delete(h.peers, pid)
 		}
-		if s.pc != nil {
-			if err := s.pc.Close(); err != nil {
-				log.Printf("signaling: pc close: %v", err)
-			}
+		if h.str != nil {
+			h.str.stop()
+			h.str = nil
 		}
+		h.mu.Unlock()
 		_ = conn.CloseNow()
-		log.Printf("signaling: session ended (%s)", label)
+		log.Printf("signaling: host session ended (%s)", label)
 	}()
 
-	// PeerConnection и захват создаются лениво по "hello" (с кодеком/аудио зрителя).
-	readLoop(ctx, s)
+	h.readLoop()
 }
 
-// buildOpts накладывает выбор зрителя (config + codec + audio) на базовые опции.
-func (s *session) buildOpts(msg signalMessage) capture.Options {
-	opts := s.base
+// send сериализует сообщение (с проставленным pid) и пишет его в общий WS.
+func (h *hub) send(msg signalMessage, pid string) {
+	msg.Vid = pid
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("signaling: marshal %s: %v", msg.Type, err)
+		return
+	}
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	if err := h.ws.Write(h.ctx, websocket.MessageText, data); err != nil {
+		if h.ctx.Err() == nil {
+			log.Printf("signaling: write %s: %v", msg.Type, err)
+		}
+	}
+}
+
+// readLoop читает сигналинг всех зрителей с общего WS и роутит по pid.
+func (h *hub) readLoop() {
+	for {
+		_, data, err := h.ws.Read(h.ctx)
+		if err != nil {
+			if websocket.CloseStatus(err) == websocket.StatusPolicyViolation {
+				log.Printf("broker: session not found or unauthorized — check --session (full UUID) and that it was created on the same site")
+			} else if h.ctx.Err() == nil && websocket.CloseStatus(err) == -1 && !errors.Is(err, context.Canceled) {
+				log.Printf("signaling: ws read: %v", err)
+			}
+			return
+		}
+
+		var msg signalMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			log.Printf("signaling: unmarshal: %v", err)
+			continue
+		}
+		pid := msg.Vid
+		if pid == "" {
+			pid = "default" // зритель без vid (старый клиент) — единственный «default»
+		}
+
+		switch msg.Type {
+		case "hello":
+			h.onHello(pid, msg)
+		case "renegotiate":
+			h.onRenegotiate(msg)
+		case "answer":
+			if p := h.peer(pid); p != nil {
+				ans := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: msg.SDP}
+				if err := p.pc.SetRemoteDescription(ans); err != nil {
+					log.Printf("signaling: set remote description: %v", err)
+				}
+			}
+		case "candidate":
+			if p := h.peer(pid); p != nil && msg.Candidate != nil {
+				if err := p.pc.AddICECandidate(*msg.Candidate); err != nil {
+					log.Printf("signaling: add ice candidate: %v", err)
+				}
+			}
+		case "config":
+			h.onConfig(msg)
+		case "mouse", "scroll", "cursor", "key", "type":
+			if p := h.peer(pid); p != nil {
+				p.dispatchInput(&msg) // фолбэк, если DataChannel ещё не открыт
+			}
+		default:
+			log.Printf("signaling: unknown message type %q", msg.Type)
+		}
+	}
+}
+
+// peer возвращает зрителя по pid (или nil).
+func (h *hub) peer(pid string) *peer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.peers[pid]
+}
+
+// onHello подключает зрителя: при первом — задаёт настройки трансляции и
+// стартует общий захват; при последующих — берёт текущие (липкие) настройки.
+func (h *hub) onHello(pid string, msg signalMessage) {
+	h.mu.Lock()
+	// Уже есть peer с таким pid?
+	if p := h.peers[pid]; p != nil {
+		switch p.pc.ConnectionState() {
+		case webrtc.PeerConnectionStateConnected,
+			webrtc.PeerConnectionStateFailed,
+			webrtc.PeerConnectionStateDisconnected:
+			// Реальное переподключение этого зрителя (reload) — пересоздаём.
+			log.Printf("broker: viewer %s reconnect (%s) — recreating peer", pid, p.pc.ConnectionState())
+			p.closePC()
+			delete(h.peers, pid)
+		default:
+			h.mu.Unlock()
+			return // дубль hello во время рукопожатия — игнор
+		}
+	}
+
+	// Первый за всё время зритель задаёт настройки трансляции.
+	if !h.configured {
+		h.curOpts = h.buildOpts(msg)
+		h.configured = true
+	}
+	// Захват ещё не идёт (первый зритель сейчас, либо все уходили и вернулись) —
+	// поднимаем его с текущими (липкими) настройками.
+	if h.str == nil {
+		if err := h.startCaptureLocked(h.curOpts); err != nil {
+			h.mu.Unlock()
+			log.Printf("signaling: start capture: %v", err)
+			return
+		}
+	}
+
+	p := &peer{h: h, pid: pid}
+	if err := p.buildLocked(); err != nil {
+		h.mu.Unlock()
+		log.Printf("signaling: build peer %s: %v", pid, err)
+		return
+	}
+	h.peers[pid] = p
+	opts := h.curOpts
+	h.mu.Unlock()
+
+	p.offer()
+	// Сообщаем зрителю текущие настройки трансляции (его UI синхронизируется,
+	// а не сбрасывает поток под свои дефолты).
+	h.send(optsToState(opts), pid)
+}
+
+// startCaptureLocked создаёт общие видео/аудио-треки и стартует ОДИН захват под
+// ними. Вызывать под h.mu.
+func (h *hub) startCaptureLocked(opts capture.Options) error {
+	vtrack, atrack, err := newSharedTracks(opts)
+	if err != nil {
+		return err
+	}
+	str := newStreamer(h.ctx, h.enc, vtrack, atrack)
+	if err := str.reconfigure(opts); err != nil {
+		return err
+	}
+	h.vtrack = vtrack
+	h.atrack = atrack
+	h.str = str
+	h.setSource(opts.SourceKind, opts.SourceID)
+	return nil
+}
+
+// stopCaptureLocked останавливает общий захват (когда не осталось зрителей).
+// Вызывать под h.mu.
+func (h *hub) stopCaptureLocked() {
+	if h.str != nil {
+		h.str.stop()
+		h.str = nil
+	}
+	h.vtrack = nil
+	h.atrack = nil
+}
+
+// removePeer закрывает зрителя и, если он был последним, гасит общий захват.
+// Настройки (curOpts) сохраняются — следующий зритель подхватит их.
+func (h *hub) removePeer(pid string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	p := h.peers[pid]
+	if p == nil {
+		return
+	}
+	p.closePC()
+	delete(h.peers, pid)
+	log.Printf("broker: viewer %s left (%d remaining)", pid, len(h.peers))
+	if len(h.peers) == 0 {
+		h.stopCaptureLocked()
+		log.Printf("broker: no viewers — capture stopped (settings kept)")
+	}
+}
+
+// onConfig применяет настройки захвата (источник/разрешение/fps/битрейт/курсор)
+// к ОБЩЕМУ потоку — изменение видят все зрители. Смена кодека/аудио идёт через
+// "renegotiate" (требует новых треков). Без SDP-ренеготиации.
+func (h *hub) onConfig(msg signalMessage) {
+	if msg.Config == nil {
+		return
+	}
+	h.mu.Lock()
+	if h.str == nil {
+		h.mu.Unlock()
+		return
+	}
+	newOpts := msg.Config.apply(h.curOpts)
+	h.curOpts = newOpts
+	str := h.str
+	h.mu.Unlock()
+
+	// Настройки общие — синхронизируем панель у ВСЕХ зрителей (не только у того,
+	// кто менял), чтобы их UI совпадал с новым потоком.
+	h.broadcastState()
+
+	// Перезапуск ffmpeg/SCK может занять ~секунду — в фоне, чтобы не блокировать
+	// чтение WS (и приём ICE).
+	go func() {
+		if err := str.reconfigure(newOpts); err != nil {
+			log.Printf("signaling: reconfigure: %v", err)
+		}
+		h.mu.Lock()
+		h.setSource(newOpts.SourceKind, newOpts.SourceID)
+		h.mu.Unlock()
+	}()
+}
+
+// onRenegotiate меняет кодек/аудио ОБЩЕГО потока: пересоздаёт общие треки и
+// шлёт оффер ренеготиации каждому зрителю — на тех же PeerConnection (без
+// разрыва). Видео-трек всегда новый (новый SSRC → Chrome поднимает свежий
+// декодер; H264 иначе виснет), Opus добавляется/снимается по opts.Audio.
+func (h *hub) onRenegotiate(msg signalMessage) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.str == nil {
+		return
+	}
+	opts := h.applyHello(h.curOpts, msg)
+	h.curOpts = opts
+
+	h.str.stop() // остановить захват перед подменой треков
+
+	vtrack, atrack, err := newSharedTracks(opts)
+	if err != nil {
+		log.Printf("reneg: new tracks: %v", err)
+		h.cnl()
+		return
+	}
+
+	st := optsToState(opts)
+	for pid, p := range h.peers {
+		if p.videoSender != nil {
+			_ = p.pc.RemoveTrack(p.videoSender)
+			p.videoSender = nil
+		}
+		if p.audioSender != nil {
+			_ = p.pc.RemoveTrack(p.audioSender)
+			p.audioSender = nil
+		}
+		vsender, err := p.pc.AddTrack(vtrack)
+		if err != nil {
+			log.Printf("reneg: add video track (%s): %v", pid, err)
+			continue
+		}
+		go readRTCP(vsender)
+		p.videoSender = vsender
+		if atrack != nil {
+			asender, err := p.pc.AddTrack(atrack)
+			if err != nil {
+				log.Printf("reneg: add audio track (%s): %v", pid, err)
+			} else {
+				go readRTCP(asender)
+				p.audioSender = asender
+			}
+		}
+		p.offer()
+		h.send(st, pid) // синхронизируем панель зрителя с новым кодеком/аудио
+	}
+
+	h.vtrack = vtrack
+	h.atrack = atrack
+	h.str.setTracks(vtrack, atrack)
+	log.Printf("broker: renegotiating all viewers (codec=%s audio=%v)", opts.Codec, opts.Audio)
+
+	// Рестарт захвата под новые треки — в фоне (~1с), чтобы не держать h.mu.
+	str := h.str
+	go func() {
+		if err := str.reconfigure(opts); err != nil {
+			log.Printf("reneg: reconfigure: %v", err)
+		}
+		h.mu.Lock()
+		h.setSource(opts.SourceKind, opts.SourceID)
+		h.mu.Unlock()
+	}()
+}
+
+// broadcastState рассылает текущие настройки трансляции всем зрителям, чтобы их
+// панели совпадали с общим потоком после изменения настроек кем-то одним.
+func (h *hub) broadcastState() {
+	h.mu.Lock()
+	st := optsToState(h.curOpts)
+	pids := make([]string, 0, len(h.peers))
+	for pid := range h.peers {
+		pids = append(pids, pid)
+	}
+	h.mu.Unlock()
+	for _, pid := range pids {
+		h.send(st, pid)
+	}
+}
+
+// buildOpts строит опции из hello первого зрителя поверх базовых.
+func (h *hub) buildOpts(msg signalMessage) capture.Options {
+	return h.applyHello(h.base, msg)
+}
+
+// applyHello накладывает config/codec/audio из сообщения на заданные опции.
+func (h *hub) applyHello(opts capture.Options, msg signalMessage) capture.Options {
 	if msg.Config != nil {
-		opts = msg.Config.apply(s.base)
+		opts = msg.Config.apply(opts)
 	}
 	switch msg.Codec {
 	case "h264":
@@ -215,123 +604,75 @@ func (s *session) buildOpts(msg signalMessage) capture.Options {
 	return opts
 }
 
-// offerStream стартует захват и шлёт offer зрителю. true при успехе.
-func (s *session) offerStream(ctx context.Context, opts capture.Options) bool {
-	if err := s.startStream(ctx, opts); err != nil {
-		log.Printf("signaling: start stream: %v", err)
-		return false
-	}
-	offer, err := s.pc.CreateOffer(nil)
+// setSource обновляет кэш геометрии общего источника (для координат мыши).
+// Вызывать под h.mu (кроме горутин reconfigure, где берём srcMu отдельно).
+func (h *hub) setSource(kind string, id int) {
+	r, err := capture.SourceRect(kind, id)
 	if err != nil {
-		log.Printf("signaling: create offer: %v", err)
-		return false
+		return
 	}
-	if err := s.pc.SetLocalDescription(offer); err != nil {
-		log.Printf("signaling: set local description: %v", err)
-		return false
-	}
-	s.send(ctx, signalMessage{Type: "offer", SDP: offer.SDP})
-	return true
+	h.srcMu.Lock()
+	h.rect = r
+	h.srcMu.Unlock()
 }
 
-// renegotiateTracks меняет треки на УЖЕ установленном pc и шлёт оффер
-// ренеготиации — без пересоздания соединения. Видео-трек пересоздаём всегда
-// (новый SSRC → Chrome заводит свежий декодер: H264 не переживает смену
-// параметров на лету по интернету; заодно меняется кодек). Opus-дорожку
-// добавляем/снимаем по opts.Audio. Выполняется в readLoop (последовательно).
-func (s *session) renegotiateTracks(ctx context.Context, opts capture.Options) {
-	s.str.stop() // остановить захват перед подменой треков
-
-	if s.videoSender != nil {
-		_ = s.pc.RemoveTrack(s.videoSender)
-	}
+// newSharedTracks создаёт видео-трек (по кодеку) и, если включён звук, Opus-трек.
+// Треки общие для всех зрителей — pion раздаёт WriteSample по всем PC, куда они
+// добавлены.
+func newSharedTracks(opts capture.Options) (*webrtc.TrackLocalStaticSample, *webrtc.TrackLocalStaticSample, error) {
 	mime := webrtc.MimeTypeVP8
 	if opts.Codec == capture.CodecH264 {
 		mime = webrtc.MimeTypeH264
 	}
-	vtrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: mime}, "screen", "desktop")
+	vtrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: mime}, "screen", "desktop")
 	if err != nil {
-		log.Printf("reneg: new video track: %v", err)
-		s.cancel()
-		return
+		return nil, nil, fmt.Errorf("new video track: %w", err)
 	}
-	vsender, err := s.pc.AddTrack(vtrack)
-	if err != nil {
-		log.Printf("reneg: add video track: %v", err)
-		s.cancel()
-		return
-	}
-	go readRTCP(vsender)
-	s.videoSender = vsender
-
 	var atrack *webrtc.TrackLocalStaticSample
 	if opts.Audio {
-		atrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "audio")
+		// Отдельный streamID (не "desktop") → видео и аудио в РАЗНЫХ MediaStream,
+		// Chrome не синхронит A/V и не раздувает видео-буфер под звук.
+		atrack, err = webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "audio")
 		if err != nil {
-			log.Printf("reneg: new audio track: %v", err)
-			s.cancel()
-			return
+			return nil, nil, fmt.Errorf("new audio track: %w", err)
 		}
-		asender, err := s.pc.AddTrack(atrack)
-		if err != nil {
-			log.Printf("reneg: add audio track: %v", err)
-			s.cancel()
-			return
-		}
-		go readRTCP(asender)
-		s.audioSender = asender
-	} else if s.audioSender != nil {
-		_ = s.pc.RemoveTrack(s.audioSender)
-		s.audioSender = nil
 	}
-	s.str.setTracks(vtrack, atrack)
-
-	// Оффер ренеготиации — сразу после смены треков (медиа польётся, когда
-	// захват перезапустится ниже; SDP описывает треки, а не кадры).
-	offer, err := s.pc.CreateOffer(nil)
-	if err != nil {
-		log.Printf("reneg: create offer: %v", err)
-		s.cancel()
-		return
-	}
-	if err := s.pc.SetLocalDescription(offer); err != nil {
-		log.Printf("reneg: set local description: %v", err)
-		s.cancel()
-		return
-	}
-	s.send(ctx, signalMessage{Type: "offer", SDP: offer.SDP})
-	log.Printf("broker: renegotiating (codec=%s audio=%v) — no reconnect", opts.Codec, opts.Audio)
-
-	// Рестарт захвата под новые треки — в фоне (~1с), чтобы не блокировать readLoop.
-	go func() {
-		if err := s.str.reconfigure(opts); err != nil {
-			log.Printf("reneg: reconfigure: %v", err)
-		}
-		s.setSource(opts.SourceKind, opts.SourceID)
-	}()
+	return vtrack, atrack, nil
 }
 
-// startStream строит PeerConnection с выбранными зрителем кодеком/аудио, вешает
-// каналы данных (input/term) и стартует захват. Вызывается из "hello".
-func (s *session) startStream(ctx context.Context, opts capture.Options) error {
-	pc, str, err := newPeerConnection(ctx, s.enc, opts)
+// buildLocked создаёт PeerConnection зрителя поверх ОБЩИХ треков хаба, вешает
+// data-каналы (input/term) и обработчики. Захват уже идёт. Вызывать под h.mu.
+func (p *peer) buildLocked() error {
+	h := p.h
+	// Публичный STUN — собираем srflx-кандидаты для P2P через NAT. TURN пока нет.
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		},
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("new peer connection: %w", err)
 	}
-	s.pc = pc
-	s.str = str
-	// Запоминаем сендеры — для замены треков при ренеготиации (без нового pc).
-	s.videoSender, s.audioSender = nil, nil
-	for _, snd := range pc.GetSenders() {
-		if snd.Track() == nil {
-			continue
+	p.pc = pc
+
+	vsender, err := pc.AddTrack(h.vtrack)
+	if err != nil {
+		_ = pc.Close()
+		return fmt.Errorf("add video track: %w", err)
+	}
+	go readRTCP(vsender)
+	p.videoSender = vsender
+
+	if h.atrack != nil {
+		asender, err := pc.AddTrack(h.atrack)
+		if err != nil {
+			_ = pc.Close()
+			return fmt.Errorf("add audio track: %w", err)
 		}
-		switch snd.Track().Kind() {
-		case webrtc.RTPCodecTypeVideo:
-			s.videoSender = snd
-		case webrtc.RTPCodecTypeAudio:
-			s.audioSender = snd
-		}
+		go readRTCP(asender)
+		p.audioSender = asender
 	}
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -339,15 +680,16 @@ func (s *session) startStream(ctx context.Context, opts capture.Options) error {
 			return
 		}
 		init := c.ToJSON()
-		s.send(ctx, signalMessage{Type: "candidate", Candidate: &init})
+		h.send(signalMessage{Type: "candidate", Candidate: &init}, p.pid)
 	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("signaling: connection state -> %s", state)
+		log.Printf("signaling: viewer %s state -> %s", p.pid, state)
 		switch state {
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed,
 			webrtc.PeerConnectionStateDisconnected:
-			s.cancel()
+			// Отвал одного зрителя НЕ рвёт трансляцию остальных — чистим только его.
+			go h.removePeer(p.pid)
 		}
 	})
 
@@ -355,7 +697,6 @@ func (s *session) startStream(ctx context.Context, opts capture.Options) error {
 	if dc, err := pc.CreateDataChannel("input", nil); err != nil {
 		log.Printf("signaling: data channel: %v", err)
 	} else {
-		// При открытии канала сообщаем зрителю имя машины и ОС (для заголовка вкладки).
 		dc.OnOpen(func() {
 			hn, _ := os.Hostname()
 			if b, err := json.Marshal(signalMessage{Type: "hostinfo", OS: osLabel(), Hostname: hn}); err == nil {
@@ -369,7 +710,6 @@ func (s *session) startStream(ctx context.Context, opts capture.Options) error {
 			}
 			switch im.Type {
 			case "sources":
-				// Список источников захвата — ответ по тому же каналу (P2P).
 				if src, err := capture.ListSources(); err == nil {
 					if b, err := json.Marshal(signalMessage{Type: "sources", Sources: &src}); err == nil {
 						_ = dc.SendText(string(b))
@@ -379,62 +719,84 @@ func (s *session) startStream(ctx context.Context, opts capture.Options) error {
 				if im.PID > 0 {
 					_ = capture.ActivateApp(im.PID)
 				}
+			case "config":
+				p.h.onConfig(im) // зритель меняет общие настройки (источник/разрешение)
+			case "renegotiate":
+				p.h.onRenegotiate(im) // зритель меняет кодек/аудио
 			default:
-				s.dispatchInput(&im)
+				p.dispatchInput(&im)
 			}
 		})
 	}
 	if dc, err := pc.CreateDataChannel("term", nil); err != nil {
 		log.Printf("signaling: term channel: %v", err)
 	} else {
-		sharedTerminal.bind(dc)
+		sharedTerminal.bind(dc) // терминал общий: PTY один на всех зрителей
 	}
-
-	if err := str.reconfigure(opts); err != nil {
-		return err
-	}
-	s.setSource(opts.SourceKind, opts.SourceID)
 	return nil
 }
 
-// session держит WS-соединение, PeerConnection и streamer одного зрителя.
-// pc/str создаются лениво по "hello" (с кодеком/аудио зрителя).
-type session struct {
-	conn   *websocket.Conn
-	enc    capture.CaptureEncoder
-	cancel context.CancelFunc // отменяет контекст сессии (по разрыву PC)
-	pc          *webrtc.PeerConnection
-	str         *streamer
-	videoSender *webrtc.RTPSender // для замены видео-трека при ренеготиации
-	audioSender *webrtc.RTPSender // для добавления/снятия Opus-дорожки
-	base        capture.Options   // базовые опции (источник/экран/дефолты)
-	mu          sync.Mutex        // сериализует запись в WS (OnICECandidate + readLoop)
-
-	srcMu sync.Mutex   // защищает геометрию источника
-	rect  capture.Rect // глобальный прямоугольник источника (для маппинга мыши)
-
-	btnDown string // зажатая кнопка мыши ("" если нет) — для drag; только из readLoop
-	dragged bool   // были ли move с зажатой кнопкой (отличить drag от чистого клика)
+// offer создаёт и отправляет оффер этому зрителю.
+func (p *peer) offer() {
+	offer, err := p.pc.CreateOffer(nil)
+	if err != nil {
+		log.Printf("signaling: create offer (%s): %v", p.pid, err)
+		return
+	}
+	if err := p.pc.SetLocalDescription(offer); err != nil {
+		log.Printf("signaling: set local description (%s): %v", p.pid, err)
+		return
+	}
+	p.h.send(signalMessage{Type: "offer", SDP: offer.SDP}, p.pid)
 }
 
-// setSource обновляет кэш геометрии источника (для координат мыши). Вызов SCK
-// относительно дорогой, поэтому делаем его при смене источника, а не на каждое
-// событие мыши. window может двигаться — тогда геометрия слегка устаревает.
-func (s *session) setSource(kind string, id int) {
-	r, err := capture.SourceRect(kind, id)
-	if err != nil {
-		return // не SCK-источник или не найден — мышь просто не сработает
+// closePC закрывает PeerConnection зрителя.
+func (p *peer) closePC() {
+	if p.pc != nil {
+		if err := p.pc.Close(); err != nil {
+			log.Printf("signaling: pc close (%s): %v", p.pid, err)
+		}
+		p.pc = nil
 	}
-	s.srcMu.Lock()
-	s.rect = r
-	s.srcMu.Unlock()
+}
+
+// dispatchInput обрабатывает события ввода (mouse/scroll/cursor/key/type) — общий
+// путь для DataChannel (основной) и WebSocket (фолбэк).
+func (p *peer) dispatchInput(msg *signalMessage) {
+	switch msg.Type {
+	case "mouse":
+		if msg.Mouse != nil {
+			p.handleMouse(msg.Mouse)
+		}
+	case "scroll":
+		if msg.Scroll != nil {
+			scrollMouse(msg.Scroll.Dx, msg.Scroll.Dy)
+		}
+	case "cursor":
+		// Курсор хоста общий для захвата — меняем на лету у всех.
+		p.h.mu.Lock()
+		str := p.h.str
+		p.h.mu.Unlock()
+		if str != nil && msg.Config != nil && msg.Config.Cursor != nil {
+			str.updateCursor(*msg.Config.Cursor)
+		}
+	case "key":
+		if msg.Key != nil && msg.Key.Key != "" {
+			tapKey(msg.Key.Key, msg.Key.Mods)
+		}
+	case "type":
+		if msg.Text != "" {
+			typeText(msg.Text)
+		}
+	}
 }
 
 // handleMouse мапит нормализованные координаты в глобальные и инжектит событие.
-func (s *session) handleMouse(m *mouseMsg) {
-	s.srcMu.Lock()
-	r := s.rect
-	s.srcMu.Unlock()
+// Геометрия источника общая (один захват), drag-состояние — своё на зрителя.
+func (p *peer) handleMouse(m *mouseMsg) {
+	p.h.srcMu.Lock()
+	r := p.h.rect
+	p.h.srcMu.Unlock()
 	if r.W <= 0 || r.H <= 0 {
 		return
 	}
@@ -448,165 +810,24 @@ func (s *session) handleMouse(m *mouseMsg) {
 	case "down":
 		moveMouse(x, y)
 		mouseToggle(button, true)
-		s.btnDown = button
-		s.dragged = false
+		p.btnDown = button
+		p.dragged = false
 	case "up":
 		// dragMouse шлём ТОЛЬКО если реально был drag (приходили move). Иначе
 		// (чистый клик) — просто отпускаем: без события Dragged, чтобы тап не
 		// принимался за перетаскивание/выделение.
-		if s.btnDown != "" && s.dragged {
-			dragMouse(x, y, s.btnDown)
+		if p.btnDown != "" && p.dragged {
+			dragMouse(x, y, p.btnDown)
 		}
 		mouseToggle(button, false)
-		s.btnDown = ""
-		s.dragged = false
+		p.btnDown = ""
+		p.dragged = false
 	default: // move
-		if s.btnDown != "" {
-			dragMouse(x, y, s.btnDown) // зажата кнопка → drag-событие
-			s.dragged = true
+		if p.btnDown != "" {
+			dragMouse(x, y, p.btnDown) // зажата кнопка → drag-событие
+			p.dragged = true
 		} else {
 			moveMouse(x, y)
-		}
-	}
-}
-
-func clampF(v float64) float64 {
-	if v < 0 {
-		return 0
-	}
-	if v > 1 {
-		return 1
-	}
-	return v
-}
-
-// send сериализует сообщение и пишет его в WS под мьютексом.
-func (s *session) send(ctx context.Context, msg signalMessage) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("signaling: marshal %s: %v", msg.Type, err)
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.conn.Write(ctx, websocket.MessageText, data); err != nil {
-		if ctx.Err() == nil {
-			log.Printf("signaling: write %s: %v", msg.Type, err)
-		}
-	}
-}
-
-// readLoop читает сообщения от браузера до закрытия соединения.
-func readLoop(ctx context.Context, s *session) {
-	for {
-		_, data, err := s.conn.Read(ctx)
-		if err != nil {
-			// 1008 — брокер закрыл: сессия неизвестна/не авторизована.
-			if websocket.CloseStatus(err) == websocket.StatusPolicyViolation {
-				log.Printf("broker: session not found or unauthorized — check --session (full UUID) and that it was created on the same site")
-			} else if ctx.Err() == nil && websocket.CloseStatus(err) == -1 && !errors.Is(err, context.Canceled) {
-				log.Printf("signaling: ws read: %v", err)
-			}
-			return
-		}
-
-		var msg signalMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
-			log.Printf("signaling: unmarshal: %v", err)
-			continue
-		}
-
-		switch msg.Type {
-		case "hello":
-			// Зритель повторяет hello каждые ~1.5с, пока не получит оффер. Если
-			// PC уже есть:
-			//  - connected/failed/disconnected → реальное переподключение зрителя
-			//    (reload) → пересоздаём сессию;
-			//  - new/connecting → это просто дубль hello во время рукопожатия
-			//    (старт захвата ~секунда) → игнорируем, иначе порвём собственную
-			//    только что созданную сессию (петля «жду зрителя»).
-			if s.pc != nil {
-				switch s.pc.ConnectionState() {
-				case webrtc.PeerConnectionStateConnected,
-					webrtc.PeerConnectionStateFailed,
-					webrtc.PeerConnectionStateDisconnected:
-					log.Printf("broker: repeated hello (%s) — recreating session", s.pc.ConnectionState())
-					return
-				default:
-					continue // рукопожатие идёт — игнорируем дубль hello
-				}
-			}
-			if !s.offerStream(ctx, s.buildOpts(msg)) {
-				return
-			}
-		case "renegotiate":
-			// Смена codec/audio/(H264-настроек) БЕЗ разрыва соединения: на ТОМ ЖЕ
-			// pc подменяем видео-трек (новый SSRC → Chrome поднимает свежий
-			// декодер, H264 иначе виснет) и добавляем/снимаем Opus-дорожку, затем
-			// шлём оффер ренеготиации. pc не закрывается → нет гонок/рандеву.
-			if s.pc == nil || s.str == nil {
-				continue // нет активного потока — ждём hello
-			}
-			s.renegotiateTracks(ctx, s.buildOpts(msg))
-		case "answer":
-			if s.pc == nil {
-				continue // ещё не было hello
-			}
-			ans := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: msg.SDP}
-			if err := s.pc.SetRemoteDescription(ans); err != nil {
-				log.Printf("signaling: set remote description: %v", err)
-			}
-		case "candidate":
-			if s.pc == nil || msg.Candidate == nil {
-				continue
-			}
-			if err := s.pc.AddICECandidate(*msg.Candidate); err != nil {
-				log.Printf("signaling: add ice candidate: %v", err)
-			}
-		case "config":
-			if msg.Config == nil || s.str == nil {
-				continue
-			}
-			// Перезапуск ffmpeg может занять ~секунду — делаем в отдельной
-			// горутине, чтобы не блокировать чтение WS (и приём ICE).
-			newOpts := msg.Config.apply(s.base)
-			go func() {
-				if err := s.str.reconfigure(newOpts); err != nil {
-					log.Printf("signaling: reconfigure: %v", err)
-				}
-				s.setSource(newOpts.SourceKind, newOpts.SourceID) // обновить геометрию
-			}()
-		case "mouse", "scroll", "cursor", "key", "type":
-			s.dispatchInput(&msg) // фолбэк, если DataChannel ещё не открыт
-		default:
-			log.Printf("signaling: unknown message type %q", msg.Type)
-		}
-	}
-}
-
-// dispatchInput обрабатывает события ввода (mouse/scroll/cursor) — общий путь
-// для DataChannel (основной) и WebSocket (фолбэк).
-func (s *session) dispatchInput(msg *signalMessage) {
-	switch msg.Type {
-	case "mouse":
-		if msg.Mouse != nil {
-			s.handleMouse(msg.Mouse)
-		}
-	case "scroll":
-		if msg.Scroll != nil {
-			scrollMouse(msg.Scroll.Dx, msg.Scroll.Dy)
-		}
-	case "cursor":
-		if s.str != nil && msg.Config != nil && msg.Config.Cursor != nil {
-			s.str.updateCursor(*msg.Config.Cursor)
-		}
-	case "key":
-		if msg.Key != nil && msg.Key.Key != "" {
-			tapKey(msg.Key.Key, msg.Key.Mods)
-		}
-	case "type":
-		if msg.Text != "" {
-			typeText(msg.Text)
 		}
 	}
 }
