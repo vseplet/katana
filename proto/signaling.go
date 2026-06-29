@@ -93,6 +93,7 @@ type configMsg struct {
 	Width       *int    `json:"width,omitempty"`
 	FPS         *int    `json:"fps,omitempty"`
 	BitrateKbps *int    `json:"bitrateKbps,omitempty"`
+	AutoBitrate *bool   `json:"autoBitrate,omitempty"` // адаптировать битрейт под сеть
 	Threads     *int    `json:"threads,omitempty"`
 	DropLate    *bool   `json:"dropLate,omitempty"`
 	Cursor      *bool   `json:"cursor,omitempty"`
@@ -246,6 +247,11 @@ type hub struct {
 	atrack     *webrtc.TrackLocalStaticSample
 	peers      map[string]*peer
 	stopTimer  *time.Timer // отложенная остановка захвата при 0 зрителей (grace)
+	lastKeyReq time.Time   // дебаунс форса keyframe по PLI (keyframe дорог)
+	autoBitrate bool       // адаптивный битрейт включён (по запросу зрителя)
+	curBitrate  int        // текущий битрейт энкодера, kbps (для адаптации)
+	maxBitrate  int        // потолок адаптации = целевой битрейт настроек, kbps
+	lastBrAdj   time.Time  // дебаунс шага адаптации битрейта
 
 	srcMu sync.Mutex   // защищает геометрию источника (для координат мыши)
 	rect  capture.Rect // глобальный прямоугольник общего источника
@@ -453,6 +459,7 @@ func (h *hub) onHello(pid string, msg signalMessage) {
 		h.curOpts = h.buildOpts(msg)
 		h.configured = true
 	}
+	h.applyAutoBitrateLocked(msg)
 	// Захват ещё не идёт (первый зритель сейчас, либо все уходили и вернулись) —
 	// поднимаем его с текущими (липкими) настройками.
 	if h.str == nil {
@@ -553,6 +560,7 @@ func (h *hub) onConfig(msg signalMessage) {
 	}
 	newOpts := msg.Config.apply(h.curOpts)
 	h.curOpts = newOpts
+	h.applyAutoBitrateLocked(msg)
 	str := h.str
 	h.mu.Unlock()
 
@@ -584,6 +592,7 @@ func (h *hub) onRenegotiate(msg signalMessage) {
 	}
 	opts := h.applyHello(h.curOpts, msg)
 	h.curOpts = opts
+	h.applyAutoBitrateLocked(msg)
 
 	h.str.stop() // остановить захват перед подменой треков
 
@@ -609,14 +618,14 @@ func (h *hub) onRenegotiate(msg signalMessage) {
 			log.Printf("reneg: add video track (%s): %v", pid, err)
 			continue
 		}
-		go readRTCP(vsender)
+		go readRTCP(vsender, h.requestKeyframe, h.onLoss)
 		p.videoSender = vsender
 		if atrack != nil {
 			asender, err := p.pc.AddTrack(atrack)
 			if err != nil {
 				log.Printf("reneg: add audio track (%s): %v", pid, err)
 			} else {
-				go readRTCP(asender)
+				go readRTCP(asender, nil, nil)
 				p.audioSender = asender
 			}
 		}
@@ -654,6 +663,100 @@ func (h *hub) broadcastState() {
 	for _, pid := range pids {
 		h.send(st, pid)
 	}
+}
+
+// requestKeyframe форсит keyframe общего энкодера в ответ на PLI зрителя —
+// зритель дропает накопленный буфер и прыгает к свежему кадру (догоняет live).
+// Дебаунс: keyframe дорог, а PLI при потере приходят пачкой (и от нескольких
+// зрителей сразу — но keyframe общий, одного достаточно всем).
+func (h *hub) requestKeyframe() {
+	h.mu.Lock()
+	now := time.Now()
+	if !h.lastKeyReq.IsZero() && now.Sub(h.lastKeyReq) < 400*time.Millisecond {
+		h.mu.Unlock()
+		return
+	}
+	h.lastKeyReq = now
+	str := h.str
+	h.mu.Unlock()
+	if str != nil {
+		str.requestKeyframe()
+	}
+}
+
+// onLoss — адаптивный битрейт (AIMD) по доле потерь из ReceiverReport. Растут
+// потери → мультипликативно снижаем (быстро уступаем дорогу), чисто → аддитивно
+// поднимаем (осторожно пробуем выше) до потолка настроек. Срабатывает только при
+// включённом autoBitrate; дебаунс ~1с (RR приходят примерно раз в секунду).
+func (h *hub) onLoss(lost float64) {
+	h.mu.Lock()
+	if !h.autoBitrate || h.str == nil {
+		h.mu.Unlock()
+		return
+	}
+	now := time.Now()
+	if !h.lastBrAdj.IsZero() && now.Sub(h.lastBrAdj) < time.Second {
+		h.mu.Unlock()
+		return
+	}
+	h.lastBrAdj = now
+	cur := h.curBitrate
+	if cur <= 0 {
+		cur = h.maxBitrate
+	}
+	switch {
+	case lost > 0.08: // >8% потерь — режем
+		cur = cur * 4 / 5
+	case lost < 0.02: // почти чисто — осторожно поднимаем
+		cur += 250
+	}
+	if cur < 300 {
+		cur = 300
+	}
+	if h.maxBitrate > 0 && cur > h.maxBitrate {
+		cur = h.maxBitrate
+	}
+	changed := cur != h.curBitrate
+	h.curBitrate = cur
+	str := h.str
+	h.mu.Unlock()
+	if changed && str != nil {
+		str.setBitrateKbps(cur)
+	}
+}
+
+// applyAutoBitrateLocked обновляет режим адаптивного битрейта из настроек зрителя
+// и переинициализирует контур: потолок = целевой битрейт настроек, старт с
+// потолка. Вызывать под h.mu.
+func (h *hub) applyAutoBitrateLocked(msg signalMessage) {
+	if msg.Config != nil && msg.Config.AutoBitrate != nil {
+		h.autoBitrate = *msg.Config.AutoBitrate
+	}
+	h.maxBitrate = parseBitrateKbps(h.curOpts.Bitrate)
+	if h.curBitrate == 0 || (h.maxBitrate > 0 && h.curBitrate > h.maxBitrate) {
+		h.curBitrate = h.maxBitrate
+	}
+}
+
+// parseBitrateKbps вытаскивает kbps из строки опций ("3000k", "3M", "2500").
+func parseBitrateKbps(s string) int {
+	if s == "" {
+		return 0
+	}
+	mult := 1
+	num := s
+	switch s[len(s)-1] {
+	case 'k', 'K':
+		num = s[:len(s)-1]
+	case 'm', 'M':
+		num = s[:len(s)-1]
+		mult = 1000
+	}
+	var v int
+	if _, err := fmt.Sscanf(num, "%d", &v); err != nil {
+		return 0
+	}
+	return v * mult
 }
 
 // buildOpts строит опции из hello первого зрителя поверх базовых.
@@ -736,7 +839,7 @@ func (p *peer) buildLocked() error {
 		_ = pc.Close()
 		return fmt.Errorf("add video track: %w", err)
 	}
-	go readRTCP(vsender)
+	go readRTCP(vsender, h.requestKeyframe, h.onLoss)
 	p.videoSender = vsender
 
 	if h.atrack != nil {
@@ -745,7 +848,7 @@ func (p *peer) buildLocked() error {
 			_ = pc.Close()
 			return fmt.Errorf("add audio track: %w", err)
 		}
-		go readRTCP(asender)
+		go readRTCP(asender, nil, nil)
 		p.audioSender = asender
 	}
 

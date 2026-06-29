@@ -132,9 +132,23 @@ int vt_open(int handle, int w, int h, int fps, int bitrateKbps, struct VTEnc **o
 	return 0;
 }
 
+// vt_set_bitrate меняет целевой битрейт на работающей сессии (для адаптации под
+// сеть, без пересоздания энкодера).
+void vt_set_bitrate(struct VTEnc *e, int bitrateKbps) {
+	if (!e || !e->session || bitrateKbps <= 0) {
+		return;
+	}
+	int br = bitrateKbps * 1000;
+	CFNumberRef brn = CFNumberCreate(NULL, kCFNumberIntType, &br);
+	VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AverageBitRate, brn);
+	CFRelease(brn);
+}
+
 // vt_encode заворачивает BGRA-кадр (tight, w*4 на строку) в CVPixelBuffer и
-// кодирует. Результат уходит в vtCallback асинхронно.
-int vt_encode(struct VTEnc *e, void *bgra, int w, int h, long long ptsNum, int fps) {
+// кодирует. forceKey!=0 → этот кадр кодируется как keyframe (ответ на PLI:
+// зритель дропает накопленный буфер и прыгает к свежему кадру). Результат уходит
+// в vtCallback асинхронно.
+int vt_encode(struct VTEnc *e, void *bgra, int w, int h, long long ptsNum, int fps, int forceKey) {
 	if (!e || !e->session) {
 		return -1;
 	}
@@ -163,7 +177,17 @@ int vt_encode(struct VTEnc *e, void *bgra, int w, int h, long long ptsNum, int f
 
 	CMTime pts = CMTimeMake(ptsNum, fps > 0 ? fps : 30);
 	CMTime d = CMTimeMake(1, fps > 0 ? fps : 30);
-	st = VTCompressionSessionEncodeFrame(e->session, pb, pts, d, NULL, NULL, NULL);
+	CFDictionaryRef frameProps = NULL;
+	if (forceKey) {
+		const void *k[] = {kVTEncodeFrameOptionKey_ForceKeyFrame};
+		const void *v[] = {kCFBooleanTrue};
+		frameProps = CFDictionaryCreate(NULL, k, v, 1,
+		                                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	}
+	st = VTCompressionSessionEncodeFrame(e->session, pb, pts, d, frameProps, NULL, NULL);
+	if (frameProps) {
+		CFRelease(frameProps);
+	}
 	CVPixelBufferRelease(pb);
 	return (int)st;
 }

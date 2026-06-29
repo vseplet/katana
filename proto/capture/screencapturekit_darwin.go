@@ -285,6 +285,22 @@ func startSCKNative(ctx context.Context, opts Options) (*Stream, error) {
 		Video:     frames,
 		Audio:     audioCh,
 		SetCursor: func(show bool) { sckSetCursor(handle, show) },
+		ForceKeyframe: func() {
+			sink.mu.Lock()
+			v := sink.vt
+			sink.mu.Unlock()
+			if v != nil {
+				v.requestKeyframe()
+			}
+		},
+		SetBitrate: func(kbps int) {
+			sink.mu.Lock()
+			v := sink.vt
+			sink.mu.Unlock()
+			if v != nil {
+				v.setBitrate(kbps)
+			}
+		},
 	}, nil
 }
 

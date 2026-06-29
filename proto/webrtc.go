@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
@@ -23,10 +24,12 @@ type streamer struct {
 	track  *webrtc.TrackLocalStaticSample // видео
 	audio  *webrtc.TrackLocalStaticSample // Opus, nil если звук выключен
 
-	mu        sync.Mutex
-	cancel    context.CancelFunc // останавливает текущий захват
-	done      chan struct{}      // закрывается, когда писатели кадров вышли
-	setCursor func(bool)         // живое переключение курсора хоста (без рестарта)
+	mu          sync.Mutex
+	cancel      context.CancelFunc // останавливает текущий захват
+	done        chan struct{}      // закрывается, когда писатели кадров вышли
+	setCursor   func(bool)         // живое переключение курсора хоста (без рестарта)
+	forceKeyFn  func()             // форс keyframe у энкодера (по PLI); nil если не поддерж.
+	setBitrate  func(kbps int)     // смена битрейта энкодера на лету; nil если не поддерж.
 }
 
 func newStreamer(parent context.Context, enc capture.CaptureEncoder, track, audio *webrtc.TrackLocalStaticSample) *streamer {
@@ -58,6 +61,8 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 	s.cancel = cancel
 	s.done = done
 	s.setCursor = stream.SetCursor
+	s.forceKeyFn = stream.ForceKeyframe
+	s.setBitrate = stream.SetBitrate
 
 	var wg sync.WaitGroup
 
@@ -131,6 +136,26 @@ func (s *streamer) updateCursor(show bool) {
 	}
 }
 
+// requestKeyframe просит энкодер выдать keyframe (ответ на PLI зрителя).
+func (s *streamer) requestKeyframe() {
+	s.mu.Lock()
+	fn := s.forceKeyFn
+	s.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// setBitrateKbps меняет битрейт энкодера на лету (адаптация к сети).
+func (s *streamer) setBitrateKbps(kbps int) {
+	s.mu.Lock()
+	fn := s.setBitrate
+	s.mu.Unlock()
+	if fn != nil {
+		fn(kbps)
+	}
+}
+
 // stop останавливает захват.
 func (s *streamer) stop() {
 	s.mu.Lock()
@@ -142,13 +167,29 @@ func (s *streamer) stop() {
 	}
 }
 
-// readRTCP вычитывает RTCP-пакеты от зрителя. Без этого pion переполняет
-// внутренний буфер. PLI логируем, но не обрабатываем (см. §7 ТЗ).
-func readRTCP(sender *webrtc.RTPSender) {
-	buf := make([]byte, 1500)
+// readRTCP вычитывает RTCP-пакеты от зрителя (иначе pion переполняет внутренний
+// буфер). На PLI (зритель потерял кадр, просит keyframe чтобы дропнуть буфер и
+// догнать live) дёргаем onPLI; на ReceiverReport отдаём долю потерь (0..1) в
+// onLoss для адаптации битрейта. Любой колбэк может быть nil.
+func readRTCP(sender *webrtc.RTPSender, onPLI func(), onLoss func(lost float64)) {
 	for {
-		if _, _, err := sender.Read(buf); err != nil {
+		pkts, _, err := sender.ReadRTCP()
+		if err != nil {
 			return // sender закрыт вместе с PeerConnection
+		}
+		for _, p := range pkts {
+			switch pkt := p.(type) {
+			case *rtcp.PictureLossIndication:
+				if onPLI != nil {
+					onPLI()
+				}
+			case *rtcp.ReceiverReport:
+				if onLoss != nil {
+					for _, r := range pkt.Reports {
+						onLoss(float64(r.FractionLost) / 256.0)
+					}
+				}
+			}
 		}
 	}
 }

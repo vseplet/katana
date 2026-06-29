@@ -56,6 +56,13 @@ type Stream struct {
 	// SetCursor меняет видимость курсора хоста в захвате НА ЛЕТУ (без рестарта).
 	// nil для источников, где это не поддерживается (avfoundation/тест).
 	SetCursor func(show bool)
+	// ForceKeyframe просит энкодер выдать keyframe на ближайшем кадре (ответ на
+	// PLI зрителя: дропнуть накопленный буфер и догнать live). nil, если путь
+	// энкодера это не поддерживает (ffmpeg/VP8/тест).
+	ForceKeyframe func()
+	// SetBitrate меняет целевой битрейт энкодера на лету, kbps (адаптация к сети).
+	// nil, если путь не поддерживает (ffmpeg/VP8/тест).
+	SetBitrate func(kbps int)
 }
 
 // CaptureEncoder запускает захват+энкод и отдаёт каналы кадров.

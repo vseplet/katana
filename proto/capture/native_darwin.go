@@ -9,7 +9,8 @@ package capture
 #include <opus/opus.h>
 struct VTEnc;
 int vt_open(int handle, int w, int h, int fps, int bitrateKbps, struct VTEnc **out);
-int vt_encode(struct VTEnc *e, void *bgra, int w, int h, long long ptsNum, int fps);
+int vt_encode(struct VTEnc *e, void *bgra, int w, int h, long long ptsNum, int fps, int forceKey);
+void vt_set_bitrate(struct VTEnc *e, int bitrateKbps);
 void vt_close(struct VTEnc *e);
 int opus_enc_create(int rate, int channels, OpusEncoder **out);
 int opus_enc_frame(OpusEncoder *enc, const float *pcm, int frameSize, unsigned char *out, int maxBytes);
@@ -20,6 +21,7 @@ import "C"
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -60,10 +62,11 @@ func goVTFrame(handle C.int, buf unsafe.Pointer, length C.int, keyframe C.int) {
 
 // vtEncoder — аппаратный H264-энкодер (VideoToolbox).
 type vtEncoder struct {
-	ptr     *C.struct_VTEnc
-	w, h    int
-	fps     int
-	pts     C.longlong
+	ptr      *C.struct_VTEnc
+	w, h     int
+	fps      int
+	pts      C.longlong
+	forceKey int32 // atomic: 1 → следующий кадр кодировать как keyframe (по PLI)
 }
 
 func newVTEncoder(handle, w, h, fps, bitrateKbps int) (*vtEncoder, error) {
@@ -75,13 +78,31 @@ func newVTEncoder(handle, w, h, fps, bitrateKbps int) (*vtEncoder, error) {
 }
 
 // encode кодирует один BGRA-кадр (tight, w*4 на строку). Результат уходит в
-// goVTFrame асинхронно.
+// goVTFrame асинхронно. Если взведён forceKey (по PLI) — кадр будет keyframe.
 func (e *vtEncoder) encode(bgra []byte) {
 	if e == nil || e.ptr == nil || len(bgra) < e.w*e.h*4 {
 		return
 	}
-	C.vt_encode(e.ptr, unsafe.Pointer(&bgra[0]), C.int(e.w), C.int(e.h), e.pts, C.int(e.fps))
+	fk := C.int(0)
+	if atomic.SwapInt32(&e.forceKey, 0) != 0 {
+		fk = 1
+	}
+	C.vt_encode(e.ptr, unsafe.Pointer(&bgra[0]), C.int(e.w), C.int(e.h), e.pts, C.int(e.fps), fk)
 	e.pts++
+}
+
+// requestKeyframe взводит флаг: следующий encode выдаст keyframe (ответ на PLI).
+func (e *vtEncoder) requestKeyframe() {
+	if e != nil {
+		atomic.StoreInt32(&e.forceKey, 1)
+	}
+}
+
+// setBitrate меняет целевой битрейт энкодера на лету (kbps; для адаптации к сети).
+func (e *vtEncoder) setBitrate(kbps int) {
+	if e != nil && e.ptr != nil && kbps > 0 {
+		C.vt_set_bitrate(e.ptr, C.int(kbps))
+	}
 }
 
 func (e *vtEncoder) close() {
