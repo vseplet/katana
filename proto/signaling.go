@@ -260,7 +260,8 @@ type peer struct {
 	videoSender *webrtc.RTPSender
 	audioSender *webrtc.RTPSender
 
-	gotAnswer bool // получили ли answer (рукопожатие завершено) — под hub.mu
+	gotAnswer  bool                          // получили ли answer (рукопожатие завершено) — под hub.mu
+	pendingICE []webrtc.ICECandidateInit     // ICE до установки remote description — под hub.mu
 
 	btnDown string // зажатая кнопка мыши ("" если нет) — для drag
 	dragged bool   // были ли move с зажатой кнопкой (отличить drag от клика)
@@ -352,15 +353,34 @@ func (h *hub) readLoop() {
 				if err := p.pc.SetRemoteDescription(ans); err != nil {
 					log.Printf("signaling: set remote description: %v", err)
 				} else {
+					// Рукопожатие завершено: больше не пересылаем offer и сливаем
+					// ICE-кандидаты, накопленные до установки remote description.
 					h.mu.Lock()
-					p.gotAnswer = true // рукопожатие завершено — больше не переслать offer
+					p.gotAnswer = true
+					pending := p.pendingICE
+					p.pendingICE = nil
 					h.mu.Unlock()
+					for _, c := range pending {
+						if err := p.pc.AddICECandidate(c); err != nil {
+							log.Printf("signaling: add buffered ice: %v", err)
+						}
+					}
 				}
 			}
 		case "candidate":
 			if p := h.peer(pid); p != nil && msg.Candidate != nil {
-				if err := p.pc.AddICECandidate(*msg.Candidate); err != nil {
-					log.Printf("signaling: add ice candidate: %v", err)
+				// До answer remote description ещё не установлен — буферизуем, иначе
+				// pion вернёт "remote description is not set" и кандидат потеряется
+				// (на мобильной сети это напрямую бьёт по установлению ICE).
+				h.mu.Lock()
+				if !p.gotAnswer {
+					p.pendingICE = append(p.pendingICE, *msg.Candidate)
+					h.mu.Unlock()
+				} else {
+					h.mu.Unlock()
+					if err := p.pc.AddICECandidate(*msg.Candidate); err != nil {
+						log.Printf("signaling: add ice candidate: %v", err)
+					}
 				}
 			}
 		case "config":
@@ -369,6 +389,14 @@ func (h *hub) readLoop() {
 			if p := h.peer(pid); p != nil {
 				p.dispatchInput(&msg) // фолбэк, если DataChannel ещё не открыт
 			}
+		case "diag":
+			// Диагностика разрывов (временно): снимок слоёв соединения по WS —
+			// доходит даже после смерти P2P-каналов.
+			id := pid
+			if len(id) > 8 {
+				id = id[:8]
+			}
+			log.Printf("diag %s: %s", id, string(data))
 		default:
 			log.Printf("signaling: unknown message type %q", msg.Type)
 		}
