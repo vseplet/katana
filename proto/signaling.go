@@ -680,6 +680,7 @@ func (h *hub) requestKeyframe() {
 	str := h.str
 	h.mu.Unlock()
 	if str != nil {
+		log.Printf("pli: viewer requested keyframe — forcing") // временно, с diag
 		str.requestKeyframe()
 	}
 }
