@@ -705,13 +705,15 @@ func (h *hub) onLoss(lost float64) {
 		cur = h.maxBitrate
 	}
 	switch {
-	case lost > 0.08: // >8% потерь — режем
+	case lost > 0.20: // катастрофа — режем вдвое, чтобы быстро уступить дорогу
+		cur = cur / 2
+	case lost > 0.05: // умеренные потери — мультипликативный спад
 		cur = cur * 4 / 5
 	case lost < 0.02: // почти чисто — осторожно поднимаем
 		cur += 250
 	}
-	if cur < 300 {
-		cur = 300
+	if cur < 200 {
+		cur = 200
 	}
 	if h.maxBitrate > 0 && cur > h.maxBitrate {
 		cur = h.maxBitrate
@@ -720,6 +722,9 @@ func (h *hub) onLoss(lost float64) {
 	h.curBitrate = cur
 	str := h.str
 	h.mu.Unlock()
+	// Логируем каждый шаг (раз в ~1с): видно, доходят ли RR (вызывается ли onLoss)
+	// и как меняется битрейт. Временно, вместе с diag.
+	log.Printf("adapt: loss=%.1f%% bitrate=%d kbps", lost*100, cur)
 	if changed && str != nil {
 		str.setBitrateKbps(cur)
 	}
