@@ -29,9 +29,11 @@ jobs:
 
       - name: Build (darwin/arm64)
         working-directory: proto
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           CGO_ENABLED=1 GOARCH=arm64 \
-            go build -trimpath -ldflags "-s -w" -o ../katana-darwin-arm64 .
+            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-darwin-arm64 .
           ../katana-darwin-arm64 -h 2>&1 | head -1 || true # smoke: бинарник запускается
 
       - name: Release

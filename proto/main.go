@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os/signal"
 	"syscall"
@@ -22,7 +23,12 @@ import (
 	"github.com/vseplet/katana/proto/permissions"
 )
 
+// version вшивается при релизной сборке: -ldflags "-X main.version=v0.1.2".
+// Установочный скрипт сравнивает её с последним релизом и качает только при отличии.
+var version = "dev"
+
 func main() {
+	showVersion := flag.Bool("version", false, "напечатать версию и выйти")
 	session := flag.String("session", "", "код сессии (UUID) рандеву-брокера — обязателен")
 	id := flag.String("id", "", "алиас --session")
 	broker := flag.String("broker", "wss://katana.vseplet.deno.net/rtc", "URL рандеву-брокера (эндпоинт /rtc)")
@@ -34,6 +40,11 @@ func main() {
 	audio := flag.Bool("audio", false, "передавать звук (SCK → Opus)")
 	test := flag.Bool("test", false, "синтетический testsrc вместо экрана (отладка без TCC)")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	sessionID := *session
 	if sessionID == "" {
