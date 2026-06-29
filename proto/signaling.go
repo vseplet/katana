@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,23 @@ type signalMessage struct {
 	// приложения ("activate" + PID). Раньше это было HTTP-API хоста.
 	Sources *capture.Sources `json:"sources,omitempty"`
 	PID     int              `json:"pid,omitempty"`
+	// Инфо о хосте (для "hostinfo" — заголовок вкладки зрителя).
+	OS       string `json:"os,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+}
+
+// osLabel — человекочитаемое имя ОС хоста.
+func osLabel() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "macOS"
+	case "linux":
+		return "Linux"
+	case "windows":
+		return "Windows"
+	default:
+		return runtime.GOOS
+	}
 }
 
 // scrollMsg — событие прокрутки от браузера (в «кликах» колеса).
@@ -336,6 +355,13 @@ func (s *session) startStream(ctx context.Context, opts capture.Options) error {
 	if dc, err := pc.CreateDataChannel("input", nil); err != nil {
 		log.Printf("signaling: data channel: %v", err)
 	} else {
+		// При открытии канала сообщаем зрителю имя машины и ОС (для заголовка вкладки).
+		dc.OnOpen(func() {
+			hn, _ := os.Hostname()
+			if b, err := json.Marshal(signalMessage{Type: "hostinfo", OS: osLabel(), Hostname: hn}); err == nil {
+				_ = dc.SendText(string(b))
+			}
+		})
 		dc.OnMessage(func(m webrtc.DataChannelMessage) {
 			var im signalMessage
 			if json.Unmarshal(m.Data, &im) != nil {
