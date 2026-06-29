@@ -10,7 +10,7 @@ package capture
 char *sck_list_sources(void);
 int sck_source_size(int kind, unsigned int sid, int *outW, int *outH);
 int sck_source_rect(int kind, unsigned int sid, double *x, double *y, double *w, double *h);
-int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cursor);
+int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cursor, int outW, int outH);
 void sck_stop(int handle);
 int sck_set_cursor(int handle, int show);
 void inject_scroll(int dx, int dy);
@@ -26,6 +26,7 @@ import (
 	"io"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +41,11 @@ import (
 type sckSink struct {
 	mu     sync.Mutex
 	latest []byte    // последний видео-кадр (для тикера CFR)
-	audio  io.Writer // stdin аудио-ffmpeg (nil, если звук не нужен)
+	audio  io.Writer // stdin аудио-ffmpeg (ffmpeg-режим; nil иначе)
+	// Нативный режим (без ffmpeg): VideoToolbox + Opus.
+	vt      *vtEncoder
+	opus    *opusEncoder
+	audioCh chan []byte
 }
 
 var (
@@ -88,13 +93,24 @@ func goSCKAudio(handle C.int, buf unsafe.Pointer, length C.int) {
 		return
 	}
 	s.mu.Lock()
-	w := s.audio
-	s.mu.Unlock()
-	if w == nil {
+	defer s.mu.Unlock()
+	// Нативный режим: PCM (f32 interleaved) → Opus → канал.
+	if s.opus != nil {
+		pcm := unsafe.Slice((*float32)(buf), int(length)/4)
+		for _, pkt := range s.opus.feed(pcm) {
+			if s.audioCh != nil {
+				select {
+				case s.audioCh <- pkt:
+				default:
+				}
+			}
+		}
 		return
 	}
-	// Аудио непрерывно — пишем сразу (C-буфер валиден до возврата).
-	_, _ = w.Write(unsafe.Slice((*byte)(buf), int(length)))
+	// ffmpeg-режим: пишем PCM в stdin (C-буфер валиден до возврата).
+	if s.audio != nil {
+		_, _ = s.audio.Write(unsafe.Slice((*byte)(buf), int(length)))
+	}
 }
 
 // sckKindCode переводит строковый вид источника в код для нативной стороны.
@@ -117,9 +133,9 @@ func sckSourceSize(kind, id int) (int, int, error) {
 	return int(w), int(h), nil
 }
 
-func sckStart(kind, id, fps, handle int, audio, cursor bool) error {
+func sckStart(kind, id, fps, handle int, audio, cursor bool, outW, outH int) error {
 	if rc := C.sck_start(C.int(kind), C.uint(id), C.int(fps), C.int(handle),
-		C.int(b2i(audio)), C.int(b2i(cursor))); rc != 0 {
+		C.int(b2i(audio)), C.int(b2i(cursor)), C.int(outW), C.int(outH)); rc != 0 {
 		return fmt.Errorf("sck_start rc=%d", int(rc))
 	}
 	return nil
@@ -132,14 +148,149 @@ func b2i(b bool) int {
 	return 0
 }
 
+// bitrateKbps парсит строку битрейта ("3M" | "3000k" | "3000") в килобиты/с.
+func bitrateKbps(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 3000
+	}
+	mul := 1
+	switch s[len(s)-1] {
+	case 'M', 'm':
+		mul = 1000
+		s = s[:len(s)-1]
+	case 'k', 'K':
+		s = s[:len(s)-1]
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return 3000
+	}
+	return n * mul
+}
+
 func sckStop(handle int) { C.sck_stop(C.int(handle)) }
 
 func sckSetCursor(handle int, show bool) { C.sck_set_cursor(C.int(handle), C.int(b2i(show))) }
 
-// startSCK захватывает дисплей/окно/приложение через ScreenCaptureKit:
-// нативный поток шлёт BGRA-кадры в stdin видео-ffmpeg (скейл/энкод), при
-// opts.Audio — ещё и PCM в stdin аудио-ffmpeg (Opus). Читаем оба stdout.
+// startSCK захватывает дисплей/окно/приложение через ScreenCaptureKit. H264 —
+// нативно (VideoToolbox + Opus, без ffmpeg); VP8 — через ffmpeg.
 func startSCK(ctx context.Context, opts Options) (*Stream, error) {
+	if opts.Codec == CodecH264 {
+		return startSCKNative(ctx, opts)
+	}
+	return startSCKFFmpeg(ctx, opts)
+}
+
+// startSCKNative кодирует H264 аппаратно (VideoToolbox) и Opus (libopus) прямо
+// в процессе — ffmpeg не нужен. SCK сам масштабирует кадр до целевого размера.
+func startSCKNative(ctx context.Context, opts Options) (*Stream, error) {
+	kind := sckKindCode(opts.SourceKind)
+	srcW, srcH, err := sckSourceSize(kind, opts.SourceID)
+	if err != nil {
+		return nil, fmt.Errorf("sck source size: %w", err)
+	}
+	// Целевой размер: native (Width=0) или даунскейл по ширине (чётные размеры).
+	outW, outH := srcW, srcH
+	if opts.Width > 0 && opts.Width < srcW {
+		outW = opts.Width &^ 1
+		outH = (srcH * outW / srcW) &^ 1
+	}
+
+	handle, sink := sckRegister()
+	vt, err := newVTEncoder(handle, outW, outH, opts.FPS, bitrateKbps(opts.Bitrate))
+	if err != nil {
+		sckUnregister(handle)
+		return nil, fmt.Errorf("vt encoder: %w", err)
+	}
+
+	frames := make(chan []byte, 8)
+	nativeRegister(handle, frames)
+
+	var audioCh chan []byte
+	if opts.Audio {
+		if oe, oerr := newOpusEncoder(); oerr != nil {
+			log.Printf("capture: opus: %v (continuing without audio)", oerr)
+		} else {
+			audioCh = make(chan []byte, 16)
+			sink.mu.Lock()
+			sink.opus = oe
+			sink.audioCh = audioCh
+			sink.mu.Unlock()
+		}
+	}
+	sink.mu.Lock()
+	sink.vt = vt
+	sink.mu.Unlock()
+
+	log.Printf("capture: sck %s/%d %dx%d audio=%v | native VideoToolbox H264",
+		opts.SourceKind, opts.SourceID, outW, outH, opts.Audio)
+
+	if err := sckStart(kind, opts.SourceID, opts.FPS, handle, opts.Audio, opts.Cursor, outW, outH); err != nil {
+		nativeClose(handle, frames)
+		sckUnregister(handle)
+		vt.close()
+		if sink.opus != nil {
+			sink.opus.close()
+		}
+		return nil, fmt.Errorf("sck start: %w", err)
+	}
+
+	// Тикер: гоним последний кадр в VT с целевым FPS (ровный CFR даже на статике).
+	go func() {
+		ticker := time.NewTicker(time.Second / time.Duration(opts.FPS))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sink.mu.Lock()
+				f := sink.latest
+				sink.mu.Unlock()
+				if f != nil {
+					vt.encode(f)
+				}
+			}
+		}
+	}()
+
+	// Очистка по отмене контекста.
+	go func() {
+		<-ctx.Done()
+		sckStop(handle)
+		sckUnregister(handle)
+		sink.mu.Lock()
+		oe := sink.opus
+		sink.opus = nil
+		sink.mu.Unlock()
+		vt.close()
+		if oe != nil {
+			oe.close()
+		}
+		nativeClose(handle, frames) // удаляет из реестра и закрывает канал под мьютексом
+		if audioCh != nil {
+			sink.mu.Lock()
+			ac := sink.audioCh
+			sink.audioCh = nil
+			sink.mu.Unlock()
+			if ac != nil {
+				close(ac)
+			}
+		}
+		log.Printf("capture stopped (sck native)")
+	}()
+
+	return &Stream{
+		Video:     frames,
+		Audio:     audioCh,
+		SetCursor: func(show bool) { sckSetCursor(handle, show) },
+	}, nil
+}
+
+// startSCKFFmpeg — путь через ffmpeg (для VP8): SCK отдаёт BGRA в stdin
+// видео-ffmpeg (скейл/энкод), при opts.Audio — PCM в stdin аудио-ffmpeg.
+func startSCKFFmpeg(ctx context.Context, opts Options) (*Stream, error) {
 	ff := FFmpegPath()
 	if ff == "" {
 		return nil, errNoFFmpeg
@@ -192,7 +343,7 @@ func startSCK(ctx context.Context, opts Options) (*Stream, error) {
 		}
 	}
 
-	if err := sckStart(kind, opts.SourceID, opts.FPS, handle, opts.Audio, opts.Cursor); err != nil {
+	if err := sckStart(kind, opts.SourceID, opts.FPS, handle, opts.Audio, opts.Cursor, 0, 0); err != nil {
 		sckUnregister(handle)
 		_ = stdin.Close()
 		if audioStop != nil {

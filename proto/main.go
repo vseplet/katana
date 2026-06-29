@@ -70,11 +70,12 @@ func main() {
 		}
 	}
 
-	// ffmpeg обязателен (энкодер): ~/.katana/bin/ffmpeg → PATH → иначе падаем сразу.
-	if ff := capture.FFmpegPath(); ff == "" {
-		log.Fatalf("ffmpeg not found: place a binary at ~/.katana/bin/ffmpeg or install ffmpeg (e.g. brew install ffmpeg)")
-	} else {
+	// H264 (по умолчанию) кодируется нативно через VideoToolbox — ffmpeg не нужен.
+	// ffmpeg требуется только для VP8 и --test; если его нет — лишь предупреждаем.
+	if ff := capture.FFmpegPath(); ff != "" {
 		log.Printf("ffmpeg: %s", ff)
+	} else {
+		log.Printf("ffmpeg not found (ok for H264; needed only for VP8 / --test) — install via brew or ~/.katana/bin/ffmpeg")
 	}
 
 	log.Printf("katana host: session %s via %s", sessionID, *broker)

@@ -289,7 +289,7 @@ int sck_source_size(int kind, unsigned int sid, int *outW, int *outH) {
 
 // sck_start запускает поток захвата выбранного источника. Кадры идут в
 // goSCKFrame(handle, ...). Возвращает 0 при успехе.
-int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cursor) {
+int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cursor, int outW, int outH) {
 	@autoreleasepool {
 		sck_ensure_app();
 		SCShareableContent *content = sck_fetch_content();
@@ -328,8 +328,10 @@ int sck_start(int kind, unsigned int sid, int fps, int handle, int audio, int cu
 		if (w <= 0 || h <= 0) return 6;
 
 		SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
-		cfg.width = w;
-		cfg.height = h;
+		// outW>0 → SCK сам масштабирует на GPU до целевого размера (нативный путь
+		// без ffmpeg-скейла); иначе отдаём в исходном размере (ffmpeg отскейлит).
+		cfg.width = outW > 0 ? outW : w;
+		cfg.height = outW > 0 ? outH : h;
 		cfg.minimumFrameInterval = CMTimeMake(1, fps > 0 ? fps : 30);
 		cfg.pixelFormat = kCVPixelFormatType_32BGRA;
 		cfg.queueDepth = 5;

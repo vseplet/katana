@@ -24,6 +24,9 @@ jobs:
         with:
           go-version-file: proto/go.mod
 
+      - name: Install libopus (static, для нативного Opus-энкодера)
+        run: brew install opus
+
       - name: Build (darwin/arm64)
         working-directory: proto
         run: |
