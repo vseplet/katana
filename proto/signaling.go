@@ -279,6 +279,7 @@ type peer struct {
 
 	inputDC          *webrtc.DataChannel // канал ввода (для отчёта позиции курсора)
 	lastCursorReport time.Time           // троттлинг cursorpos
+	cursorTimer      *time.Timer         // трейлинг: дослать финальную позицию после остановки
 }
 
 // serveHub ведёт хост-узел поверх готового WS-соединения с брокером.
@@ -1013,10 +1014,23 @@ func (p *peer) reportCursor() {
 		return
 	}
 	now := time.Now()
-	if now.Sub(p.lastCursorReport) < 30*time.Millisecond {
+	if now.Sub(p.lastCursorReport) >= 25*time.Millisecond {
+		p.lastCursorReport = now
+		p.sendCursor()
+	}
+	// Трейлинг: когда движение стихнет, дослать ТОЧНУЮ финальную позицию (иначе
+	// последний кадр движения мог попасть в троттл-окно → кольцо отстаёт).
+	if p.cursorTimer != nil {
+		p.cursorTimer.Stop()
+	}
+	p.cursorTimer = time.AfterFunc(70*time.Millisecond, p.sendCursor)
+}
+
+// sendCursor шлёт текущую позицию курсора (норм. к прямоугольнику источника).
+func (p *peer) sendCursor() {
+	if p.inputDC == nil {
 		return
 	}
-	p.lastCursorReport = now
 	p.h.srcMu.Lock()
 	r := p.h.rect
 	p.h.srcMu.Unlock()
