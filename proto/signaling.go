@@ -28,6 +28,7 @@ type signalMessage struct {
 	Config    *configMsg               `json:"config,omitempty"`
 	Mouse     *mouseMsg                `json:"mouse,omitempty"`
 	Scroll    *scrollMsg               `json:"scroll,omitempty"`
+	Dir       string                   `json:"dir,omitempty"` // zoom: "in" | "out"
 	Key       *keyMsg                  `json:"key,omitempty"`
 	Text      string                   `json:"text,omitempty"` // для "type": набор текста
 	// Vid — идентификатор зрителя (viewer/peer id). Несколько зрителей делят один
@@ -80,8 +81,11 @@ type keyMsg struct {
 type mouseMsg struct {
 	X      float64 `json:"x"`
 	Y      float64 `json:"y"`
-	Action string  `json:"action"` // move | down | up
+	Action string  `json:"action"` // move | down | up | moverel | click
 	Button string  `json:"button"` // left | right
+	// Относительное движение (трекпад-режим мобилы), в пикселях хоста.
+	Dx int `json:"dx,omitempty"`
+	Dy int `json:"dy,omitempty"`
 }
 
 // configMsg — настройки захвата, присылаемые браузером. Указатели, чтобы
@@ -272,6 +276,9 @@ type peer struct {
 
 	btnDown string // зажатая кнопка мыши ("" если нет) — для drag
 	dragged bool   // были ли move с зажатой кнопкой (отличить drag от клика)
+
+	inputDC          *webrtc.DataChannel // канал ввода (для отчёта позиции курсора)
+	lastCursorReport time.Time           // троттлинг cursorpos
 }
 
 // serveHub ведёт хост-узел поверх готового WS-соединения с брокером.
@@ -893,6 +900,7 @@ func (p *peer) buildLocked() error {
 	if dc, err := pc.CreateDataChannel("input", nil); err != nil {
 		log.Printf("signaling: data channel: %v", err)
 	} else {
+		p.inputDC = dc // для отчёта позиции курсора вьюеру
 		dc.OnOpen(func() {
 			hn, _ := os.Hostname()
 			if b, err := json.Marshal(signalMessage{Type: "hostinfo", OS: osLabel(), Hostname: hn}); err == nil {
@@ -968,6 +976,14 @@ func (p *peer) dispatchInput(msg *signalMessage) {
 		if msg.Scroll != nil {
 			scrollMouse(msg.Scroll.Dx, msg.Scroll.Dy)
 		}
+	case "zoom":
+		// Пинч на мобиле → Cmd +/− (зум страницы в браузере и др. приложениях;
+		// настоящий magnify-жест macOS инжектить нельзя).
+		if msg.Dir == "out" {
+			tapKey("-", []string{"cmd"})
+		} else {
+			tapKey("=", []string{"cmd"})
+		}
 	case "cursor":
 		// Курсор хоста общий для захвата — меняем на лету у всех.
 		p.h.mu.Lock()
@@ -989,7 +1005,64 @@ func (p *peer) dispatchInput(msg *signalMessage) {
 
 // handleMouse мапит нормализованные координаты в глобальные и инжектит событие.
 // Геометрия источника общая (один захват), drag-состояние — своё на зрителя.
+// reportCursor сообщает вьюеру текущую позицию курсора (нормализованную к
+// прямоугольнику источника) — для подсветки курсора и follow-pan при зуме на
+// мобиле. Троттлинг ~30/с, чтобы не флудить канал.
+func (p *peer) reportCursor() {
+	if p.inputDC == nil {
+		return
+	}
+	now := time.Now()
+	if now.Sub(p.lastCursorReport) < 30*time.Millisecond {
+		return
+	}
+	p.lastCursorReport = now
+	p.h.srcMu.Lock()
+	r := p.h.rect
+	p.h.srcMu.Unlock()
+	if r.W <= 0 || r.H <= 0 {
+		return
+	}
+	x, y := mouseLocation()
+	cx := clampF((float64(x) - r.X) / r.W)
+	cy := clampF((float64(y) - r.Y) / r.H)
+	if b, err := json.Marshal(signalMessage{Type: "cursorpos", Mouse: &mouseMsg{X: cx, Y: cy}}); err == nil {
+		_ = p.inputDC.SendText(string(b))
+	}
+}
+
 func (p *peer) handleMouse(m *mouseMsg) {
+	// Трекпад-режим (мобила): движение/клик/перетаскивание относительно ТЕКУЩЕЙ
+	// позиции, без маппинга на прямоугольник источника.
+	//  moverel — свайп (свободное движение); click — тап; press/release —
+	//  зажать/отпустить кнопку (long-press-drag); dragrel — свайп с зажатой.
+	btn := "left"
+	if m.Button == "right" {
+		btn = "right"
+	}
+	switch m.Action {
+	case "moverel":
+		moveRel(m.Dx, m.Dy)
+		p.reportCursor()
+		return
+	case "click":
+		clickMouse(btn)
+		return
+	case "dblclick":
+		doubleClick(btn)
+		return
+	case "press":
+		mouseToggle(btn, true)
+		return
+	case "dragrel":
+		dragRel(m.Dx, m.Dy, btn)
+		p.reportCursor()
+		return
+	case "release":
+		mouseToggle(btn, false)
+		return
+	}
+
 	p.h.srcMu.Lock()
 	r := p.h.rect
 	p.h.srcMu.Unlock()
