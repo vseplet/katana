@@ -11,6 +11,10 @@
 // Реализованы в Go: видео-кадр (BGRA) и аудио-чанк (interleaved float32).
 extern void goSCKFrame(int handle, void *buf, int len);
 extern void goSCKAudio(int handle, void *buf, int len);
+// Реализован в Go: SCK-поток остановился (сон/пробуждение, смена дисплея) — Go
+// пересоздаёт захват. Без этого после сна шёл замороженный кадр (тикер CFR гонит
+// последний кадр, а новых от SCK нет).
+extern void goSCKStopped(int handle);
 
 // Старт SCStream трогает CoreGraphics/WindowServer, который в «голом» CLI не
 // инициализирован (Assertion CGS_REQUIRE_INIT). NSApplicationLoad поднимает
@@ -208,6 +212,8 @@ char *sck_list_sources(void) {
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+	NSLog(@"katana: SCK stream stopped: %@", error);
+	goSCKStopped(self.handle); // Go пересоздаст захват
 }
 @end
 

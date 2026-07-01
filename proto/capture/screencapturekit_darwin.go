@@ -46,6 +46,7 @@ type sckSink struct {
 	vt      *vtEncoder
 	opus    *opusEncoder
 	audioCh chan []byte
+	restart chan struct{} // сигнал: SCK-поток остановился, надо пересоздать захват
 }
 
 var (
@@ -58,7 +59,7 @@ func sckRegister() (int, *sckSink) {
 	sckMu.Lock()
 	defer sckMu.Unlock()
 	sckSeq++
-	s := &sckSink{}
+	s := &sckSink{restart: make(chan struct{}, 1)}
 	sckSinks[sckSeq] = s
 	return sckSeq, s
 }
@@ -82,6 +83,20 @@ func goSCKFrame(handle C.int, buf unsafe.Pointer, length C.int) {
 	s.mu.Lock()
 	s.latest = frame
 	s.mu.Unlock()
+}
+
+//export goSCKStopped
+func goSCKStopped(handle C.int) {
+	sckMu.Lock()
+	s := sckSinks[int(handle)]
+	sckMu.Unlock()
+	if s == nil || s.restart == nil {
+		return
+	}
+	select {
+	case s.restart <- struct{}{}: // будим горутину рестарта (неблокирующе)
+	default:
+	}
 }
 
 //export goSCKAudio
@@ -235,6 +250,40 @@ func startSCKNative(ctx context.Context, opts Options) (*Stream, error) {
 		}
 		return nil, fmt.Errorf("sck start: %w", err)
 	}
+
+	// Восстановление захвата: SCK останавливается при сне/пробуждении Mac и смене
+	// дисплея (goSCKStopped через делегат). Тикер CFR при этом гнал бы последний
+	// кадр вечно — зритель видел бы замороженную картинку на 60 fps. Пересоздаём
+	// SCK-поток на том же handle: sink/энкодер/канал сохраняются, кадры снова
+	// пойдут в goSCKFrame.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sink.restart:
+				log.Printf("capture: SCK stopped — restarting screen capture")
+				sckStop(handle) // остановить/убрать старый поток
+				select { // проглотить возможный само-сигнал от sckStop (не зациклиться)
+				case <-sink.restart:
+				default:
+				}
+				for ctx.Err() == nil {
+					if err := sckStart(kind, opts.SourceID, opts.FPS, handle, opts.Audio, opts.Cursor, outW, outH); err != nil {
+						log.Printf("capture: SCK restart failed: %v (retry in 1s)", err)
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(time.Second):
+						}
+						continue
+					}
+					log.Printf("capture: screen capture restarted")
+					break
+				}
+			}
+		}
+	}()
 
 	// Тикер: гоним последний кадр в VT с целевым FPS (ровный CFR даже на статике).
 	go func() {
