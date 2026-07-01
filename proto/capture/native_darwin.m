@@ -95,41 +95,67 @@ static void vtCallback(void *refcon, void *src, OSStatus status,
 	free(out);
 }
 
-// vt_open создаёт H264-энкодер (realtime, без B-кадров, кейфрейм раз в секунду).
+// vtConfigure создаёт и настраивает VTCompressionSession (realtime, без B-кадров,
+// кейфрейм раз в секунду). Общий код для vt_open и vt_reopen.
+static OSStatus vtConfigure(int handle, int w, int h, int fps, int bitrateKbps, VTCompressionSessionRef *out) {
+	OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, w, h,
+	                                         kCMVideoCodecType_H264, NULL, NULL, NULL,
+	                                         vtCallback, (void *)(intptr_t)handle, out);
+	if (st != noErr) {
+		*out = NULL;
+		return st;
+	}
+	VTSessionSetProperty(*out, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+	VTSessionSetProperty(*out, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+	VTSessionSetProperty(*out, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
+
+	int br = bitrateKbps * 1000;
+	CFNumberRef brn = CFNumberCreate(NULL, kCFNumberIntType, &br);
+	VTSessionSetProperty(*out, kVTCompressionPropertyKey_AverageBitRate, brn);
+	CFRelease(brn);
+
+	int gop = fps > 0 ? fps : 30;
+	CFNumberRef gn = CFNumberCreate(NULL, kCFNumberIntType, &gop);
+	VTSessionSetProperty(*out, kVTCompressionPropertyKey_MaxKeyFrameInterval, gn);
+	CFRelease(gn);
+	double dur = 1.0;
+	CFNumberRef dn = CFNumberCreate(NULL, kCFNumberDoubleType, &dur);
+	VTSessionSetProperty(*out, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, dn);
+	CFRelease(dn);
+
+	VTCompressionSessionPrepareToEncodeFrames(*out);
+	return noErr;
+}
+
+// vt_open создаёт H264-энкодер.
 int vt_open(int handle, int w, int h, int fps, int bitrateKbps, struct VTEnc **out) {
 	struct VTEnc *e = calloc(1, sizeof(struct VTEnc));
 	if (!e) {
 		return -1;
 	}
 	e->handle = handle;
-	OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, w, h,
-	                                         kCMVideoCodecType_H264, NULL, NULL, NULL,
-	                                         vtCallback, (void *)(intptr_t)handle, &e->session);
+	OSStatus st = vtConfigure(handle, w, h, fps, bitrateKbps, &e->session);
 	if (st != noErr) {
 		free(e);
 		return (int)st;
 	}
-	VTSessionSetProperty(e->session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-	VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-	VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
-
-	int br = bitrateKbps * 1000;
-	CFNumberRef brn = CFNumberCreate(NULL, kCFNumberIntType, &br);
-	VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AverageBitRate, brn);
-	CFRelease(brn);
-
-	int gop = fps > 0 ? fps : 30;
-	CFNumberRef gn = CFNumberCreate(NULL, kCFNumberIntType, &gop);
-	VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, gn);
-	CFRelease(gn);
-	double dur = 1.0;
-	CFNumberRef dn = CFNumberCreate(NULL, kCFNumberDoubleType, &dur);
-	VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, dn);
-	CFRelease(dn);
-
-	VTCompressionSessionPrepareToEncodeFrames(e->session);
 	*out = e;
 	return 0;
+}
+
+// vt_reopen пересоздаёт сессию на месте (та же struct/handle) — восстановление,
+// когда VTCompressionSession свалилась в невалидное состояние и молча перестала
+// выдавать кадры. Следующий encode стоит делать с forceKey (сразу keyframe).
+int vt_reopen(struct VTEnc *e, int w, int h, int fps, int bitrateKbps) {
+	if (!e) {
+		return -1;
+	}
+	if (e->session) {
+		VTCompressionSessionInvalidate(e->session);
+		CFRelease(e->session);
+		e->session = NULL;
+	}
+	return (int)vtConfigure(e->handle, w, h, fps, bitrateKbps, &e->session);
 }
 
 // vt_set_bitrate меняет целевой битрейт на работающей сессии (для адаптации под
