@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/vseplet/katana/proto/capture"
@@ -405,13 +406,7 @@ func (h *hub) readLoop() {
 				p.dispatchInput(&msg) // фолбэк, если DataChannel ещё не открыт
 			}
 		case "diag":
-			// Диагностика разрывов (временно): снимок слоёв соединения по WS —
-			// доходит даже после смерти P2P-каналов.
-			id := pid
-			if len(id) > 8 {
-				id = id[:8]
-			}
-			log.Printf("diag %s: %s", id, string(data))
+			// Диаг-снимок связи от зрителя — игнорируем (раньше логировали).
 		default:
 			log.Printf("signaling: unknown message type %q", msg.Type)
 		}
@@ -689,7 +684,6 @@ func (h *hub) requestKeyframe() {
 	str := h.str
 	h.mu.Unlock()
 	if str != nil {
-		log.Printf("pli: viewer requested keyframe — forcing") // временно, с diag
 		str.requestKeyframe()
 	}
 }
@@ -744,9 +738,6 @@ func (h *hub) onLoss(lost float64) {
 	h.curBitrate = cur
 	str := h.str
 	h.mu.Unlock()
-	// Логируем каждый шаг (раз в ~1с): видно, доходят ли RR (вызывается ли onLoss)
-	// и как меняется битрейт. Временно, вместе с diag.
-	log.Printf("adapt: loss=%.1f%% bitrate=%d kbps", lost*100, cur)
 	if changed && str != nil {
 		str.setBitrateKbps(cur)
 	}
@@ -846,12 +837,30 @@ func newSharedTracks(opts capture.Options) (*webrtc.TrackLocalStaticSample, *web
 	return vtrack, atrack, nil
 }
 
+// webrtcAPI — общий API pion с дефолтными кодеками И интерсепторами. Ключевое:
+// RegisterDefaultInterceptors включает NACK-респондер (ретрансляцию потерянных
+// пакетов) + RTCP. Без него потерянный пакет keyframe'а никто не досылает —
+// декодер зрителя виснет навсегда, хотя звук (Opus, без опорного кадра) идёт.
+// Голый webrtc.NewPeerConnection ставит кодеки, но НЕ интерсепторы (в SDP rtx/nack
+// есть, а по факту ретрансляции нет — и в GetStats нет OutboundRTPStreamStats).
+var webrtcAPI = func() *webrtc.API {
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterDefaultCodecs(); err != nil {
+		panic(err)
+	}
+	ir := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
+		panic(err)
+	}
+	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir))
+}()
+
 // buildLocked создаёт PeerConnection зрителя поверх ОБЩИХ треков хаба, вешает
 // data-каналы (input/term) и обработчики. Захват уже идёт. Вызывать под h.mu.
 func (p *peer) buildLocked() error {
 	h := p.h
 	// Публичный STUN — собираем srflx-кандидаты для P2P через NAT. TURN пока нет.
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+	pc, err := webrtcAPI.NewPeerConnection(webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 		},
