@@ -49,6 +49,16 @@ type signalMessage struct {
 	// Инфо о хосте (для "hostinfo" — заголовок вкладки зрителя).
 	OS       string `json:"os,omitempty"`
 	Hostname string `json:"hostname,omitempty"`
+	// Broker → host для TUI: "sessioninfo" (владелец+план) и "presence" (зрители).
+	Owner   string        `json:"owner,omitempty"`
+	Plan    string        `json:"plan,omitempty"`
+	Viewers []viewerCount `json:"viewers,omitempty"`
+}
+
+// viewerCount — один пользователь-зритель и число его открытых вкладок (views).
+type viewerCount struct {
+	Name  string `json:"name"`
+	Views int    `json:"views"`
 }
 
 // osLabel — человекочитаемое имя ОС хоста.
@@ -470,6 +480,12 @@ func (h *hub) readLoop() {
 			if p := h.peer(pid); p != nil {
 				p.dispatchInput(&msg) // фолбэк, если DataChannel ещё не открыт
 			}
+		case "sessioninfo":
+			// От брокера: владелец сессии + уровень подписки — для TUI.
+			uiOwner(msg.Owner, msg.Plan)
+		case "presence":
+			// От брокера: список зрителей (имя + число вкладок) — для TUI.
+			uiViewerList(msg.Viewers)
 		case "diag":
 			// Диаг-снимок связи от зрителя — игнорируем (раньше логировали).
 		default:
