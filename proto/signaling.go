@@ -212,7 +212,17 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 			continue
 		}
 		log.Printf("broker: connected, waiting for viewers")
-		serveHub(ctx, conn, enc, opts, "broker:"+sessionID)
+		reject, reason := serveHub(ctx, conn, enc, opts, "broker:"+sessionID)
+		if reject {
+			// Брокер отклонил хост (лимит free-плана / неизвестная сессия). Это не
+			// сетевой сбой — переподключаться бессмысленно. Печатаем причину и выходим.
+			if reason == "" {
+				reason = "rejected by broker"
+			}
+			log.Printf("host: cannot start — %s", reason)
+			log.Printf("host: manage or upgrade at %s", dashboardURL(brokerURL))
+			return
+		}
 		if ctx.Err() == nil {
 			log.Printf("broker: connection lost, reconnecting")
 			select {
@@ -222,6 +232,15 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 			}
 		}
 	}
+}
+
+// dashboardURL выводит адрес дашборда (для апгрейда) из URL брокера:
+// wss://host/rtc → https://host/sessions.
+func dashboardURL(brokerURL string) string {
+	u := strings.TrimSuffix(strings.TrimRight(brokerURL, "/"), "/rtc")
+	u = strings.Replace(u, "wss://", "https://", 1)
+	u = strings.Replace(u, "ws://", "http://", 1)
+	return u + "/sessions"
 }
 
 // captureGrace — сколько держать захват живым после ухода последнего зрителя,
@@ -243,6 +262,9 @@ type hub struct {
 	cnl  context.CancelFunc
 
 	writeMu sync.Mutex // сериализует запись в общий WS
+
+	reject       bool   // брокер отклонил хост (1008) — НЕ переподключаться
+	rejectReason string // причина отклонения (текст из close-фрейма)
 
 	mu         sync.Mutex // защищает всё ниже
 	configured bool       // задавались ли уже настройки трансляции
@@ -284,7 +306,9 @@ type peer struct {
 }
 
 // serveHub ведёт хост-узел поверх готового WS-соединения с брокером.
-func serveHub(parent context.Context, conn *websocket.Conn, enc capture.CaptureEncoder, connOpts capture.Options, label string) {
+// serveHub ведёт сессию хоста поверх WS. Возвращает (reject, reason): reject=true
+// значит брокер отклонил хост (1008) и переподключаться НЕ нужно.
+func serveHub(parent context.Context, conn *websocket.Conn, enc capture.CaptureEncoder, connOpts capture.Options, label string) (bool, string) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -342,6 +366,7 @@ func serveHub(parent context.Context, conn *websocket.Conn, enc capture.CaptureE
 	}()
 
 	h.readLoop()
+	return h.reject, h.rejectReason
 }
 
 // send сериализует сообщение (с проставленным pid) и пишет его в общий WS.
@@ -367,7 +392,13 @@ func (h *hub) readLoop() {
 		_, data, err := h.ws.Read(h.ctx)
 		if err != nil {
 			if websocket.CloseStatus(err) == websocket.StatusPolicyViolation {
-				log.Printf("broker: session not found or unauthorized — check --session (full UUID) and that it was created on the same site")
+				// Брокер отклонил хост (неизвестная сессия / лимит free-плана).
+				// Запоминаем причину и НЕ переподключаемся — это не сетевой сбой.
+				var ce websocket.CloseError
+				if errors.As(err, &ce) {
+					h.rejectReason = ce.Reason
+				}
+				h.reject = true
 			} else if h.ctx.Err() == nil && websocket.CloseStatus(err) == -1 && !errors.Is(err, context.Canceled) {
 				log.Printf("signaling: ws read: %v", err)
 			}
