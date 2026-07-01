@@ -201,6 +201,7 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 		strings.TrimRight(brokerURL, "/"), url.QueryEscape(sessionID))
 	for ctx.Err() == nil {
 		log.Printf("broker: connecting to %s (session %s)", brokerURL, sessionID)
+		uiStatus("connecting to broker…")
 		conn, _, err := websocket.Dial(ctx, wsURL, nil)
 		if err != nil {
 			log.Printf("broker: dial: %v (retry in 3s)", err)
@@ -212,6 +213,7 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 			continue
 		}
 		log.Printf("broker: connected, waiting for viewers")
+		uiStatus("connected · waiting for viewers")
 		reject, reason := serveHub(ctx, conn, enc, opts, "broker:"+sessionID)
 		if reject {
 			// Брокер отклонил хост (лимит free-плана / неизвестная сессия). Это не
@@ -221,10 +223,12 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 			}
 			log.Printf("host: cannot start — %s", reason)
 			log.Printf("host: manage or upgrade at %s", dashboardURL(brokerURL))
+			uiStatus("stopped — " + reason)
 			return
 		}
 		if ctx.Err() == nil {
 			log.Printf("broker: connection lost, reconnecting")
+			uiStatus("connection lost · reconnecting…")
 			select {
 			case <-ctx.Done():
 				return
@@ -543,7 +547,10 @@ func (h *hub) onHello(pid string, msg signalMessage) {
 	}
 	h.peers[pid] = p
 	opts := h.curOpts
+	nviewers := len(h.peers)
 	h.mu.Unlock()
+	uiViewers(nviewers)
+	uiStatus("live · streaming")
 
 	p.offer()
 	// Сообщаем зрителю текущие настройки трансляции (его UI синхронизируется,
@@ -592,6 +599,10 @@ func (h *hub) removePeer(pid string) {
 	p.closePC()
 	delete(h.peers, pid)
 	log.Printf("broker: viewer %s left (%d remaining)", pid, len(h.peers))
+	uiViewers(len(h.peers))
+	if len(h.peers) == 0 {
+		uiStatus("connected · waiting for viewers")
+	}
 	if len(h.peers) == 0 {
 		// Захват не глушим сразу: на мобильной сети зритель часто рвётся и
 		// возвращается за пару секунд. Даём grace-период — если за него никто

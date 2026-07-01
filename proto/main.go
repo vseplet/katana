@@ -15,12 +15,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/vseplet/katana/proto/capture"
 	"github.com/vseplet/katana/proto/permissions"
+	"golang.org/x/term"
 )
 
 // version вшивается при релизной сборке: -ldflags "-X main.version=v0.1.2".
@@ -52,6 +56,19 @@ func main() {
 	}
 	if sessionID == "" {
 		log.Fatalf("--session=<uuid> is required (broker session code; created on the katana-saas site)")
+	}
+
+	// Логи уводим в ~/.katana/<session>.log, чтобы терминал занял TUI. В fallback
+	// (не TTY: фон/пайп) дублируем в stdout, иначе вывода не будет вообще.
+	tty := term.IsTerminal(int(os.Stdout.Fd()))
+	logPath := sessionLogPath(sessionID)
+	if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		defer lf.Close()
+		if tty {
+			log.SetOutput(lf)
+		} else {
+			log.SetOutput(io.MultiWriter(os.Stdout, lf))
+		}
 	}
 
 	opts := capture.Options{
@@ -90,6 +107,20 @@ func main() {
 	}
 
 	log.Printf("katana host: session %s via %s", sessionID, *broker)
-	runBrokerHost(ctx, *broker, sessionID, enc, opts)
+	run := func() { runBrokerHost(ctx, *broker, sessionID, enc, opts) }
+	if tty {
+		runHostUI(sessionID, logPath, stop, run) // живой статус в терминале
+	} else {
+		run() // не TTY (фон/пайп) — обычный лог-вывод
+	}
 	log.Printf("stopped")
+}
+
+// sessionLogPath — файл логов сессии рядом с бинарём: ~/.katana/<session>.log.
+func sessionLogPath(session string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, ".katana", session+".log")
 }
