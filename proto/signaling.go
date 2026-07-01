@@ -390,7 +390,11 @@ func (h *hub) readLoop() {
 		case "renegotiate":
 			h.onRenegotiate(msg)
 		case "answer":
-			if p := h.peer(pid); p != nil {
+			if p := h.peer(pid); p != nil && p.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
+				// Применяем answer только если реально ждём его (есть локальный
+				// offer). Брокер иногда доставляет answer дублями — без этой
+				// проверки повтор летит в уже установленное (stable) соединение
+				// и сыплет InvalidModificationError.
 				ans := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: msg.SDP}
 				if err := p.pc.SetRemoteDescription(ans); err != nil {
 					log.Printf("signaling: set remote description: %v", err)
