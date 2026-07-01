@@ -315,6 +315,32 @@ func serveHub(parent context.Context, conn *websocket.Conn, enc capture.CaptureE
 		log.Printf("signaling: host session ended (%s)", label)
 	}()
 
+	// Keepalive: периодически пингуем брокер. Если pong не пришёл (сокет мёртв —
+	// например Mac уснул и проснулся, TCP заморожен и обрыв сам не детектится),
+	// рвём контекст → readLoop выходит → runBrokerHost переподключается. Без
+	// этого хост после сна висел бы на мёртвом Read, и зрители не могли подключиться.
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				pctx, pcancel := context.WithTimeout(ctx, 7*time.Second)
+				err := conn.Ping(pctx)
+				pcancel()
+				if err != nil {
+					if ctx.Err() == nil {
+						log.Printf("broker: keepalive ping failed: %v — reconnecting", err)
+						cancel()
+					}
+					return
+				}
+			}
+		}
+	}()
+
 	h.readLoop()
 }
 
