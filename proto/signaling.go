@@ -325,7 +325,11 @@ func loadICEServers(ctx context.Context, brokerURL string) {
 	}
 	if len(out) > 0 {
 		hostICEServers = out
-		log.Printf("ice: loaded %d server(s) from broker", len(out))
+		n := 0
+		for _, s := range out {
+			n += len(s.URLs)
+		}
+		log.Printf("ice: loaded %d server(s), %d URL(s) from broker", len(out), n)
 	}
 }
 
