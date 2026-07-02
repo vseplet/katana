@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"runtime"
@@ -215,6 +216,7 @@ func optsToState(o capture.Options) signalMessage {
 func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture.CaptureEncoder, opts capture.Options) {
 	wsURL := fmt.Sprintf("%s?session=%s&role=host",
 		strings.TrimRight(brokerURL, "/"), url.QueryEscape(sessionID))
+	loadICEServers(ctx, brokerURL) // до цикла: список нужен уже первому зрителю
 	for ctx.Err() == nil {
 		log.Printf("broker: connecting to %s (session %s)", brokerURL, sessionID)
 		uiStatus("connecting to broker…")
@@ -270,6 +272,61 @@ func originFromBroker(brokerURL string) string {
 	u = strings.Replace(u, "wss://", "https://", 1)
 	u = strings.Replace(u, "ws://", "http://", 1)
 	return u
+}
+
+// hostICEServers — ICE-серверы для PeerConnection зрителей. Тянем из /api/ice
+// (SaaS — источник правды, туда же добавится TURN без пересборки хоста). Фолбэк
+// — публичный Google STUN. Заполняется один раз в loadICEServers() до цикла
+// подключения; читается в buildLocked (гонки нет — загрузка завершается раньше).
+var hostICEServers = []webrtc.ICEServer{
+	{URLs: []string{"stun:stun.l.google.com:19302"}},
+}
+
+// loadICEServers запрашивает список ICE у брокера. Формат ответа:
+// {"iceServers":[{"urls":["stun:..."|"..."],"username":"?","credential":"?"}]}.
+// urls допускается и строкой, и массивом (как в спецификации RTCIceServer).
+func loadICEServers(ctx context.Context, brokerURL string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, originFromBroker(brokerURL)+"/api/ice", nil)
+	if err != nil {
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return // сеть — остаёмся на фолбэке
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	var body struct {
+		IceServers []struct {
+			URLs       json.RawMessage `json:"urls"`
+			Username   string          `json:"username"`
+			Credential string          `json:"credential"`
+		} `json:"iceServers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return
+	}
+	out := make([]webrtc.ICEServer, 0, len(body.IceServers))
+	for _, s := range body.IceServers {
+		var urls []string
+		if err := json.Unmarshal(s.URLs, &urls); err != nil {
+			var one string
+			if json.Unmarshal(s.URLs, &one) != nil || one == "" {
+				continue
+			}
+			urls = []string{one}
+		}
+		if len(urls) == 0 {
+			continue
+		}
+		out = append(out, webrtc.ICEServer{URLs: urls, Username: s.Username, Credential: s.Credential})
+	}
+	if len(out) > 0 {
+		hostICEServers = out
+		log.Printf("ice: loaded %d server(s) from broker", len(out))
+	}
 }
 
 // captureGrace — сколько держать захват живым после ухода последнего зрителя,
@@ -962,11 +1019,10 @@ var webrtcAPI = func() *webrtc.API {
 // data-каналы (input/term) и обработчики. Захват уже идёт. Вызывать под h.mu.
 func (p *peer) buildLocked() error {
 	h := p.h
-	// Публичный STUN — собираем srflx-кандидаты для P2P через NAT. TURN пока нет.
+	// ICE из /api/ice (несколько STUN на разных доменах + TURN, когда появится).
+	// Фолбэк на Google STUN зашит в hostICEServers.
 	pc, err := webrtcAPI.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
+		ICEServers: hostICEServers,
 	})
 	if err != nil {
 		return fmt.Errorf("new peer connection: %w", err)
