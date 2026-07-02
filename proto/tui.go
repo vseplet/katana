@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mdp/qrterminal/v3"
 )
 
 // TUI хоста: вместо потока логов — компактный живой статус (bubbletea). Логи
@@ -53,21 +55,40 @@ func uiViewerList(v []viewerCount) {
 
 type hostModel struct {
 	session string
+	url     string // ссылка зрителя (в QR)
+	qr      string // предрендеренный QR-код (half-blocks)
 	logPath string
 	status  string
 	owner   string
 	plan    string
 	viewers int
 	list    []viewerCount
+	showQR  bool // QR большой — по умолчанию скрыт, по кнопке c (выводится снизу)
 	sp      spinner.Model
 	cancel  context.CancelFunc
 }
 
-func newHostModel(session, logPath string, cancel context.CancelFunc) hostModel {
+func newHostModel(session, url, logPath string, cancel context.CancelFunc) hostModel {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	return hostModel{session: session, logPath: logPath, status: "starting…", sp: sp, cancel: cancel}
+	return hostModel{session: session, url: url, qr: makeQR(url), logPath: logPath, status: "starting…", sp: sp, cancel: cancel}
+}
+
+// makeQR рендерит компактный QR (half-blocks) в строку для вывода в TUI.
+func makeQR(url string) string {
+	var buf bytes.Buffer
+	qrterminal.GenerateWithConfig(url, qrterminal.Config{
+		Level:          qrterminal.L,
+		Writer:         &buf,
+		HalfBlocks:     true,
+		BlackChar:      qrterminal.BLACK_BLACK,
+		WhiteChar:      qrterminal.WHITE_WHITE,
+		BlackWhiteChar: qrterminal.BLACK_WHITE,
+		WhiteBlackChar: qrterminal.WHITE_BLACK,
+		QuietZone:      1,
+	})
+	return strings.Trim(buf.String(), "\n")
 }
 
 func (m hostModel) Init() tea.Cmd { return m.sp.Tick }
@@ -81,6 +102,9 @@ func (m hostModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cancel() // останавливаем хост
 			}
 			return m, tea.Quit
+		case "c":
+			m.showQR = !m.showQR
+			return m, nil
 		}
 	case statusMsg:
 		m.status = string(msg)
@@ -101,10 +125,14 @@ func (m hostModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m hostModel) View() string {
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("katana")
-	label := lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	val := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	pink := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	lbl := lipgloss.NewStyle().Foreground(lipgloss.Color("103")) // grey-blue лейблы
+	val := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	cyan := lipgloss.NewStyle().Foreground(lipgloss.Color("80"))
+	name := lipgloss.NewStyle().Foreground(lipgloss.Color("114")) // зелёные имена
+	sep := dim.Render(" · ")
+	stat := lipgloss.NewStyle().Bold(true).Foreground(statusColor(m.status))
 
 	sess := m.session
 	if len(sess) > 8 {
@@ -112,25 +140,59 @@ func (m hostModel) View() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(title + "  " + dim.Render("host") + "\n\n")
-	b.WriteString(m.sp.View() + val.Render(m.status) + "\n\n")
-	b.WriteString(label.Render("session  ") + val.Render(sess) + "\n")
+	b.WriteString(pink.Render("katana") + "  " + dim.Render("host") + "\n\n")
+	b.WriteString(m.sp.View() + stat.Render(m.status) + "\n\n")
+	b.WriteString(lbl.Render("session  ") + cyan.Render(sess) + "\n")
 	if m.owner != "" {
-		b.WriteString(label.Render("owner    ") + val.Render(m.owner) + " " + planBadge(m.plan) + "\n")
+		b.WriteString(lbl.Render("owner    ") + val.Render(m.owner) + " " + planBadge(m.plan) + "\n")
 	}
-	b.WriteString(label.Render("viewers  ") + val.Render(fmt.Sprintf("%d", m.viewers)) + "\n")
-	for _, v := range m.list {
-		b.WriteString(label.Render("         ") + val.Render(v.Name) + dim.Render(fmt.Sprintf("  ×%d", v.Views)) + "\n")
+	// Все зрители одной строкой: users  alice ×2 · bob · guest
+	b.WriteString(lbl.Render("users    "))
+	if len(m.list) == 0 {
+		b.WriteString(dim.Render("none yet"))
+	} else {
+		parts := make([]string, 0, len(m.list))
+		for _, v := range m.list {
+			s := name.Render(v.Name)
+			if v.Views > 1 {
+				s += dim.Render(fmt.Sprintf(" ×%d", v.Views))
+			}
+			parts = append(parts, s)
+		}
+		b.WriteString(strings.Join(parts, sep))
 	}
-	b.WriteString("\n")
+	b.WriteString("\n\n")
+	// QR со ссылкой зрителя — большой, поэтому только по кнопке c, и выводится снизу.
+	if m.showQR {
+		b.WriteString(m.qr + "\n" + cyan.Render("scan to watch") + "\n\n")
+	}
 	b.WriteString(dim.Render("logs: "+m.logPath) + "\n")
-	b.WriteString(dim.Render("press q to quit"))
+	if m.showQR {
+		b.WriteString(dim.Render("press c to hide QR · q to quit"))
+	} else {
+		b.WriteString(dim.Render("press c for connect QR · q to quit"))
+	}
 
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("238")).
+		BorderForeground(lipgloss.Color("61")).
 		Padding(1, 3).
 		Render(b.String()) + "\n"
+}
+
+// statusColor — цвет статуса по смыслу: живой=зелёный, ожидание=янтарь,
+// остановлен/ошибка=красный.
+func statusColor(s string) lipgloss.Color {
+	switch {
+	case strings.Contains(s, "live"):
+		return lipgloss.Color("42") // green
+	case strings.Contains(s, "stopped"), strings.Contains(s, "cannot"), strings.Contains(s, "lost"):
+		return lipgloss.Color("203") // red
+	case strings.Contains(s, "connect"), strings.Contains(s, "waiting"), strings.Contains(s, "reconnect"), strings.Contains(s, "starting"):
+		return lipgloss.Color("214") // amber
+	default:
+		return lipgloss.Color("252")
+	}
 }
 
 // planBadge — цветной бейдж уровня подписки.
@@ -143,8 +205,8 @@ func planBadge(plan string) string {
 
 // runHostUI запускает TUI и хост параллельно: хост крутится в горутине, TUI держит
 // главный поток (tea.Run блокирует). Когда хост завершается — закрываем TUI.
-func runHostUI(session, logPath string, cancel context.CancelFunc, run func()) {
-	uiProg = tea.NewProgram(newHostModel(session, logPath, cancel))
+func runHostUI(session, url, logPath string, cancel context.CancelFunc, run func()) {
+	uiProg = tea.NewProgram(newHostModel(session, url, logPath, cancel))
 	go func() {
 		run()
 		uiProg.Quit()

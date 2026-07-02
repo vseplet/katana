@@ -251,10 +251,19 @@ func runBrokerHost(ctx context.Context, brokerURL, sessionID string, enc capture
 // dashboardURL выводит адрес дашборда (для апгрейда) из URL брокера:
 // wss://host/rtc → https://host/sessions.
 func dashboardURL(brokerURL string) string {
+	return originFromBroker(brokerURL) + "/sessions"
+}
+
+// viewerURL — ссылка зрителя (для QR в TUI): wss://host/rtc → https://host/v/<session>.
+func viewerURL(brokerURL, session string) string {
+	return originFromBroker(brokerURL) + "/v/" + session
+}
+
+func originFromBroker(brokerURL string) string {
 	u := strings.TrimSuffix(strings.TrimRight(brokerURL, "/"), "/rtc")
 	u = strings.Replace(u, "wss://", "https://", 1)
 	u = strings.Replace(u, "ws://", "http://", 1)
-	return u + "/sessions"
+	return u
 }
 
 // captureGrace — сколько держать захват живым после ухода последнего зрителя,

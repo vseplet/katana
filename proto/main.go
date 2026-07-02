@@ -109,7 +109,7 @@ func main() {
 	log.Printf("katana host: session %s via %s", sessionID, *broker)
 	run := func() { runBrokerHost(ctx, *broker, sessionID, enc, opts) }
 	if tty {
-		runHostUI(sessionID, logPath, stop, run) // живой статус в терминале
+		runHostUI(sessionID, viewerURL(*broker, sessionID), logPath, stop, run) // живой статус + QR
 	} else {
 		run() // не TTY (фон/пайп) — обычный лог-вывод
 	}
