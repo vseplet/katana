@@ -188,7 +188,6 @@ func (m hostModel) View() string {
 	if m.showQR {
 		b.WriteString(m.qr + "\n" + cyan.Render("scan to watch") + "\n\n")
 	}
-	b.WriteString(dim.Render("logs: "+m.logPath) + "\n")
 	if m.showQR {
 		b.WriteString(dim.Render("press c to hide QR · q to quit"))
 	} else {
@@ -198,7 +197,7 @@ func (m hostModel) View() string {
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("61")).
-		Padding(1, 3).
+		Padding(0, 2).
 		Render(b.String()) + "\n"
 }
 
