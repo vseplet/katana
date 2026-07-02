@@ -49,6 +49,12 @@ type signalMessage struct {
 	// Инфо о хосте (для "hostinfo" — заголовок вкладки зрителя).
 	OS       string `json:"os,omitempty"`
 	Hostname string `json:"hostname,omitempty"`
+	Ffmpeg   bool   `json:"ffmpeg,omitempty"` // есть ли ffmpeg на хосте (для доступности VP8)
+	// Возможности хоста в этом окружении (для "hostinfo") — вьювер адаптируется.
+	Video    bool `json:"video,omitempty"`
+	AudioCap bool `json:"audioCap,omitempty"`
+	Input    bool `json:"input,omitempty"`
+	Terminal bool `json:"terminal,omitempty"`
 	// Broker → host для TUI: "sessioninfo" (владелец+план) и "presence" (зрители).
 	Owner   string        `json:"owner,omitempty"`
 	Plan    string        `json:"plan,omitempty"`
@@ -1010,7 +1016,7 @@ func (p *peer) buildLocked() error {
 		p.inputDC = dc // для отчёта позиции курсора вьюеру
 		dc.OnOpen(func() {
 			hn, _ := os.Hostname()
-			if b, err := json.Marshal(signalMessage{Type: "hostinfo", OS: osLabel(), Hostname: hn}); err == nil {
+			if b, err := json.Marshal(signalMessage{Type: "hostinfo", OS: osLabel(), Hostname: hn, Ffmpeg: capture.FFmpegPath() != "", Video: hostCaps().Video, AudioCap: hostCaps().Audio, Input: hostCaps().Input, Terminal: hostCaps().Terminal}); err == nil {
 				_ = dc.SendText(string(b))
 			}
 		})

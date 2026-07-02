@@ -1,7 +1,9 @@
 name: release
 
-# Сборка бинарника хоста для macOS arm64 и публикация в GitHub Release.
-# Хост использует cgo + ObjC (ScreenCaptureKit) — собирается только на macOS.
+# Сборка бинарников хоста и публикация в один GitHub Release.
+# macOS (arm64): cgo + ObjC (ScreenCaptureKit/VideoToolbox) — только на macOS, полный.
+# Linux (arm64/amd64): статик (CGO_ENABLED=0), headless — терминал по WebRTC, без
+# видео/ввода/аудио (заглушки). Работает где нет графики (Pi, серверы, контейнеры).
 on:
   push:
     tags: ["v*"]
@@ -15,18 +17,15 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  macos:
     runs-on: macos-14 # arm64 (Apple Silicon)
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version-file: proto/go.mod
-
       - name: Install libopus (static, для нативного Opus-энкодера)
         run: brew install opus
-
       - name: Build (darwin/arm64)
         working-directory: proto
         env:
@@ -34,11 +33,34 @@ jobs:
         run: |
           CGO_ENABLED=1 GOARCH=arm64 \
             go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-darwin-arm64 .
-          ../katana-darwin-arm64 -h 2>&1 | head -1 || true # smoke: бинарник запускается
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
+          ../katana-darwin-arm64 -h 2>&1 | head -1 || true # smoke
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: katana-darwin-arm64
+          fail_on_unmatched_files: true
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proto/go.mod
+      - name: Build (linux/arm64 + amd64, static, headless)
+        working-directory: proto
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-linux-arm64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-linux-amd64 .
+          ../katana-linux-amd64 --version || true # smoke
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            katana-linux-arm64
+            katana-linux-amd64
           fail_on_unmatched_files: true

@@ -82,7 +82,7 @@ func main() {
 		Audio:       *audio,
 		TestSource:  *test,
 	}
-	enc := capture.NewFFmpegDarwin()
+	enc := capture.NewEncoder()
 
 	// Корневой контекст: отмена по SIGINT/SIGTERM останавливает захват/ffmpeg.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

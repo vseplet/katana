@@ -81,6 +81,11 @@ func NewFFmpegDarwin() *FFmpegDarwin {
 	return &FFmpegDarwin{}
 }
 
+// NewEncoder — платформо-нейтральная фабрика энкодера (её зовёт ядро). На macOS —
+// нативный путь (SCK+VideoToolbox / ffmpeg). На других платформах — заглушка без
+// видео (см. stub_other.go).
+func NewEncoder() CaptureEncoder { return NewFFmpegDarwin() }
+
 // buildArgs собирает аргументы ffmpeg для захвата всего экрана (avfoundation)
 // или тест-источника.
 func buildArgs(opts Options) []string {

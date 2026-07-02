@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"runtime"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -63,7 +65,10 @@ type hostModel struct {
 	plan    string
 	viewers int
 	list    []viewerCount
-	showQR  bool // QR большой — по умолчанию скрыт, по кнопке c (выводится снизу)
+	caps    capsInfo
+	machine string // hostname
+	osName  string // ОС (runtime.GOOS)
+	showQR  bool   // QR большой — по умолчанию скрыт, по кнопке c (выводится снизу)
 	sp      spinner.Model
 	cancel  context.CancelFunc
 }
@@ -72,7 +77,11 @@ func newHostModel(session, url, logPath string, cancel context.CancelFunc) hostM
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	return hostModel{session: session, url: url, qr: makeQR(url), logPath: logPath, status: "starting…", sp: sp, cancel: cancel}
+	host, _ := os.Hostname()
+	return hostModel{
+		session: session, url: url, qr: makeQR(url), logPath: logPath, status: "starting…",
+		caps: hostCaps(), machine: host, osName: runtime.GOOS, sp: sp, cancel: cancel,
+	}
 }
 
 // makeQR рендерит компактный QR (half-blocks) в строку для вывода в TUI.
@@ -143,9 +152,22 @@ func (m hostModel) View() string {
 	b.WriteString(pink.Render("katana") + "  " + dim.Render("host") + "\n\n")
 	b.WriteString(m.sp.View() + stat.Render(m.status) + "\n\n")
 	b.WriteString(lbl.Render("session  ") + cyan.Render(sess) + "\n")
+	if m.machine != "" {
+		b.WriteString(lbl.Render("machine  ") + val.Render(m.machine) + dim.Render(" · "+m.osName) + "\n")
+	}
 	if m.owner != "" {
 		b.WriteString(lbl.Render("owner    ") + val.Render(m.owner) + " " + planBadge(m.plan) + "\n")
 	}
+	// Что хост может предоставить в этом окружении (чекбоксы).
+	chk := func(ok bool, label string) string {
+		if ok {
+			return name.Render("✓ " + label)
+		}
+		return dim.Render("✗ " + label)
+	}
+	b.WriteString(lbl.Render("provides ") +
+		chk(m.caps.Video, "video") + "  " + chk(m.caps.Audio, "audio") + "  " +
+		chk(m.caps.Input, "input") + "  " + chk(m.caps.Terminal, "terminal") + "\n")
 	// Все зрители одной строкой: users  alice ×2 · bob · guest
 	b.WriteString(lbl.Render("users    "))
 	if len(m.list) == 0 {
