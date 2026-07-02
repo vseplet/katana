@@ -1034,6 +1034,11 @@ func (p *peer) buildLocked() error {
 				p.h.onConfig(im) // зритель меняет общие настройки (источник/разрешение)
 			case "renegotiate":
 				p.h.onRenegotiate(im) // зритель меняет кодек/аудио
+			case "keyframe":
+				// Зритель завис (потери на канале) и просит свежий keyframe по
+				// data-каналу — надёжнее RTCP PLI, который на потерях сам теряется.
+				// Как канал прояснится — запрос дойдёт, декодер догонит без реконнекта.
+				p.h.requestKeyframe()
 			default:
 				p.dispatchInput(&im)
 			}
