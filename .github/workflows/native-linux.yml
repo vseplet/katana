@@ -24,6 +24,9 @@ jobs:
             pkg-config --exists libpipewire-0.3 libva libavcodec && echo "HEADERS OK" || { echo "MISSING HEADERS"; exit 1; }
             echo "=== build ==="
             git config --global --add safe.directory /src || true
+            # Arch подсовывает hardening-флаги через pkg-config (-fno-strict-overflow
+            # и т.п.), а cgo их по умолчанию блокирует — разрешаем все.
+            export CGO_CFLAGS_ALLOW=".*" CGO_LDFLAGS_ALLOW=".*"
             CGO_ENABLED=1 GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags "-s -w" -o ../katana-linux-amd64-native .
             file ../katana-linux-amd64-native
           '
