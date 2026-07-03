@@ -1,27 +1,24 @@
 //go:build linux && cgo
 
 // Нативный Wayland-захват+энкод в ОДНОМ процессе: PipeWire (BGRx CPU-кадры) →
-// libav filtergraph (format=nv12 → hwupload в VAAPI) → h264_vaapi (GPU) →
-// Annex-B H264 наружу в Go (goNativeH264). Без gst и без межпроцессного пайпа.
-//
-// Собирается только в cgo-сборке под Linux (флаги из pkg-config libpipewire-0.3
-// libavcodec libavfilter libavutil в video_wayland_native_linux.go).
+// sws_scale в NV12 → заливка в VAAPI-сурфейс → h264_vaapi (GPU) → Annex-B H264
+// наружу в Go (goNativeH264). Без gst и без межпроцессного пайпа. Использованы
+// только стабильные libav-API (есть в ffmpeg 5.x…8) для портативности.
 
 #include "native_pw_linux.h"
 
 #include <fcntl.h>
 #include <string.h>
+#include <time.h>
 
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 
 #include <libavcodec/avcodec.h>
-#include <libavfilter/avfilter.h>
-#include <libavfilter/buffersink.h>
-#include <libavfilter/buffersrc.h>
 #include <libavutil/hwcontext.h>
-#include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 
 // Экспорт из Go: отдать один H264 access unit (Annex-B).
 extern void goNativeH264(void *data, int len);
@@ -36,12 +33,11 @@ struct nstate {
 
 	int cfg_fps, cfg_kbps;
 
-	// libav
 	AVBufferRef *hw_device;
-	AVFilterGraph *graph;
-	AVFilterContext *src, *sink;
+	AVBufferRef *hw_frames;
+	struct SwsContext *sws;
 	AVCodecContext *enc;
-	int inited;
+	int w, h, inited;
 	long long pts;
 };
 
@@ -52,77 +48,47 @@ static void log_averr(const char *what, int err)
 {
 	char buf[256];
 	av_strerror(err, buf, sizeof(buf));
-	pw_log_error("katana native: %s: %s", what, buf);
 	fprintf(stderr, "katana native: %s: %s\n", what, buf);
 }
 
-// init_encoder строит VAAPI-устройство, filtergraph (bgr0→nv12→hwupload) и
-// открывает h264_vaapi. Ленивая инициализация — знаем размер из param_changed.
+// init_encoder: VAAPI-устройство, пул VAAPI-сурфейсов (NV12), sws (BGR0→NV12) и
+// h264_vaapi. Ленивая инициализация — размер знаем из param_changed.
 static int init_encoder(int w, int h)
 {
 	int ret;
+	S.w = w;
+	S.h = h;
+
 	if ((ret = av_hwdevice_ctx_create(&S.hw_device, AV_HWDEVICE_TYPE_VAAPI,
 			"/dev/dri/renderD128", NULL, 0)) < 0) {
 		log_averr("hwdevice_ctx_create", ret);
 		return -1;
 	}
 
-	S.graph = avfilter_graph_alloc();
-	if (!S.graph)
+	S.hw_frames = av_hwframe_ctx_alloc(S.hw_device);
+	if (!S.hw_frames)
 		return -1;
-
-	char args[512];
-	snprintf(args, sizeof(args),
-		"video_size=%dx%d:pix_fmt=%d:time_base=1/%d:pixel_aspect=1/1",
-		w, h, AV_PIX_FMT_BGR0, S.cfg_fps);
-	if ((ret = avfilter_graph_create_filter(&S.src,
-			avfilter_get_by_name("buffer"), "in", args, NULL, S.graph)) < 0) {
-		log_averr("create buffersrc", ret);
-		return -1;
-	}
-	if ((ret = avfilter_graph_create_filter(&S.sink,
-			avfilter_get_by_name("buffersink"), "out", NULL, NULL, S.graph)) < 0) {
-		log_averr("create buffersink", ret);
+	AVHWFramesContext *fc = (AVHWFramesContext *)S.hw_frames->data;
+	fc->format = AV_PIX_FMT_VAAPI;
+	fc->sw_format = AV_PIX_FMT_NV12;
+	fc->width = w;
+	fc->height = h;
+	fc->initial_pool_size = 20;
+	if ((ret = av_hwframe_ctx_init(S.hw_frames)) < 0) {
+		log_averr("hwframe_ctx_init", ret);
 		return -1;
 	}
 
-	// bgr0 → nv12 (CPU) → hwupload (в VAAPI). hwupload берёт устройство из графа.
-	AVFilterInOut *outputs = avfilter_inout_alloc();
-	AVFilterInOut *inputs = avfilter_inout_alloc();
-	outputs->name = av_strdup("in");
-	outputs->filter_ctx = S.src;
-	outputs->pad_idx = 0;
-	outputs->next = NULL;
-	inputs->name = av_strdup("out");
-	inputs->filter_ctx = S.sink;
-	inputs->pad_idx = 0;
-	inputs->next = NULL;
-
-	if ((ret = avfilter_graph_parse_ptr(S.graph,
-			"format=nv12,hwupload", &inputs, &outputs, NULL)) < 0) {
-		log_averr("graph_parse", ret);
-		avfilter_inout_free(&inputs);
-		avfilter_inout_free(&outputs);
-		return -1;
-	}
-	avfilter_inout_free(&inputs);
-	avfilter_inout_free(&outputs);
-
-	// hwupload-фильтру нужен hw_device_ctx.
-	for (unsigned i = 0; i < S.graph->nb_filters; i++) {
-		AVFilterContext *f = S.graph->filters[i];
-		if (strcmp(f->filter->name, "hwupload") == 0)
-			f->hw_device_ctx = av_buffer_ref(S.hw_device);
-	}
-
-	if ((ret = avfilter_graph_config(S.graph, NULL)) < 0) {
-		log_averr("graph_config", ret);
+	S.sws = sws_getContext(w, h, AV_PIX_FMT_BGR0, w, h, AV_PIX_FMT_NV12,
+		SWS_BILINEAR, NULL, NULL, NULL);
+	if (!S.sws) {
+		fprintf(stderr, "katana native: sws_getContext failed\n");
 		return -1;
 	}
 
 	const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
 	if (!codec) {
-		fprintf(stderr, "katana native: h264_vaapi encoder not found\n");
+		fprintf(stderr, "katana native: h264_vaapi not found\n");
 		return -1;
 	}
 	S.enc = avcodec_alloc_context3(codec);
@@ -134,14 +100,7 @@ static int init_encoder(int w, int h)
 	S.enc->bit_rate = (int64_t)S.cfg_kbps * 1000;
 	S.enc->gop_size = S.cfg_fps;
 	S.enc->max_b_frames = 0;
-	// hw_frames_ctx энкодера = выход buffersink (VAAPI NV12).
-	AVBufferRef *frames_ref = av_buffersink_get_hw_frames_ctx(S.sink);
-	if (!frames_ref) {
-		fprintf(stderr, "katana native: no hw_frames_ctx from buffersink\n");
-		return -1;
-	}
-	S.enc->hw_frames_ctx = av_buffer_ref(frames_ref);
-
+	S.enc->hw_frames_ctx = av_buffer_ref(S.hw_frames);
 	if ((ret = avcodec_open2(S.enc, codec, NULL)) < 0) {
 		log_averr("avcodec_open2", ret);
 		return -1;
@@ -151,41 +110,56 @@ static int init_encoder(int w, int h)
 	return 0;
 }
 
-// encode_bgrx кодирует один BGRx-кадр (data/stride) и отдаёт H264 в Go.
+static void drain_packets(void)
+{
+	AVPacket *pkt = av_packet_alloc();
+	while (avcodec_receive_packet(S.enc, pkt) == 0) {
+		goNativeH264(pkt->data, pkt->size);
+		av_packet_unref(pkt);
+	}
+	av_packet_free(&pkt);
+}
+
+// encode_bgrx: BGRx (CPU) → NV12 (CPU, sws) → VAAPI-сурфейс (upload) → энкод.
 static void encode_bgrx(uint8_t *data, int stride, int w, int h)
 {
-	AVFrame *in = av_frame_alloc();
-	in->format = AV_PIX_FMT_BGR0;
-	in->width = w;
-	in->height = h;
-	in->data[0] = data;
-	in->linesize[0] = stride;
-	in->pts = S.pts++;
-
-	int ret = av_buffersrc_add_frame_flags(S.src, in, AV_BUFFERSRC_FLAG_KEEP_REF);
-	av_frame_free(&in);
-	if (ret < 0) {
-		log_averr("buffersrc_add_frame", ret);
+	int ret;
+	AVFrame *nv12 = av_frame_alloc();
+	nv12->format = AV_PIX_FMT_NV12;
+	nv12->width = w;
+	nv12->height = h;
+	if ((ret = av_frame_get_buffer(nv12, 0)) < 0) {
+		log_averr("nv12 get_buffer", ret);
+		av_frame_free(&nv12);
 		return;
 	}
+	const uint8_t *src[4] = {data, NULL, NULL, NULL};
+	int srcStride[4] = {stride, 0, 0, 0};
+	sws_scale(S.sws, src, srcStride, 0, h, nv12->data, nv12->linesize);
 
 	AVFrame *hw = av_frame_alloc();
-	while ((ret = av_buffersink_get_frame(S.sink, hw)) >= 0) {
-		hw->pict_type = 0; // авто
-		ret = avcodec_send_frame(S.enc, hw);
-		av_frame_unref(hw);
-		if (ret < 0) {
-			log_averr("send_frame", ret);
-			break;
-		}
-		AVPacket *pkt = av_packet_alloc();
-		while (avcodec_receive_packet(S.enc, pkt) == 0) {
-			goNativeH264(pkt->data, pkt->size);
-			av_packet_unref(pkt);
-		}
-		av_packet_free(&pkt);
+	if ((ret = av_hwframe_get_buffer(S.hw_frames, hw, 0)) < 0) {
+		log_averr("hwframe_get_buffer", ret);
+		av_frame_free(&nv12);
+		av_frame_free(&hw);
+		return;
 	}
+	if ((ret = av_hwframe_transfer_data(hw, nv12, 0)) < 0) {
+		log_averr("hwframe_transfer", ret);
+		av_frame_free(&nv12);
+		av_frame_free(&hw);
+		return;
+	}
+	hw->pts = S.pts++;
+	av_frame_free(&nv12);
+
+	ret = avcodec_send_frame(S.enc, hw);
 	av_frame_free(&hw);
+	if (ret < 0) {
+		log_averr("send_frame", ret);
+		return;
+	}
+	drain_packets();
 }
 
 static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *param)
@@ -207,9 +181,8 @@ static void on_process(void *userdata)
 	struct spa_buffer *buf = b->buffer;
 	if (S.inited && buf->n_datas > 0 && buf->datas[0].data != NULL) {
 		struct spa_data *sd = &buf->datas[0];
-		int stride = sd->chunk->stride > 0 ? sd->chunk->stride : (int)S.format.size.width * 4;
-		encode_bgrx((uint8_t *)sd->data, stride,
-			S.format.size.width, S.format.size.height);
+		int stride = (sd->chunk && sd->chunk->stride > 0) ? sd->chunk->stride : S.w * 4;
+		encode_bgrx((uint8_t *)sd->data, stride, S.w, S.h);
 	}
 	pw_stream_queue_buffer(S.stream, b);
 }
@@ -269,10 +242,8 @@ int katana_native_start(katana_native_cfg cfg)
 		PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, 1);
 	pw_thread_loop_unlock(S.loop);
 
-	// Крутимся, пока не попросят стоп (кадры обрабатываются в on_process на
-	// потоке PipeWire).
 	while (g_running) {
-		struct timespec ts = {0, 100 * 1000 * 1000}; // 100 мс
+		struct timespec ts = {0, 100 * 1000 * 1000};
 		nanosleep(&ts, NULL);
 	}
 
@@ -287,8 +258,10 @@ int katana_native_start(katana_native_cfg cfg)
 
 	if (S.enc)
 		avcodec_free_context(&S.enc);
-	if (S.graph)
-		avfilter_graph_free(&S.graph);
+	if (S.sws)
+		sws_freeContext(S.sws);
+	if (S.hw_frames)
+		av_buffer_unref(&S.hw_frames);
 	if (S.hw_device)
 		av_buffer_unref(&S.hw_device);
 	return 0;

@@ -1,9 +1,10 @@
 name: native-linux
 
-# Нативный Wayland-захват на GPU (libpipewire + libva/libavcodec, cgo). Собираем
-# ВНУТРИ Arch-контейнера, чтобы версии libpipewire/libva совпадали со SteamOS
-# (тоже Arch) → бинарь запустится на Deck. Ручной запуск (workflow_dispatch),
-# результат — артефакт katana-linux-amd64-native (без релиза/тега).
+# Нативный Wayland-захват на GPU (libpipewire + libva/libavcodec, cgo). Собираем в
+# СТАРОМ дистрибутиве (Debian 12, glibc 2.36), чтобы бинарь был ПОРТАТИВНЫМ —
+# запускался на любом Linux с glibc >= 2.36 (SteamOS и почти все актуальные).
+# ffmpeg-либы бандлим рядом (версия-независимо), libpipewire/libva берём системные
+# (soname стабилен). Ручной запуск; результат — пре-релиз (тег native).
 on:
   workflow_dispatch:
 
@@ -15,25 +16,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build + bundle ffmpeg libs (cgo, Arch)
+      - name: Build + bundle ffmpeg libs (cgo, Debian 12 — portable glibc 2.36)
         run: |
-          docker run --rm -v "$PWD":/src -w /src/proto archlinux:latest bash -c '
+          docker run --rm -v "$PWD":/src -w /src/proto debian:12 bash -c '
             set -e
-            pacman -Sy --noconfirm archlinux-keyring
-            pacman -Su --noconfirm
-            pacman -S --noconfirm --needed base-devel go git pipewire libpipewire libva ffmpeg pkgconf
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends build-essential git pkg-config curl ca-certificates \
+              libpipewire-0.3-dev libva-dev libdrm-dev \
+              libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev
+            echo "=== versions ==="; ldd --version | head -1; pkg-config --modversion libavcodec
+            # Go — свежий из тарбола (в Debian старый, а go.mod требует 1.25).
+            curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz
+            export PATH=/usr/local/go/bin:$PATH
             git config --global --add safe.directory /src || true
             export CGO_CFLAGS_ALLOW=".*" CGO_LDFLAGS_ALLOW=".*"
             CGO_ENABLED=1 GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags "-s -w" -o /src/katana-linux-amd64-native .
             file /src/katana-linux-amd64-native
             # Бандлим ffmpeg+кодек-либы рядом с бинарём, КРОМЕ системных (glibc,
-            # GPU-драйвер/дисплей, PipeWire) — те должны быть с Deck, т.к. привязаны
-            # к его железу/серверу. ldd даёт полное транзитивное замыкание.
+            # GPU-драйвер/дисплей, PipeWire) — те берутся с целевой машины (soname
+            # стабилен). ldd даёт полное транзитивное замыкание.
             mkdir -p /src/native-libs
             DENY="ld-linux|/libc\.so|/libm\.so|/libmvec|libpthread|/libdl\.so|/librt\.so|libresolv|/libutil|libpipewire|/libva\.so|libva-|libdrm|libGL|libEGL|libgbm|libglapi|libX11|libxcb|libwayland|libstdc|libgcc_s"
             ldd /src/katana-linux-amd64-native | grep "=> /" | sed "s/.*=> //; s/ (0x.*//" | sort -u | while read -r lib; do
               echo "$lib" | grep -qE "$DENY" && continue
-              cp -v "$lib" /src/native-libs/
+              cp -vL "$lib" /src/native-libs/
             done
             echo "=== bundled ==="; ls -1 /src/native-libs
             tar -C /src -czf /src/native-libs.tar.gz native-libs

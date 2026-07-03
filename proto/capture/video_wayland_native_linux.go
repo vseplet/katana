@@ -7,7 +7,7 @@ package capture
 // Mac (тег darwin) этот файл и .c не видит вообще. C-часть — native_pw_linux.c.
 
 /*
-#cgo pkg-config: libpipewire-0.3 libavcodec libavfilter libavutil
+#cgo pkg-config: libpipewire-0.3 libavcodec libavutil libswscale
 #include "native_pw_linux.h"
 */
 import "C"
