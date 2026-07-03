@@ -3,13 +3,21 @@
 // Нативный Wayland-захват+энкод в ОДНОМ процессе: PipeWire (BGRx CPU-кадры) →
 // libav filtergraph (hwupload → scale_vaapi=format=nv12, всё на GPU) → h264_vaapi
 // (GPU) → Annex-B H264 наружу в Go (goNativeH264). Без gst и без межпроцессного
-// пайпа. Кодируем SOURCE-DRIVEN — по приходу кадра из PipeWire (синхронно с
-// компоузитором), а не по свободному таймеру: иначе рассинхрон частот даёт
-// джаддер. Энкод быстрый (VAAPI ~1мс), поэтому не блокирует PipeWire-поток.
+// пайпа.
+//
+// Схема потоков: on_process — realtime-поток PipeWire, у него ЖЁСТКИЙ дедлайн,
+// поэтому там НЕЛЬЗЯ кодировать (VAAPI-сабмит не укладывается → PipeWire кричит
+// overload и режет частоту вдвое). on_process только копирует свежий кадр в
+// S.latest и будит энкод-поток (condvar). Энкод-поток просыпается ПО ПРИХОДУ
+// кадра (а не по свободному таймеру) — значит синхронен с компоузитором (нет
+// джаддера), кодирует строго по порядку (нет переупорядочивания), и работает вне
+// RT-потока (нет overload). Если кадры приходят быстрее энкода — держим только
+// свежий (промежуточные отбрасываем, латенси не копится).
 
 #include "native_pw_linux.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +70,16 @@ struct nstate {
 	AVCodecContext *enc;
 	int w, h, inited;
 	long long pts;
+
+	// Двойной буфер между RT-потоком (продюсер) и энкод-потоком (консюмер).
+	pthread_t enc_thread;
+	pthread_mutex_t mtx;
+	pthread_cond_t cond;
+	uint8_t *latest;   // свежий кадр из on_process
+	int latest_cap;    // выделенная ёмкость latest
+	int latest_stride; // stride свежего кадра
+	int have;          // есть новый кадр для энкода
+	int stop_enc;      // сигнал энкод-потоку выйти
 
 	// статистика энкода
 	long long stat_ns, next_log;
@@ -217,8 +235,54 @@ static void encode_bgrx(uint8_t *data, int stride, int w, int h)
 	av_frame_free(&hw);
 }
 
-// on_process (поток PipeWire): вычёрпываем очередь до свежего кадра и кодируем его
-// сразу (source-driven, синхронно с компоузитором). Энкод быстрый — не блокирует.
+// enc_thread_fn: консюмер. Спит на condvar; просыпается КОГДА on_process положил
+// свежий кадр (have=1). Копирует его под мьютексом в локальный буфер и кодирует
+// уже вне блокировки. Одна побудка = один энкод свежего кадра → синхронно с
+// компоузитором, по порядку, без RT-overload.
+static void *enc_thread_fn(void *arg)
+{
+	(void)arg;
+	uint8_t *local = NULL;
+	int local_cap = 0;
+	for (;;) {
+		pthread_mutex_lock(&S.mtx);
+		while (!S.have && !S.stop_enc)
+			pthread_cond_wait(&S.cond, &S.mtx);
+		if (S.stop_enc) {
+			pthread_mutex_unlock(&S.mtx);
+			break;
+		}
+		int stride = S.latest_stride;
+		int need = stride * S.h;
+		if (local_cap < need) {
+			free(local);
+			local = malloc(need);
+			local_cap = need;
+		}
+		memcpy(local, S.latest, need);
+		S.have = 0;
+		pthread_mutex_unlock(&S.mtx);
+
+		if (!S.inited)
+			continue;
+		long long t0 = now_ns();
+		encode_bgrx(local, stride, S.w, S.h);
+		S.stat_ns += now_ns() - t0;
+		S.stat_n++;
+		if (now_ns() >= S.next_log) {
+			if (S.stat_n > 0)
+				nlog("encode avg %lld ms over %d frames", (S.stat_ns / S.stat_n) / 1000000, S.stat_n);
+			S.stat_ns = 0;
+			S.stat_n = 0;
+			S.next_log = now_ns() + 5000000000LL;
+		}
+	}
+	free(local);
+	return NULL;
+}
+
+// on_process (RT-поток PipeWire): вычёрпываем очередь до свежего кадра, копируем
+// его в S.latest и будим энкод-поток. Никакого энкода здесь — только memcpy.
 static void on_process(void *userdata)
 {
 	(void)userdata;
@@ -234,17 +298,18 @@ static void on_process(void *userdata)
 	if (S.inited && buf->n_datas > 0 && buf->datas[0].data != NULL) {
 		struct spa_data *sd = &buf->datas[0];
 		int stride = (sd->chunk && sd->chunk->stride > 0) ? sd->chunk->stride : S.w * 4;
-		long long t0 = now_ns();
-		encode_bgrx((uint8_t *)sd->data, stride, S.w, S.h);
-		S.stat_ns += now_ns() - t0;
-		S.stat_n++;
-		if (now_ns() >= S.next_log) {
-			if (S.stat_n > 0)
-				nlog("encode avg %lld ms over %d frames", (S.stat_ns / S.stat_n) / 1000000, S.stat_n);
-			S.stat_ns = 0;
-			S.stat_n = 0;
-			S.next_log = now_ns() + 5000000000LL;
+		int need = stride * S.h;
+		pthread_mutex_lock(&S.mtx);
+		if (S.latest_cap < need) {
+			free(S.latest);
+			S.latest = malloc(need);
+			S.latest_cap = need;
 		}
+		memcpy(S.latest, sd->data, need);
+		S.latest_stride = stride;
+		S.have = 1;
+		pthread_cond_signal(&S.cond);
+		pthread_mutex_unlock(&S.mtx);
 	}
 	pw_stream_queue_buffer(S.stream, last);
 }
@@ -273,6 +338,9 @@ int katana_native_start(katana_native_cfg cfg)
 	S.cfg_w = cfg.width;
 	S.cfg_h = cfg.height;
 	g_running = 1;
+	pthread_mutex_init(&S.mtx, NULL);
+	pthread_cond_init(&S.cond, NULL);
+	pthread_create(&S.enc_thread, NULL, enc_thread_fn, NULL);
 
 	pw_init(NULL, NULL);
 	S.loop = pw_thread_loop_new("katana-native", NULL);
@@ -329,6 +397,16 @@ int katana_native_start(katana_native_cfg cfg)
 	pw_context_destroy(S.context);
 	pw_thread_loop_unlock(S.loop);
 	pw_thread_loop_destroy(S.loop);
+
+	// Останавливаем энкод-поток.
+	pthread_mutex_lock(&S.mtx);
+	S.stop_enc = 1;
+	pthread_cond_signal(&S.cond);
+	pthread_mutex_unlock(&S.mtx);
+	pthread_join(S.enc_thread, NULL);
+	pthread_mutex_destroy(&S.mtx);
+	pthread_cond_destroy(&S.cond);
+	free(S.latest);
 
 	if (S.enc)
 		avcodec_free_context(&S.enc);
