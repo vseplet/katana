@@ -25,7 +25,7 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 
-extern void goNativeH264(void *data, int len, long long dur_ns); // dur_ns — реальная длительность кадра
+extern void goNativeH264(void *data, int len);
 extern void goNativeLog(char *msg); // C-логи → в лог хоста (Go)
 
 static void nlog(const char *fmt, ...)
@@ -66,12 +66,10 @@ struct nstate {
 	// таймер энкодит его ровно на fps (CFR, как videorate). Двойной буфер +
 	// мьютекс, чтобы энкод шёл вне блокировки (не тормозил PipeWire).
 	pthread_mutex_t mtx;
-	uint8_t *latest;      // последний BGRx-кадр
-	size_t latest_cap;    // ёмкость буфера
+	uint8_t *latest;   // последний BGRx-кадр
+	size_t latest_cap; // ёмкость буфера
 	int latest_stride;
 	int have;
-	long long latest_ns;  // время прихода latest (CLOCK_MONOTONIC) — реальный таймстамп кадра
-	long long cur_dur_ns; // длительность текущего энкодимого кадра → в goNativeH264
 	pthread_t timer;
 };
 
@@ -188,17 +186,14 @@ static void drain_packets(void)
 {
 	AVPacket *pkt = av_packet_alloc();
 	while (avcodec_receive_packet(S.enc, pkt) == 0) {
-		goNativeH264(pkt->data, pkt->size, S.cur_dur_ns);
+		goNativeH264(pkt->data, pkt->size);
 		av_packet_unref(pkt);
 	}
 	av_packet_free(&pkt);
 }
 
 // encode_bgrx: BGRx (CPU) → буфер-src → hwupload+scale_vaapi (GPU) → h264_vaapi.
-// keyframe=1 форсит IDR (pict_type=I) — нужно т.к. gop_size в КАДРАХ, а дедуп
-// режет fps на статике, из-за чего периодический кейфрейм уезжал на десятки сек и
-// вьювер не мог начать декодировать. Форсим по wall-времени → старт за ≤1с.
-static void encode_bgrx(uint8_t *data, int stride, int w, int h, int keyframe)
+static void encode_bgrx(uint8_t *data, int stride, int w, int h)
 {
 	int ret;
 	AVFrame *in = av_frame_alloc();
@@ -218,12 +213,6 @@ static void encode_bgrx(uint8_t *data, int stride, int w, int h, int keyframe)
 
 	AVFrame *hw = av_frame_alloc();
 	while ((ret = av_buffersink_get_frame(S.sink, hw)) >= 0) {
-		if (keyframe) {
-			hw->pict_type = AV_PICTURE_TYPE_I; // форс IDR
-			keyframe = 0;                      // только первый кадр за вызов
-		} else {
-			hw->pict_type = AV_PICTURE_TYPE_NONE;
-		}
 		ret = avcodec_send_frame(S.enc, hw);
 		av_frame_unref(hw);
 		if (ret < 0) {
@@ -273,7 +262,6 @@ static void on_process(void *userdata)
 		if (S.latest) {
 			memcpy(S.latest, sd->data, need);
 			S.latest_stride = stride;
-			S.latest_ns = now_ns(); // реальное время прихода кадра
 			S.have = 1;
 		}
 		pthread_mutex_unlock(&S.mtx);
@@ -281,28 +269,16 @@ static void on_process(void *userdata)
 	pw_stream_queue_buffer(S.stream, last);
 }
 
-// timer_fn: опрашивает latest на cfg_fps (не в RT-потоке PipeWire → нет overload).
-// Ключевое против джаддера (подход libwebrtc): ДЕДУП по времени захвата — если с
-// прошлого энкода latest не сменился (тот же кадр), НЕ кодируем дубль (иначе кадр
-// показывается дважды = «пауза», глазом читается как дёрганье). А каждому реально
-// новому кадру проставляем РЕАЛЬНУЮ длительность = дельта времён захвата (а не
-// фиксированные 1/fps), чтобы показ совпал с моментами захвата → гладко.
-// KEEPALIVE_NS: если движения нет дольше — переотправляем последний кадр, чтобы
-// поток/кейфреймы не застаивались.
+// timer_fn: энкодит ПОСЛЕДНИЙ кадр ровно на cfg_fps (CFR, как videorate). Кадр
+// копируем под мьютексом, энкод — вне блокировки. Замеряет время энкода.
 static void *timer_fn(void *arg)
 {
 	(void)arg;
-	const long long KEEPALIVE_NS = 500000000LL; // 0.5s
-	const long long KEYFRAME_NS = 1000000000LL; // IDR минимум раз в 1с реального времени
-	const long long MAX_DUR_NS = 1000000000LL;  // клампим длительность (долгий простой)
 	long long interval = 1000000000LL / (S.cfg_fps > 0 ? S.cfg_fps : 30);
 	uint8_t *buf = NULL;
 	size_t bufcap = 0;
 	long long stat_ns = 0, next_log = 0;
 	int stat_n = 0;
-	long long last_cap_ns = 0;  // время захвата последнего ОТПРАВЛЕННОГО кадра
-	long long last_send_ns = 0; // wall-время последней отправки (для keepalive-длительности)
-	long long last_key_ns = 0;  // wall-время последнего IDR
 	long long next = now_ns() + interval;
 	while (g_running) {
 		// Планируем по абсолютному дедлайну: период = ровно interval (не
@@ -316,14 +292,10 @@ static void *timer_fn(void *arg)
 		if (now_ns() - next > interval) // сильно отстали (энкод не успевает) — ресинк
 			next = now_ns() + interval;
 
-		long long now = now_ns();
 		pthread_mutex_lock(&S.mtx);
 		int ready = S.inited && S.have;
 		int stride = S.latest_stride, w = S.w, h = S.h;
-		long long cap_ns = S.latest_ns;
-		int is_new = ready && (cap_ns != last_cap_ns);
-		int keepalive = ready && !is_new && (now - last_send_ns >= KEEPALIVE_NS);
-		if (ready && (is_new || keepalive)) {
+		if (ready) {
 			size_t need = (size_t)stride * h;
 			if (bufcap < need) {
 				free(buf);
@@ -334,36 +306,13 @@ static void *timer_fn(void *arg)
 				memcpy(buf, S.latest, need);
 			else
 				ready = 0;
-		} else {
-			ready = 0; // дубль без keepalive — пропускаем (дедуп)
 		}
 		pthread_mutex_unlock(&S.mtx);
 		if (!ready)
 			continue;
 
-		// Длительность = реальное время между захватами (для нового кадра) либо
-		// wall-дельта (для keepalive-дубля). Первый кадр — один interval.
-		long long dur;
-		if (last_send_ns == 0)
-			dur = interval;
-		else if (is_new)
-			dur = cap_ns - last_cap_ns;
-		else
-			dur = now - last_send_ns;
-		if (dur < 1) dur = 1;
-		if (dur > MAX_DUR_NS) dur = MAX_DUR_NS;
-		S.cur_dur_ns = dur;
-		last_cap_ns = cap_ns;
-		last_send_ns = now;
-
-		// Кейфрейм по wall-времени (а не по числу кадров): gop_size в кадрах +
-		// дедуп на статике = кейфрейм уезжает на десятки секунд, вьювер не стартует.
-		int key = (last_key_ns == 0) || (now - last_key_ns >= KEYFRAME_NS);
-		if (key)
-			last_key_ns = now;
-
 		long long t0 = now_ns();
-		encode_bgrx(buf, stride, w, h, key);
+		encode_bgrx(buf, stride, w, h);
 		stat_ns += now_ns() - t0;
 		stat_n++;
 		if (now_ns() >= next_log) {

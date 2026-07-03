@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"bufio"
 
@@ -111,7 +110,6 @@ func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) 
 	}
 
 	var video chan []byte
-	var videoDur chan time.Duration // реальные длительности кадров (только нативный wayland); nil → фикс. 1/fps
 	switch backend {
 	case "x11":
 		v, err := startVideoX11(ctx, opts)
@@ -122,13 +120,12 @@ func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) 
 			video = v
 		}
 	case "wayland":
-		v, d, err := waylandVideoFn(ctx, opts)
+		v, err := waylandVideoFn(ctx, opts)
 		if err != nil {
 			log.Printf("capture: video (wayland/portal): %v (continuing without video)", err)
 			video = closedChan()
 		} else {
 			video = v
-			videoDur = d
 		}
 	default:
 		video = closedChan()
@@ -143,11 +140,7 @@ func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) 
 			audioCh = a
 		}
 	}
-	var videoDurRO <-chan time.Duration
-	if videoDur != nil {
-		videoDurRO = videoDur
-	}
-	return &Stream{Video: video, Audio: audioCh, VideoDur: videoDurRO}, nil
+	return &Stream{Video: video, Audio: audioCh}, nil
 }
 
 func closedChan() chan []byte {
