@@ -271,9 +271,18 @@ static void *timer_fn(void *arg)
 	size_t bufcap = 0;
 	long long stat_ns = 0, next_log = 0;
 	int stat_n = 0;
+	long long next = now_ns() + interval;
 	while (g_running) {
-		struct timespec ts = {interval / 1000000000LL, interval % 1000000000LL};
-		nanosleep(&ts, NULL);
+		// Планируем по абсолютному дедлайну: период = ровно interval (не
+		// interval + время_энкода), иначе fps всегда ниже целевого.
+		long long sleep_ns = next - now_ns();
+		if (sleep_ns > 0) {
+			struct timespec ts = {sleep_ns / 1000000000LL, sleep_ns % 1000000000LL};
+			nanosleep(&ts, NULL);
+		}
+		next += interval;
+		if (now_ns() - next > interval) // сильно отстали (энкод не успевает) — ресинк
+			next = now_ns() + interval;
 
 		pthread_mutex_lock(&S.mtx);
 		int ready = S.inited && S.have;
