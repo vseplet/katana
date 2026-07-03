@@ -175,13 +175,20 @@ func buildVideoArgs(opts Options, backend string) []string {
 
 	args = append(args, "-r", fmt.Sprintf("%d", opts.FPS), "-fps_mode", "cfr")
 
-	// Видео-фильтр: для kmsgrab сначала скачиваем кадр из DRM в CPU (bgr0),
-	// затем опциональный даунскейл.
+	// Видео-фильтр. kmsgrab отдаёт DRM_PRIME-кадр в GPU-формате с AMD-модификатором
+	// (тайлинг/DCC, часто 10-бит ABGR2101010) — hwdownload напрямую его не читает.
+	// Импортируем во VAAPI (GPU понимает модификатор), там же скейлим и конвертим
+	// в nv12, и только потом качаем в CPU (уже маленький кадр — дёшево).
 	var vf []string
 	if kms {
-		vf = append(vf, "hwdownload", "format=bgr0")
-	}
-	if opts.Width > 0 {
+		vf = append(vf, "hwmap=derive_device=vaapi")
+		if opts.Width > 0 {
+			vf = append(vf, fmt.Sprintf("scale_vaapi=w=%d:h=-2:format=nv12", opts.Width))
+		} else {
+			vf = append(vf, "scale_vaapi=format=nv12")
+		}
+		vf = append(vf, "hwdownload", "format=nv12")
+	} else if opts.Width > 0 {
 		vf = append(vf, fmt.Sprintf("scale=%d:-2", opts.Width))
 	}
 	if len(vf) > 0 {
