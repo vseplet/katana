@@ -2,11 +2,13 @@
 
 package capture
 
-// Захват экрана и системного звука на Linux через ffmpeg: видео — x11grab,
-// звук — PulseAudio (-f pulse). Всё capability-driven: без графики ($DISPLAY)
-// хост остаётся headless (только терминал), без PulseAudio — без звука. Формат
-// выхода тот же, что и на macOS (IVF/VP8 или Annex-B/H264 + Opus в ogg), поэтому
-// чтение (readIVF/readH264/oggreader) и WebRTC-путь общие.
+// Захват экрана и системного звука на Linux через ffmpeg. Видео-бэкенд выбирается
+// по сессии: X11 → x11grab; Wayland/gamescope → kmsgrab (снимаем финальный
+// композит прямо с DRM-сканаута — видит и Wayland-окна, и игры). Звук — PulseAudio
+// (монитор дефолтного sink). Видео и звук — ДВА независимых ffmpeg-процесса, чтобы
+// сбой одного (напр. нет прав на DRM для kmsgrab) не ронял другой. Формат выхода
+// тот же, что на macOS (Annex-B/H264 или IVF/VP8 + Opus в ogg) → чтение
+// (readH264/readIVF/oggreader) и WebRTC-путь общие.
 
 import (
 	"bufio"
@@ -23,24 +25,46 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
 
-// VideoAvailable — можно ли захватывать экран через x11grab: нужен X11-дисплей
-// ($DISPLAY) и ffmpeg. Wayland-сессию исключаем: x11grab видит только пустой root
-// Xwayland (реальный композит недоступен) → был бы зелёный экран; для Wayland
-// нужен отдельный бэкенд (kmsgrab/portal, позже). Headless (нет графики) — false,
-// хост поднимется только с терминалом.
-func VideoAvailable() bool {
+// videoBackend — какой ffmpeg-вход использовать для видео:
+//
+//	"x11grab" — X11-десктоп ($DISPLAY, не Wayland);
+//	"kmsgrab" — Wayland/gamescope: композит с DRM-сканаута. Нужен доступ к /dev/dri
+//	            и права на DRM (CAP_SYS_ADMIN у ffmpeg) — иначе процесс упадёт;
+//	""        — видео недоступно (нет графики/ffmpeg) → headless.
+func videoBackend() string {
 	if FFmpegPath() == "" {
-		return false
+		return ""
 	}
-	if os.Getenv("WAYLAND_DISPLAY") != "" || strings.EqualFold(os.Getenv("XDG_SESSION_TYPE"), "wayland") {
-		return false
+	wayland := os.Getenv("WAYLAND_DISPLAY") != "" ||
+		strings.EqualFold(os.Getenv("XDG_SESSION_TYPE"), "wayland")
+	if !wayland && os.Getenv("DISPLAY") != "" {
+		return "x11grab" // чистый X11 — снимаем root
 	}
-	return os.Getenv("DISPLAY") != ""
+	if drmCard() != "" {
+		return "kmsgrab" // Wayland/gamescope или без X, но есть DRM
+	}
+	if os.Getenv("DISPLAY") != "" {
+		return "x11grab" // последний фолбэк (Xwayland без DRM-доступа)
+	}
+	return ""
+}
+
+// VideoAvailable — есть ли рабочий видео-бэкенд (x11grab или kmsgrab) + ffmpeg.
+func VideoAvailable() bool { return videoBackend() != "" }
+
+// drmCard — первая DRM-карта (/dev/dri/card0…7). Пусто, если DRM нет (headless).
+func drmCard() string {
+	for i := 0; i < 8; i++ {
+		p := fmt.Sprintf("/dev/dri/card%d", i)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // AudioAvailable — доступен ли системный звук: PulseAudio (или PipeWire-pulse) и
-// ffmpeg. Проверяем переменную PULSE_SERVER и стандартный per-user сокет. Без
-// звукового сервера (headless) — false.
+// ffmpeg. Проверяем PULSE_SERVER и стандартный per-user сокет.
 func AudioAvailable() bool {
 	if FFmpegPath() == "" {
 		return false
@@ -53,8 +77,8 @@ func AudioAvailable() bool {
 	return err == nil
 }
 
-// x11Display — адрес входа x11grab. Берём $DISPLAY (напр. ":0"); x11grab сам
-// определяет геометрию корневого окна, если -video_size не задан.
+// x11Display — адрес входа x11grab ($DISPLAY, напр. ":0"); x11grab сам определяет
+// геометрию корневого окна.
 func x11Display() string {
 	d := os.Getenv("DISPLAY")
 	if d == "" {
@@ -63,10 +87,10 @@ func x11Display() string {
 	return d
 }
 
-// NewEncoder на Linux: ffmpeg (x11grab + pulse), если есть графика; иначе —
-// headless-заглушка без видео (терминал продолжает работать).
+// NewEncoder на Linux: ffmpeg-энкодер, если доступно видео ИЛИ звук; иначе
+// headless-заглушка (только терминал).
 func NewEncoder() CaptureEncoder {
-	if !VideoAvailable() {
+	if !VideoAvailable() && !AudioAvailable() {
 		return noVideoEncoder{}
 	}
 	return &FFmpegLinux{}
@@ -75,23 +99,69 @@ func NewEncoder() CaptureEncoder {
 // FFmpegLinux реализует CaptureEncoder через ffmpeg на Linux.
 type FFmpegLinux struct{}
 
-// buildLinuxArgs собирает аргументы ffmpeg: x11grab (или тест-источник) для видео
-// и, если audio, второй вход -f pulse. Видео уходит в stdout (pipe:1), звук —
-// в pipe:3 (ExtraFiles). Возвращает аргументы и признак, что звук включён.
-func buildLinuxArgs(opts Options, audio bool) ([]string, bool) {
+// Start поднимает видео- и/или аудио-процессы (независимо) и возвращает каналы.
+func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) {
+	if FFmpegPath() == "" {
+		return nil, errNoFFmpeg
+	}
+	backend := videoBackend()
+	audio := opts.Audio && AudioAvailable()
+	if backend == "" && !audio {
+		return noVideoEncoder{}.Start(ctx, opts) // ни видео, ни звука → headless
+	}
+
+	var video chan []byte
+	if backend != "" {
+		v, err := startVideoProc(ctx, opts, backend)
+		if err != nil {
+			log.Printf("capture: video (%s): %v (continuing without video)", backend, err)
+			video = closedChan()
+		} else {
+			video = v
+		}
+	} else {
+		video = closedChan()
+	}
+
+	var audioCh chan []byte
+	if audio {
+		a, err := startAudioProc(ctx)
+		if err != nil {
+			log.Printf("capture: audio: %v (continuing without audio)", err)
+		} else {
+			audioCh = a
+		}
+	}
+
+	return &Stream{Video: video, Audio: audioCh}, nil
+}
+
+func closedChan() chan []byte {
+	ch := make(chan []byte)
+	close(ch)
+	return ch
+}
+
+// buildVideoArgs — аргументы ffmpeg для видео (по бэкенду) с выходом H264/VP8 в
+// stdout. kmsgrab отдаёт DRM_PRIME-кадры → hwdownload в CPU-формат перед энкодом.
+func buildVideoArgs(opts Options, backend string) []string {
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostats"}
-	if opts.TestSource {
-		// Синтетический движущийся источник — отладка без графики.
+	kms := backend == "kmsgrab"
+
+	switch {
+	case opts.TestSource:
 		w := opts.Width
 		if w <= 0 {
 			w = 1280
 		}
+		args = append(args, "-re", "-f", "lavfi",
+			"-i", fmt.Sprintf("testsrc2=size=%dx720:rate=%d", w, opts.FPS))
+	case kms:
 		args = append(args,
-			"-re",
-			"-f", "lavfi",
-			"-i", fmt.Sprintf("testsrc2=size=%dx720:rate=%d", w, opts.FPS),
-		)
-	} else {
+			"-framerate", fmt.Sprintf("%d", opts.FPS),
+			"-device", drmCard(),
+			"-f", "kmsgrab", "-i", "-")
+	default: // x11grab
 		draw := "0"
 		if opts.Cursor {
 			draw = "1"
@@ -100,77 +170,49 @@ func buildLinuxArgs(opts Options, audio bool) ([]string, bool) {
 			"-f", "x11grab",
 			"-framerate", fmt.Sprintf("%d", opts.FPS),
 			"-draw_mouse", draw,
-			"-i", x11Display(),
-		)
+			"-i", x11Display())
 	}
-	if audio {
-		// @DEFAULT_MONITOR@ = монитор дефолтного sink (СИСТЕМНЫЙ вывод), а не
-		// микрофон (-i default брал бы источник по умолчанию = вход/шум).
-		args = append(args, "-f", "pulse", "-i", "@DEFAULT_MONITOR@")
-		args = append(args, "-map", "0:v")
-	}
-	args = append(args, linuxVideoOut(opts)...)
-	if audio {
-		// Opus, страница ≈ 20 мс (совпадает с Duration в WriteSample).
-		args = append(args,
-			"-map", "1:a",
-			"-c:a", "libopus", "-b:a", "128k", "-application", "lowdelay",
-			"-page_duration", "20000",
-			"-f", "ogg", "pipe:3",
-		)
-	}
-	return args, audio
-}
 
-// linuxVideoOut — общая часть видеовыхода: CFR, опц. даунскейл, энкодер. H264 —
-// софтовый libx264 (VideoToolbox только на Apple); VP8 — libvpx, как на macOS.
-func linuxVideoOut(opts Options) []string {
-	a := []string{"-r", fmt.Sprintf("%d", opts.FPS), "-fps_mode", "cfr"}
-	if opts.Width > 0 {
-		a = append(a, "-vf", fmt.Sprintf("scale=%d:-2", opts.Width))
+	args = append(args, "-r", fmt.Sprintf("%d", opts.FPS), "-fps_mode", "cfr")
+
+	// Видео-фильтр: для kmsgrab сначала скачиваем кадр из DRM в CPU (bgr0),
+	// затем опциональный даунскейл.
+	var vf []string
+	if kms {
+		vf = append(vf, "hwdownload", "format=bgr0")
 	}
-	a = append(a, "-pix_fmt", "yuv420p")
+	if opts.Width > 0 {
+		vf = append(vf, fmt.Sprintf("scale=%d:-2", opts.Width))
+	}
+	if len(vf) > 0 {
+		args = append(args, "-vf", strings.Join(vf, ","))
+	}
+	args = append(args, "-pix_fmt", "yuv420p")
 
 	if opts.Codec == CodecH264 {
-		a = append(a,
-			"-c:v", "libx264",
-			"-preset", "ultrafast",
-			"-tune", "zerolatency",
-			"-profile:v", "high",
-			"-b:v", opts.Bitrate,
+		args = append(args,
+			"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+			"-profile:v", "high", "-b:v", opts.Bitrate,
 			"-g", fmt.Sprintf("%d", opts.FPS),
-			// SPS/PPS перед каждым кейфреймом — чтобы новый зритель декодировал.
 			"-bsf:v", "dump_extra=freq=keyframe",
-			"-f", "h264", "pipe:1",
-		)
+			"-f", "h264", "pipe:1")
 	} else {
-		a = append(a,
-			"-c:v", "libvpx",
-			"-deadline", "realtime",
-			"-cpu-used", "8",
-			"-lag-in-frames", "0",
-			"-threads", fmt.Sprintf("%d", opts.Threads),
+		args = append(args,
+			"-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8",
+			"-lag-in-frames", "0", "-threads", fmt.Sprintf("%d", opts.Threads),
 			"-b:v", opts.Bitrate,
 			"-g", fmt.Sprintf("%d", opts.FPS),
 			"-keyint_min", fmt.Sprintf("%d", opts.FPS),
-			"-f", "ivf", "pipe:1",
-		)
+			"-f", "ivf", "pipe:1")
 	}
-	return a
+	return args
 }
 
-// Start запускает ffmpeg-захват и возвращает каналы кадров (видео + опц. звук).
-func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) {
-	ff := FFmpegPath()
-	if ff == "" {
-		return nil, errNoFFmpeg
-	}
-	// Звук передаём, только если его просят И PulseAudio реально доступен.
-	audio := opts.Audio && AudioAvailable()
-	args, wantAudio := buildLinuxArgs(opts, audio)
-
-	cmd := exec.CommandContext(ctx, ff, args...)
-	log.Printf("capture: ffmpeg %s", strings.Join(args, " "))
+// startVideoProc запускает видео-ffmpeg и возвращает канал кадров.
+func startVideoProc(ctx context.Context, opts Options, backend string) (chan []byte, error) {
+	args := buildVideoArgs(opts, backend)
+	cmd := exec.CommandContext(ctx, FFmpegPath(), args...)
+	log.Printf("capture: ffmpeg video (%s) %s", backend, strings.Join(args, " "))
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -181,30 +223,8 @@ func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) 
 		return nil, fmt.Errorf("stderr pipe: %w", err)
 	}
 	go logStderr(stderr)
-
-	// Звук ffmpeg пишет в fd 3 (pipe:3) — прокидываем через ExtraFiles.
-	var audioR *os.File
-	var audioW *os.File
-	var audioCh chan []byte
-	if wantAudio {
-		pr, pw, perr := os.Pipe()
-		if perr != nil {
-			return nil, fmt.Errorf("audio pipe: %w", perr)
-		}
-		cmd.ExtraFiles = []*os.File{pw} // становится fd 3 у ffmpeg
-		audioR, audioW = pr, pw
-		audioCh = make(chan []byte, 16)
-	}
-
 	if err := cmd.Start(); err != nil {
-		if audioR != nil {
-			_ = audioR.Close()
-			_ = audioW.Close()
-		}
 		return nil, fmt.Errorf("start ffmpeg: %w", err)
-	}
-	if audioW != nil {
-		_ = audioW.Close() // копию держит ffmpeg; родитель в fd 3 не пишет
 	}
 
 	frames := make(chan []byte, 4)
@@ -215,10 +235,7 @@ func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) 
 				_ = cmd.Process.Kill()
 			}
 			_ = cmd.Wait()
-			if audioR != nil {
-				_ = audioR.Close()
-			}
-			log.Printf("capture stopped")
+			log.Printf("capture stopped (video)")
 		}()
 		in := bufio.NewReader(stdout)
 		if opts.Codec == CodecH264 {
@@ -227,16 +244,52 @@ func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) 
 			readIVF(ctx, in, frames, opts.DropLate)
 		}
 	}()
-
-	if wantAudio {
-		go readOggOpus(ctx, audioR, audioCh)
-	}
-
-	return &Stream{Video: frames, Audio: audioCh}, nil
+	return frames, nil
 }
 
-// readOggOpus читает Opus-страницы из ogg-потока ffmpeg (fd 3) и шлёт пакеты в
-// канал. Каждая страница ≈ 20 мс (см. -page_duration).
+// startAudioProc запускает аудио-ffmpeg (PulseAudio → Opus) и возвращает канал
+// Opus-пакетов. @DEFAULT_MONITOR@ = монитор дефолтного sink (СИСТЕМНЫЙ вывод), а
+// не микрофон (-i default брал бы источник по умолчанию = вход/шум).
+func startAudioProc(ctx context.Context) (chan []byte, error) {
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-nostats",
+		"-f", "pulse", "-i", "@DEFAULT_MONITOR@",
+		"-c:a", "libopus", "-b:a", "128k", "-application", "lowdelay",
+		"-page_duration", "20000",
+		"-f", "ogg", "pipe:1",
+	}
+	cmd := exec.CommandContext(ctx, FFmpegPath(), args...)
+	log.Printf("capture: ffmpeg audio %s", strings.Join(args, " "))
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
+	go logStderr(stderr)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start ffmpeg: %w", err)
+	}
+
+	out := make(chan []byte, 16)
+	go func() {
+		defer func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			_ = cmd.Wait()
+			log.Printf("capture stopped (audio)")
+		}()
+		readOggOpus(ctx, stdout, out)
+	}()
+	return out, nil
+}
+
+// readOggOpus читает Opus-страницы из ogg-потока ffmpeg и шлёт пакеты в канал.
+// Каждая страница ≈ 20 мс (см. -page_duration). Закрывает канал по завершении.
 func readOggOpus(ctx context.Context, r io.Reader, out chan []byte) {
 	defer close(out)
 	reader, _, err := oggreader.NewWith(bufio.NewReader(r))
@@ -267,8 +320,8 @@ func ListSources() (Sources, error) { return Sources{}, nil }
 func ActivateApp(_ int) error       { return nil }
 func InjectScroll(_, _ int)         {} // скролл на Linux идёт через uinput (input_linux.go)
 
-// SourceRect на Linux — весь экран (x11grab снимает root целиком). Нужен для
-// маппинга нормализованных координат мыши зрителя в пиксели (см. handleMouse).
+// SourceRect на Linux — весь экран. Нужен для маппинга нормализованных координат
+// мыши зрителя в пиксели (см. handleMouse) и как ABS-диапазон uinput.
 func SourceRect(_ string, _ int) (Rect, error) {
 	w, h := ScreenSize()
 	if w <= 0 || h <= 0 {
@@ -278,8 +331,8 @@ func SourceRect(_ string, _ int) (Rect, error) {
 }
 
 // ScreenSize определяет разрешение подключённого дисплея из DRM sysfs
-// (/sys/class/drm/<connector>/{status,modes}) — работает и в X11, и в Wayland,
-// без зависимости от дисплей-сервера. 0,0 если не удалось.
+// (/sys/class/drm/<connector>/{status,modes}) — работает и в X11, и в Wayland.
+// 0,0 если не удалось.
 func ScreenSize() (int, int) {
 	entries, err := os.ReadDir("/sys/class/drm")
 	if err != nil {

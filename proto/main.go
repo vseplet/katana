@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"github.com/vseplet/katana/proto/capture"
@@ -88,9 +89,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// TCC: запись экрана. Разрешение привязывается к терминалу, из которого
-	// запущено (не к самому бинарю).
-	if !*test {
+	// TCC: запись экрана (только macOS). Разрешение привязывается к терминалу, из
+	// которого запущено (не к самому бинарю). На Linux/Windows TCC нет.
+	if !*test && runtime.GOOS == "darwin" {
 		if permissions.RequestScreenCapture() {
 			log.Printf("permissions: screen recording granted")
 		} else {
