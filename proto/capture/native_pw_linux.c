@@ -162,6 +162,8 @@ static int init_encoder(int in_w, int in_h)
 	S.enc->bit_rate = (int64_t)S.cfg_kbps * 1000;
 	S.enc->gop_size = S.cfg_fps;
 	S.enc->max_b_frames = 0;
+	S.enc->refs = 1;
+	S.enc->flags |= AV_CODEC_FLAG_LOW_DELAY; // без переупорядочивания вывода
 	AVBufferRef *fctx = av_buffersink_get_hw_frames_ctx(S.sink);
 	if (!fctx) {
 		nlog("no hw_frames_ctx from sink");
