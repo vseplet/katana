@@ -62,20 +62,15 @@ struct nstate {
 	int w, h, inited;
 	long long pts;
 
-	// Развязка захвата и энкода: on_process кладёт свежий кадр в latest и будит
-	// энкод-поток. Энкодим ПО ПРИХОДУ кадра (фаза синхронна с компоузитором →
-	// нет джаддера свободного таймера), но не в RT-потоке PipeWire.
-	// ВАЖНО: rate-cap проверяем ДО memcpy — иначе enc-поток копирует 33 МБ на
-	// каждый приход (KWin при драге сыпет >fps) и конкурирует с RT-потоком за
-	// мьютекс → overload. С cap'ом до memcpy enc-поток трогает мьютекс ≤fps.
+	// Развязка захвата и энкода: on_process кладёт последний кадр в latest,
+	// таймер энкодит его ровно на fps (CFR, как videorate). Двойной буфер +
+	// мьютекс, чтобы энкод шёл вне блокировки (не тормозил PipeWire).
 	pthread_mutex_t mtx;
-	pthread_cond_t cond;
 	uint8_t *latest;   // последний BGRx-кадр
 	size_t latest_cap; // ёмкость буфера
 	int latest_stride;
 	int have;
-	int stop_enc;
-	pthread_t enc_thread;
+	pthread_t timer;
 };
 
 static struct nstate S;
@@ -239,8 +234,9 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
 		init_encoder(S.format.size.width, S.format.size.height);
 }
 
-// on_process (RT-поток PipeWire): ТОЛЬКО копируем СВЕЖИЙ кадр (быстро) и будим
-// энкод-поток. Вычёрпываем всю очередь, оставляя последний (не энкодим устаревшие).
+// on_process (поток PipeWire): ТОЛЬКО копируем СВЕЖИЙ кадр (быстро) — энкод делает
+// таймер. Вычёрпываем всю очередь буферов, оставляя только последний, чтобы не
+// энкодить устаревшие (иначе окно «скачет» между старым и новым кадром).
 static void on_process(void *userdata)
 {
 	(void)userdata;
@@ -267,42 +263,37 @@ static void on_process(void *userdata)
 			memcpy(S.latest, sd->data, need);
 			S.latest_stride = stride;
 			S.have = 1;
-			pthread_cond_signal(&S.cond);
 		}
 		pthread_mutex_unlock(&S.mtx);
 	}
 	pw_stream_queue_buffer(S.stream, last);
 }
 
-// enc_thread_fn: просыпается ПО ПРИХОДУ кадра (фаза синхронна с компоузитором →
-// нет джаддера свободного таймера). Rate-cap проверяем ДО memcpy: если с прошлого
-// энкода прошло меньше interval — сбрасываем have и уходим спать, НЕ копируя кадр.
-// Так enc-поток трогает мьютекс с memcpy ≤fps (как таймер), не создавая контеншн
-// с RT-потоком → нет overload, даже если KWin сыпет кадры быстрее fps.
-static void *enc_thread_fn(void *arg)
+// timer_fn: энкодит ПОСЛЕДНИЙ кадр ровно на cfg_fps (CFR, как videorate). Кадр
+// копируем под мьютексом, энкод — вне блокировки. Замеряет время энкода.
+static void *timer_fn(void *arg)
 {
 	(void)arg;
 	long long interval = 1000000000LL / (S.cfg_fps > 0 ? S.cfg_fps : 30);
 	uint8_t *buf = NULL;
 	size_t bufcap = 0;
-	long long stat_ns = 0, next_log = 0, last_enc = 0;
+	long long stat_ns = 0, next_log = 0;
 	int stat_n = 0;
-	for (;;) {
+	long long next = now_ns() + interval;
+	while (g_running) {
+		// Планируем по абсолютному дедлайну: период = ровно interval (не
+		// interval + время_энкода), иначе fps всегда ниже целевого.
+		long long sleep_ns = next - now_ns();
+		if (sleep_ns > 0) {
+			struct timespec ts = {sleep_ns / 1000000000LL, sleep_ns % 1000000000LL};
+			nanosleep(&ts, NULL);
+		}
+		next += interval;
+		if (now_ns() - next > interval) // сильно отстали (энкод не успевает) — ресинк
+			next = now_ns() + interval;
+
 		pthread_mutex_lock(&S.mtx);
-		while (!S.have && !S.stop_enc)
-			pthread_cond_wait(&S.cond, &S.mtx);
-		if (S.stop_enc) {
-			pthread_mutex_unlock(&S.mtx);
-			break;
-		}
-		// Rate-cap ДО memcpy: слишком рано — дропаем кадр без копирования.
-		long long now = now_ns();
-		if (last_enc != 0 && now - last_enc < interval) {
-			S.have = 0;
-			pthread_mutex_unlock(&S.mtx);
-			continue;
-		}
-		int ready = S.inited;
+		int ready = S.inited && S.have;
 		int stride = S.latest_stride, w = S.w, h = S.h;
 		if (ready) {
 			size_t need = (size_t)stride * h;
@@ -316,11 +307,9 @@ static void *enc_thread_fn(void *arg)
 			else
 				ready = 0;
 		}
-		S.have = 0;
 		pthread_mutex_unlock(&S.mtx);
 		if (!ready)
 			continue;
-		last_enc = now;
 
 		long long t0 = now_ns();
 		encode_bgrx(buf, stride, w, h);
@@ -352,7 +341,6 @@ int katana_native_start(katana_native_cfg cfg)
 	S.cfg_w = cfg.width;
 	S.cfg_h = cfg.height;
 	pthread_mutex_init(&S.mtx, NULL);
-	pthread_cond_init(&S.cond, NULL);
 	g_running = 1;
 
 	pw_init(NULL, NULL);
@@ -391,25 +379,20 @@ int katana_native_start(katana_native_cfg cfg)
 		SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(
 			&SPA_RECTANGLE(1920, 1080), &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(8192, 8192)),
 		SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-			&SPA_FRACTION(cfg.fps > 0 ? cfg.fps : 30, 1), &SPA_FRACTION(0, 1),
-			&SPA_FRACTION(cfg.fps > 0 ? cfg.fps : 30, 1))); // max=target: меньше пробуждений RT-потока
+			&SPA_FRACTION(cfg.fps > 0 ? cfg.fps : 30, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(240, 1)));
 
 	pw_stream_connect(S.stream, PW_DIRECTION_INPUT, cfg.node,
 		PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, 1);
 	pw_thread_loop_unlock(S.loop);
 
-	pthread_create(&S.enc_thread, NULL, enc_thread_fn, NULL);
+	pthread_create(&S.timer, NULL, timer_fn, NULL);
 
 	while (g_running) {
 		struct timespec ts = {0, 100 * 1000 * 1000};
 		nanosleep(&ts, NULL);
 	}
 
-	pthread_mutex_lock(&S.mtx);
-	S.stop_enc = 1;
-	pthread_cond_signal(&S.cond);
-	pthread_mutex_unlock(&S.mtx);
-	pthread_join(S.enc_thread, NULL);
+	pthread_join(S.timer, NULL);
 
 	pw_thread_loop_lock(S.loop);
 	if (S.stream)
@@ -427,7 +410,6 @@ int katana_native_start(katana_native_cfg cfg)
 	if (S.hw_device)
 		av_buffer_unref(&S.hw_device);
 	free(S.latest);
-	pthread_cond_destroy(&S.cond);
 	pthread_mutex_destroy(&S.mtx);
 	return 0;
 }
