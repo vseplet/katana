@@ -252,6 +252,9 @@ func ffmpegHasVAAPI() bool {
 func gstNV12Pipeline(node uint32, w, h, fps int) []string {
 	desc := fmt.Sprintf(
 		"pipewiresrc fd=3 path=%d do-timestamp=true keepalive-time=1000 ! "+
+			// leaky-queue: под нагрузкой (перетаскивание окна) дропаем старые кадры,
+			// а не копим очередь и не тормозим весь конвейер рывками.
+			"queue leaky=downstream max-size-buffers=3 max-size-time=0 max-size-bytes=0 ! "+
 			"videorate ! videoconvert n-threads=0 ! videoscale n-threads=0 ! "+
 			"video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1 ! "+
 			"fdsink fd=1 sync=false",
@@ -273,7 +276,11 @@ func waylandVAAPIArgs(cw, ch, tw, th, fps int, bitrate string) []string {
 		"-i", "-",
 		"-r", fmt.Sprintf("%d", fps), "-fps_mode", "cfr",
 		"-vf", fmt.Sprintf("hwupload,scale_vaapi=w=%d:h=%d", tw, th),
-		"-c:v", "h264_vaapi", "-b:v", bitrate, "-g", fmt.Sprintf("%d", fps), "-bf", "0",
+		// CBR + VBV (bufsize=битрейт/сек): битрейт не пикует под движением →
+		// меньше потерь пакетов на Wi-Fi. bf 0 — без B-кадров (низкая задержка).
+		"-c:v", "h264_vaapi", "-rc_mode", "CBR",
+		"-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate,
+		"-g", fmt.Sprintf("%d", fps), "-bf", "0",
 		"-f", "h264", "pipe:1",
 	}
 }
