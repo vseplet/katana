@@ -2,8 +2,9 @@ name: release
 
 # Сборка бинарников хоста и публикация в один GitHub Release.
 # macOS (arm64): cgo + ObjC (ScreenCaptureKit/VideoToolbox) — только на macOS, полный.
-# Linux (arm64/amd64): статик (CGO_ENABLED=0), headless — терминал по WebRTC, без
-# видео/ввода/аудио (заглушки). Работает где нет графики (Pi, серверы, контейнеры).
+# Linux (arm64/amd64): статик (CGO_ENABLED=0). Экран/звук — через ffmpeg (x11grab +
+# pulse) при наличии графики; без неё (серверы, контейнеры, Pi headless) — только
+# терминал по WebRTC. Ввод пока не реализован. ffmpeg нужен в рантайме (не вшит).
 on:
   push:
     tags: ["v*"]
