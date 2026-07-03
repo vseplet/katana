@@ -260,7 +260,10 @@ func gstRawPipeline(node uint32, w, h, fps int) []string {
 			"video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 ! "+
 			"fdsink fd=1 sync=false",
 		node, w, h, fps)
-	return []string{"-q", desc}
+	// Пайплайн — ОТДЕЛЬНЫМИ токенами (как в шелле): единый аргумент с пробелами
+	// gst-launch трактует как одно имя элемента → syntax error. -q гасит прогресс
+	// в stdout (туда fdsink пишет сырьё).
+	return append([]string{"-q"}, strings.Fields(desc)...)
 }
 
 // waylandEncodeArgs — ffmpeg читает сырой I420 (WxH) из stdin и кодирует в
