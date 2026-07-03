@@ -8,6 +8,7 @@
 #include "native_pw_linux.h"
 
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -23,6 +24,17 @@
 #include <libavutil/opt.h>
 
 extern void goNativeH264(void *data, int len);
+extern void goNativeLog(char *msg); // C-логи → в лог хоста (Go)
+
+static void nlog(const char *fmt, ...)
+{
+	char buf[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	goNativeLog(buf);
+}
 
 struct nstate {
 	struct pw_thread_loop *loop;
@@ -49,7 +61,7 @@ static void log_averr(const char *what, int err)
 {
 	char buf[256];
 	av_strerror(err, buf, sizeof(buf));
-	fprintf(stderr, "katana native: %s: %s\n", what, buf);
+	nlog("%s: %s", what, buf);
 }
 
 // init_encoder: VAAPI-устройство, filtergraph (bgr0 → hwupload → scale_vaapi nv12
@@ -119,7 +131,7 @@ static int init_encoder(int in_w, int in_h)
 
 	const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
 	if (!codec) {
-		fprintf(stderr, "katana native: h264_vaapi not found\n");
+		nlog("h264_vaapi not found");
 		return -1;
 	}
 	S.enc = avcodec_alloc_context3(codec);
@@ -133,7 +145,7 @@ static int init_encoder(int in_w, int in_h)
 	S.enc->max_b_frames = 0;
 	AVBufferRef *fctx = av_buffersink_get_hw_frames_ctx(S.sink);
 	if (!fctx) {
-		fprintf(stderr, "katana native: no hw_frames_ctx from sink\n");
+		nlog("no hw_frames_ctx from sink");
 		return -1;
 	}
 	S.enc->hw_frames_ctx = av_buffer_ref(fctx);
@@ -142,7 +154,7 @@ static int init_encoder(int in_w, int in_h)
 		return -1;
 	}
 	S.inited = 1;
-	fprintf(stderr, "katana native: encoder ready in=%dx%d out=%dx%d @%d %dk\n",
+	nlog("encoder ready in=%dx%d out=%dx%d @%d %dk",
 		in_w, in_h, out_w, out_h, S.cfg_fps, S.cfg_kbps);
 	return 0;
 }

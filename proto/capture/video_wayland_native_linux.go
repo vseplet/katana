@@ -28,6 +28,11 @@ func init() {
 // nativeCh — канал H264 access unit'ов от нативного энкодера (единственный захват).
 var nativeCh chan []byte
 
+//export goNativeLog
+func goNativeLog(msg *C.char) {
+	log.Printf("capture: native: %s", C.GoString(msg))
+}
+
 //export goNativeH264
 func goNativeH264(data unsafe.Pointer, n C.int) {
 	ch := nativeCh
