@@ -37,10 +37,10 @@ func isWayland() bool {
 //	""        — видео недоступно (headless / нет нужных бинарей).
 func videoBackend() string {
 	if isWayland() {
-		if gstLaunchPath() != "" {
-			return "wayland"
+		if gstLaunchPath() != "" && FFmpegPath() != "" {
+			return "wayland" // gst забирает PipeWire, ffmpeg кодирует
 		}
-		return "" // Wayland без GStreamer — видео не снять
+		return "" // без gst или ffmpeg видео не снять
 	}
 	if os.Getenv("DISPLAY") != "" && FFmpegPath() != "" {
 		return "x11"

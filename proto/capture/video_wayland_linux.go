@@ -157,93 +157,138 @@ func startVideoWayland(ctx context.Context, opts Options) (chan []byte, error) {
 	}
 	pwFile := os.NewFile(uintptr(fd), "pipewire")
 
-	// 5) gst: pipewiresrc(fd 3) → H264 Annex-B в stdout
-	pipe := gstPipeline(opts, node)
-	cmd := exec.CommandContext(ctx, gst, pipe...)
-	cmd.ExtraFiles = []*os.File{pwFile} // становится fd 3 у gst
-	log.Printf("capture: gst video (wayland) node=%d %s", node, strings.Join(pipe, " "))
+	// 5) gst забирает кадры из PipeWire и отдаёт СЫРОЙ I420 (фикс. WxH) в stdout;
+	// кодирует их ffmpeg (libx264/libvpx — есть в ffmpeg, в отличие от gst x264enc).
+	// Так мы не зависим от кодер-плагинов GStreamer.
+	w, h := waylandSize(opts)
+	fps := opts.FPS
+	if fps <= 0 {
+		fps = 30
+	}
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
+	gstArgs := gstRawPipeline(node, w, h, fps)
+	gstCmd := exec.CommandContext(ctx, gst, gstArgs...)
+	gstCmd.ExtraFiles = []*os.File{pwFile} // fd 3 у gst
+	log.Printf("capture: gst grab (wayland) node=%d %dx%d %s", node, w, h, strings.Join(gstArgs, " "))
+
+	ffArgs := waylandEncodeArgs(opts, w, h, fps)
+	ffCmd := exec.CommandContext(ctx, FFmpegPath(), ffArgs...)
+	log.Printf("capture: ffmpeg encode (wayland) %s", strings.Join(ffArgs, " "))
+
+	// Связь gst.stdout → ffmpeg.stdin напрямую (kernel pipe, без копирования).
+	rp, wp, perr := os.Pipe()
+	if perr != nil {
 		pwFile.Close()
 		conn.Close()
-		return nil, fmt.Errorf("stdout pipe: %w", err)
+		return nil, fmt.Errorf("pipe: %w", perr)
 	}
-	stderr, err := cmd.StderrPipe()
+	gstCmd.Stdout = wp
+	ffCmd.Stdin = rp
+	gstErr, _ := gstCmd.StderrPipe()
+	go logStderr(gstErr)
+	ffErr, _ := ffCmd.StderrPipe()
+	go logStderr(ffErr)
+	ffOut, err := ffCmd.StdoutPipe()
 	if err != nil {
+		rp.Close()
+		wp.Close()
 		pwFile.Close()
 		conn.Close()
-		return nil, fmt.Errorf("stderr pipe: %w", err)
+		return nil, fmt.Errorf("ffmpeg stdout: %w", err)
 	}
-	go logStderr(stderr)
-	if err := cmd.Start(); err != nil {
+
+	if err := gstCmd.Start(); err != nil {
+		rp.Close()
+		wp.Close()
 		pwFile.Close()
 		conn.Close()
 		return nil, fmt.Errorf("start gst: %w", err)
 	}
-	pwFile.Close() // копию fd держит gst
+	if err := ffCmd.Start(); err != nil {
+		rp.Close()
+		wp.Close()
+		pwFile.Close()
+		_ = gstCmd.Process.Kill()
+		_ = gstCmd.Wait()
+		conn.Close()
+		return nil, fmt.Errorf("start ffmpeg: %w", err)
+	}
+	// Концы пайпа и fd PipeWire держат уже дочерние процессы — в родителе закрываем.
+	rp.Close()
+	wp.Close()
+	pwFile.Close()
 
 	frames := make(chan []byte, 4)
 	go func() {
 		defer close(frames)
 		defer conn.Close()
-		defer waitKill(cmd, "video")
-		readH264(ctx, bufio.NewReader(stdout), frames, opts.DropLate)
+		defer waitKill(gstCmd, "video-grab")
+		defer waitKill(ffCmd, "video-encode")
+		in := bufio.NewReader(ffOut)
+		if opts.Codec == CodecH264 {
+			readH264(ctx, in, frames, opts.DropLate)
+		} else {
+			readIVF(ctx, in, frames, opts.DropLate)
+		}
 	}()
 	return frames, nil
 }
 
-// gstHas — есть ли gst-элемент (проверяем через gst-inspect-1.0).
-func gstHas(el string) bool {
-	p, err := exec.LookPath("gst-inspect-1.0")
-	if err != nil {
-		return false
-	}
-	return exec.Command(p, el).Run() == nil
-}
+func even(v int) int { return v - v%2 }
 
-// gstEncoderChain — H264-кодер, доступный в этой сборке GStreamer, с параметрами.
-// Приоритет: аппаратный VAAPI (на AMD Deck — почти бесплатно по CPU, тянет 4K) →
-// софтовые openh264/x264. У разных кодеров разные свойства и единицы битрейта.
-func gstEncoderChain(kbps, fps int) string {
-	switch {
-	case gstHas("vah264enc"): // GStreamer VA (gst-plugins-bad), аппаратный
-		return fmt.Sprintf("vapostproc ! vah264enc bitrate=%d key-int-max=%d", kbps, fps)
-	case gstHas("vaapih264enc"): // gstreamer-vaapi, аппаратный
-		return fmt.Sprintf("vaapipostproc ! vaapih264enc rate-control=cbr bitrate=%d keyframe-period=%d", kbps, fps)
-	case gstHas("openh264enc"): // Cisco OpenH264, софтовый (bitrate в БИТ/с)
-		return fmt.Sprintf("openh264enc bitrate=%d gop-size=%d complexity=0", kbps*1000, fps)
-	default: // x264enc, софтовый
-		return fmt.Sprintf("x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d key-int-max=%d", kbps, fps)
-	}
-}
-
-// gstPipeline строит описание gst-пайплайна: PipeWire → (скейл) → H264 (доступный
-// кодер) → Annex-B H264 в stdout. h264parse config-interval=1 повторяет SPS/PPS
-// (раз в секунду), чтобы новый зритель декодировал.
-func gstPipeline(opts Options, node uint32) []string {
-	kbps := bitrateKbps(opts.Bitrate)
-	fps := opts.FPS
-	if fps <= 0 {
-		fps = 30
-	}
-	rawCaps := fmt.Sprintf("video/x-raw,format=I420,framerate=%d/1", fps)
-	scale := ""
+// waylandSize — целевой размер сырого кадра: даунскейл до opts.Width (аспект по
+// экрану), либо нативное разрешение экрана, либо дефолт.
+func waylandSize(opts Options) (int, int) {
 	if opts.Width > 0 {
 		if sw, sh := ScreenSize(); sw > 0 && sh > 0 {
-			th := opts.Width * sh / sw
-			th -= th % 2
-			rawCaps = fmt.Sprintf("video/x-raw,format=I420,framerate=%d/1,width=%d,height=%d", fps, opts.Width, th)
+			return even(opts.Width), even(opts.Width * sh / sw)
 		}
-		scale = "videoscale ! "
+		return even(opts.Width), even(opts.Width * 9 / 16)
 	}
+	if sw, sh := ScreenSize(); sw > 0 && sh > 0 {
+		return even(sw), even(sh)
+	}
+	return 1920, 1080
+}
+
+// gstRawPipeline — gst забирает PipeWire, приводит к I420 фиксированного WxH и
+// пишет сырьё в stdout (fdsink fd=1). Никакого кодирования в gst.
+func gstRawPipeline(node uint32, w, h, fps int) []string {
 	desc := fmt.Sprintf(
 		"pipewiresrc fd=3 path=%d do-timestamp=true keepalive-time=1000 ! "+
-			"videoconvert ! videorate ! %s%s ! "+
-			"%s ! "+
-			"h264parse config-interval=1 ! "+
-			"video/x-h264,stream-format=byte-stream,alignment=au ! "+
+			"videoconvert ! videorate ! videoscale ! "+
+			"video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 ! "+
 			"fdsink fd=1 sync=false",
-		node, scale, rawCaps, gstEncoderChain(kbps, fps))
+		node, w, h, fps)
 	return []string{"-q", desc}
+}
+
+// waylandEncodeArgs — ffmpeg читает сырой I420 (WxH) из stdin и кодирует в
+// H264 (libx264) или VP8 (libvpx), как в X11-пути.
+func waylandEncodeArgs(opts Options, w, h, fps int) []string {
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-nostats",
+		"-f", "rawvideo", "-pixel_format", "yuv420p",
+		"-video_size", fmt.Sprintf("%dx%d", w, h),
+		"-framerate", fmt.Sprintf("%d", fps),
+		"-i", "-",
+		"-r", fmt.Sprintf("%d", fps), "-fps_mode", "cfr", "-pix_fmt", "yuv420p",
+	}
+	if opts.Codec == CodecH264 {
+		args = append(args,
+			"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+			"-profile:v", "high", "-b:v", opts.Bitrate,
+			"-g", fmt.Sprintf("%d", fps),
+			"-bsf:v", "dump_extra=freq=keyframe",
+			"-f", "h264", "pipe:1")
+	} else {
+		args = append(args,
+			"-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8",
+			"-lag-in-frames", "0", "-threads", fmt.Sprintf("%d", opts.Threads),
+			"-b:v", opts.Bitrate,
+			"-g", fmt.Sprintf("%d", fps),
+			"-keyint_min", fmt.Sprintf("%d", fps),
+			"-f", "ivf", "pipe:1")
+	}
+	return args
 }
