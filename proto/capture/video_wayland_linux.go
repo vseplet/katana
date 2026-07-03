@@ -276,10 +276,13 @@ func waylandVAAPIArgs(cw, ch, tw, th, fps int, bitrate string) []string {
 		"-i", "-",
 		"-r", fmt.Sprintf("%d", fps), "-fps_mode", "cfr",
 		"-vf", fmt.Sprintf("hwupload,scale_vaapi=w=%d:h=%d", tw, th),
-		// CBR + VBV (bufsize=битрейт/сек): битрейт не пикует под движением →
-		// меньше потерь пакетов на Wi-Fi. bf 0 — без B-кадров (низкая задержка).
-		"-c:v", "h264_vaapi", "-rc_mode", "CBR",
-		"-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate,
+		// VBR с большим потолком (до 3× таргета): под резким движением кадру нужно
+		// куда больше бит — даём разгуляться, чтобы качество не рушилось в блоки.
+		// bf 0 — без B-кадров (низкая задержка).
+		"-c:v", "h264_vaapi", "-rc_mode", "VBR",
+		"-b:v", bitrate,
+		"-maxrate", fmt.Sprintf("%dk", bitrateKbps(bitrate)*3),
+		"-bufsize", fmt.Sprintf("%dk", bitrateKbps(bitrate)*3),
 		"-g", fmt.Sprintf("%d", fps), "-bf", "0",
 		"-f", "h264", "pipe:1",
 	}
