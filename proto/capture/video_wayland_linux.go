@@ -157,21 +157,32 @@ func startVideoWayland(ctx context.Context, opts Options) (chan []byte, error) {
 	}
 	pwFile := os.NewFile(uintptr(fd), "pipewire")
 
-	// 5) gst забирает кадры из PipeWire и отдаёт СЫРОЙ I420 (фикс. WxH) в stdout;
-	// кодирует их ffmpeg (libx264/libvpx — есть в ffmpeg, в отличие от gst x264enc).
-	// Так мы не зависим от кодер-плагинов GStreamer.
-	w, h := waylandSize(opts)
+	// 5) gst забирает кадры из PipeWire и отдаёт СЫРОЙ NV12 в stdout; ffmpeg
+	// кодирует. Если есть VAAPI (AMD Deck) — ffmpeg делает СКЕЙЛ и КОДИРОВАНИЕ на
+	// GPU (h264_vaapi), а gst отдаёт кадр в нативном размере (без софт-скейла).
+	// Иначе gst скейлит софтом, ffmpeg кодирует libx264/libvpx.
 	fps := opts.FPS
 	if fps <= 0 {
 		fps = 30
 	}
+	vaapi := opts.Codec == CodecH264 && renderNode() != "" && ffmpegHasVAAPI()
 
-	gstArgs := gstRawPipeline(node, w, h, fps)
+	var gstW, gstH int
+	var ffArgs []string
+	if vaapi {
+		gstW, gstH = captureSize() // нативный размер: скейл сделает GPU в ffmpeg
+		tw, th := waylandSize(opts)
+		ffArgs = waylandVAAPIArgs(gstW, gstH, tw, th, fps, opts.Bitrate)
+	} else {
+		gstW, gstH = waylandSize(opts) // софтовый путь: gst скейлит сам
+		ffArgs = waylandSoftwareArgs(opts, gstW, gstH, fps)
+	}
+
+	gstArgs := gstNV12Pipeline(node, gstW, gstH, fps)
 	gstCmd := exec.CommandContext(ctx, gst, gstArgs...)
 	gstCmd.ExtraFiles = []*os.File{pwFile} // fd 3 у gst
-	log.Printf("capture: gst grab (wayland) node=%d %dx%d %s", node, w, h, strings.Join(gstArgs, " "))
+	log.Printf("capture: gst grab (wayland) node=%d %dx%d vaapi=%v %s", node, gstW, gstH, vaapi, strings.Join(gstArgs, " "))
 
-	ffArgs := waylandEncodeArgs(opts, w, h, fps)
 	ffCmd := exec.CommandContext(ctx, FFmpegPath(), ffArgs...)
 	log.Printf("capture: ffmpeg encode (wayland) %s", strings.Join(ffArgs, " "))
 
@@ -251,27 +262,76 @@ func waylandSize(opts Options) (int, int) {
 	return 1920, 1080
 }
 
-// gstRawPipeline — gst забирает PipeWire, приводит к I420 фиксированного WxH и
-// пишет сырьё в stdout (fdsink fd=1). Никакого кодирования в gst.
-func gstRawPipeline(node uint32, w, h, fps int) []string {
+// captureSize — нативный размер кадра для gst (разрешение экрана; дефолт 1080p).
+func captureSize() (int, int) {
+	if sw, sh := ScreenSize(); sw > 0 && sh > 0 {
+		return even(sw), even(sh)
+	}
+	return 1920, 1080
+}
+
+// renderNode — DRM render-нода для VAAPI (/dev/dri/renderD128…). Пусто, если нет.
+func renderNode() string {
+	for i := 128; i < 136; i++ {
+		p := fmt.Sprintf("/dev/dri/renderD%d", i)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+var (
+	vaapiOnce sync.Once
+	vaapiOK   bool
+)
+
+// ffmpegHasVAAPI — собран ли ffmpeg с кодером h264_vaapi (кэшируется).
+func ffmpegHasVAAPI() bool {
+	vaapiOnce.Do(func() {
+		out, err := exec.Command(FFmpegPath(), "-hide_banner", "-encoders").Output()
+		vaapiOK = err == nil && strings.Contains(string(out), "h264_vaapi")
+	})
+	return vaapiOK
+}
+
+// gstNV12Pipeline — gst забирает PipeWire, приводит к NV12 (фикс. WxH) и пишет
+// сырьё в stdout. Никакого кодирования в gst (в этой сборке нет VA-энкодеров).
+func gstNV12Pipeline(node uint32, w, h, fps int) []string {
 	desc := fmt.Sprintf(
 		"pipewiresrc fd=3 path=%d do-timestamp=true keepalive-time=1000 ! "+
 			"videoconvert ! videorate ! videoscale ! "+
-			"video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 ! "+
+			"video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1 ! "+
 			"fdsink fd=1 sync=false",
 		node, w, h, fps)
-	// Пайплайн — ОТДЕЛЬНЫМИ токенами (как в шелле): единый аргумент с пробелами
-	// gst-launch трактует как одно имя элемента → syntax error. -q гасит прогресс
-	// в stdout (туда fdsink пишет сырьё).
+	// Токенами (не единой строкой) — иначе gst-launch: syntax error. -q гасит
+	// прогресс в stdout (туда fdsink пишет сырьё).
 	return append([]string{"-q"}, strings.Fields(desc)...)
 }
 
-// waylandEncodeArgs — ffmpeg читает сырой I420 (WxH) из stdin и кодирует в
-// H264 (libx264) или VP8 (libvpx), как в X11-пути.
-func waylandEncodeArgs(opts Options, w, h, fps int) []string {
+// waylandVAAPIArgs — ffmpeg читает сырой NV12 (cw×ch) из stdin, грузит в GPU,
+// скейлит и кодирует H264 аппаратно (h264_vaapi). Почти без нагрузки на CPU.
+func waylandVAAPIArgs(cw, ch, tw, th, fps int, bitrate string) []string {
+	return []string{
+		"-hide_banner", "-loglevel", "error", "-nostats",
+		"-init_hw_device", "vaapi=va:" + renderNode(), "-filter_hw_device", "va",
+		"-f", "rawvideo", "-pixel_format", "nv12",
+		"-video_size", fmt.Sprintf("%dx%d", cw, ch),
+		"-framerate", fmt.Sprintf("%d", fps),
+		"-i", "-",
+		"-r", fmt.Sprintf("%d", fps), "-fps_mode", "cfr",
+		"-vf", fmt.Sprintf("hwupload,scale_vaapi=w=%d:h=%d", tw, th),
+		"-c:v", "h264_vaapi", "-b:v", bitrate, "-g", fmt.Sprintf("%d", fps), "-bf", "0",
+		"-f", "h264", "pipe:1",
+	}
+}
+
+// waylandSoftwareArgs — фолбэк без VAAPI: ffmpeg читает сырой NV12 (w×h) и
+// кодирует софтом (libx264 / libvpx).
+func waylandSoftwareArgs(opts Options, w, h, fps int) []string {
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostats",
-		"-f", "rawvideo", "-pixel_format", "yuv420p",
+		"-f", "rawvideo", "-pixel_format", "nv12",
 		"-video_size", fmt.Sprintf("%dx%d", w, h),
 		"-framerate", fmt.Sprintf("%d", fps),
 		"-i", "-",
