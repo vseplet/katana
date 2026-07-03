@@ -1,6 +1,9 @@
 package capture
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Codec — кодек видео. Определяет энкодер ffmpeg, формат вывода и MimeType
 // WebRTC-трека.
@@ -53,6 +56,11 @@ type Options struct {
 type Stream struct {
 	Video <-chan []byte
 	Audio <-chan []byte
+	// VideoDur — реальная длительность каждого видео-кадра, в лок-степе с Video
+	// (один элемент на кадр). Заполняет только нативный Wayland-путь (таймстампы
+	// PipeWire) для устранения джаддера. nil для остальных путей (Mac/gst/x11) —
+	// тогда потребитель берёт фиксированную 1/fps. Читать строго по кадру из Video.
+	VideoDur <-chan time.Duration
 	// SetCursor меняет видимость курсора хоста в захвате НА ЛЕТУ (без рестарта).
 	// nil для источников, где это не поддерживается (avfoundation/тест).
 	SetCursor func(show bool)

@@ -97,22 +97,25 @@ func sessionHandleOf(res map[string]dbus.Variant) string {
 // startVideoWaylandGst поднимает портал ScreenCast + gst→ffmpeg и возвращает
 // канал кадров. Это ФОЛБЭК-путь (через CPU-копию/пайп). Нативный путь на GPU
 // (libpipewire+libva, cgo) переопределяет waylandVideoFn в cgo-сборке.
-func startVideoWaylandGst(ctx context.Context, opts Options) (chan []byte, error) {
+// Возвращает nil-канал длительностей: gst-путь пейсит сам (videorate внутри
+// пайплайна), потребитель берёт фиксированную 1/fps. Реальные таймстампы — только
+// у нативного пути.
+func startVideoWaylandGst(ctx context.Context, opts Options) (chan []byte, chan time.Duration, error) {
 	gst := gstLaunchPath()
 	if gst == "" {
-		return nil, fmt.Errorf("gst-launch-1.0 не найден (нужен для Wayland-захвата)")
+		return nil, nil, fmt.Errorf("gst-launch-1.0 не найден (нужен для Wayland-захвата)")
 	}
 	// Объединённая портал-сессия (RemoteDesktop+ScreenCast) — синглтон; переживает
 	// перезапуски захвата (её же использует ввод). Здесь только берём свежий
 	// PipeWire-fd для видео; сессию/conn не закрываем.
 	ps, err := ensurePortal()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	node := ps.node
 	fd, err := ps.openPipeWire()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	pwFile := os.NewFile(uintptr(fd), "pipewire")
 
@@ -149,7 +152,7 @@ func startVideoWaylandGst(ctx context.Context, opts Options) (chan []byte, error
 	rp, wp, perr := os.Pipe()
 	if perr != nil {
 		pwFile.Close()
-		return nil, fmt.Errorf("pipe: %w", perr)
+		return nil, nil, fmt.Errorf("pipe: %w", perr)
 	}
 	gstCmd.Stdout = wp
 	ffCmd.Stdin = rp
@@ -162,14 +165,14 @@ func startVideoWaylandGst(ctx context.Context, opts Options) (chan []byte, error
 		rp.Close()
 		wp.Close()
 		pwFile.Close()
-		return nil, fmt.Errorf("ffmpeg stdout: %w", err)
+		return nil, nil, fmt.Errorf("ffmpeg stdout: %w", err)
 	}
 
 	if err := gstCmd.Start(); err != nil {
 		rp.Close()
 		wp.Close()
 		pwFile.Close()
-		return nil, fmt.Errorf("start gst: %w", err)
+		return nil, nil, fmt.Errorf("start gst: %w", err)
 	}
 	if err := ffCmd.Start(); err != nil {
 		rp.Close()
@@ -177,7 +180,7 @@ func startVideoWaylandGst(ctx context.Context, opts Options) (chan []byte, error
 		pwFile.Close()
 		_ = gstCmd.Process.Kill()
 		_ = gstCmd.Wait()
-		return nil, fmt.Errorf("start ffmpeg: %w", err)
+		return nil, nil, fmt.Errorf("start ffmpeg: %w", err)
 	}
 	// Концы пайпа и fd PipeWire держат уже дочерние процессы — в родителе закрываем.
 	rp.Close()
@@ -196,7 +199,7 @@ func startVideoWaylandGst(ctx context.Context, opts Options) (chan []byte, error
 			readIVF(ctx, in, frames, opts.DropLate)
 		}
 	}()
-	return frames, nil
+	return frames, nil, nil
 }
 
 func even(v int) int { return v - v%2 }

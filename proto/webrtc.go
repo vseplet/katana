@@ -24,12 +24,12 @@ type streamer struct {
 	track  *webrtc.TrackLocalStaticSample // видео
 	audio  *webrtc.TrackLocalStaticSample // Opus, nil если звук выключен
 
-	mu          sync.Mutex
-	cancel      context.CancelFunc // останавливает текущий захват
-	done        chan struct{}      // закрывается, когда писатели кадров вышли
-	setCursor   func(bool)         // живое переключение курсора хоста (без рестарта)
-	forceKeyFn  func()             // форс keyframe у энкодера (по PLI); nil если не поддерж.
-	setBitrate  func(kbps int)     // смена битрейта энкодера на лету; nil если не поддерж.
+	mu         sync.Mutex
+	cancel     context.CancelFunc // останавливает текущий захват
+	done       chan struct{}      // закрывается, когда писатели кадров вышли
+	setCursor  func(bool)         // живое переключение курсора хоста (без рестарта)
+	forceKeyFn func()             // форс keyframe у энкодера (по PLI); nil если не поддерж.
+	setBitrate func(kbps int)     // смена битрейта энкодера на лету; nil если не поддерж.
 }
 
 func newStreamer(parent context.Context, enc capture.CaptureEncoder, track, audio *webrtc.TrackLocalStaticSample) *streamer {
@@ -72,12 +72,21 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 	// ближайшем кейфрейме. Логируем первую ошибку, дальше молча.
 	wg.Add(1)
 	frameDur := time.Second / time.Duration(opts.FPS)
+	videoDur := stream.VideoDur // nil → все кадры фиксированной длительности 1/fps
 	go func() {
 		defer wg.Done()
 		var n int
 		var loggedErr bool
 		for frame := range stream.Video {
-			if err := s.track.WriteSample(media.Sample{Data: frame, Duration: frameDur}); err != nil {
+			// Реальная длительность кадра (нативный Wayland-путь тащит таймстампы
+			// PipeWire) — читаем в лок-степе с Video. Для остальных путей 1/fps.
+			dur := frameDur
+			if videoDur != nil {
+				if d, ok := <-videoDur; ok && d > 0 {
+					dur = d
+				}
+			}
+			if err := s.track.WriteSample(media.Sample{Data: frame, Duration: dur}); err != nil {
 				// Не выходим на транзиентной ошибке (иначе видео встанет навсегда):
 				// логируем один раз и продолжаем, восстановимся на кейфрейме.
 				if !loggedErr {

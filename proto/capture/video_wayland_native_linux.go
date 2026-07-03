@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -25,8 +26,15 @@ func init() {
 	waylandVideoFn = startVideoWaylandNative
 }
 
-// nativeCh — канал H264 access unit'ов от нативного энкодера (единственный захват).
-var nativeCh chan []byte
+// nativeFrame — H264 access unit + реальная длительность кадра (таймстамп PipeWire).
+// Данные и длительность в ОДНОЙ структуре → не рассинхронятся при дропе.
+type nativeFrame struct {
+	data []byte
+	dur  time.Duration
+}
+
+// nativeCh — канал кадров от нативного энкодера (единственный активный захват).
+var nativeCh chan nativeFrame
 
 //export goNativeLog
 func goNativeLog(msg *C.char) {
@@ -36,15 +44,15 @@ func goNativeLog(msg *C.char) {
 var nativeDrops, nativeTotal int
 
 //export goNativeH264
-func goNativeH264(data unsafe.Pointer, n C.int) {
+func goNativeH264(data unsafe.Pointer, n C.int, durNs C.longlong) {
 	ch := nativeCh
 	if ch == nil {
 		return
 	}
-	b := C.GoBytes(data, n)
+	f := nativeFrame{data: C.GoBytes(data, n), dur: time.Duration(durNs)}
 	nativeTotal++
 	select {
-	case ch <- b:
+	case ch <- f:
 	default: // канал полон — дропаем (иначе блокируем C-поток); P-кадр теряется
 		nativeDrops++
 	}
@@ -54,23 +62,23 @@ func goNativeH264(data unsafe.Pointer, n C.int) {
 }
 
 // startVideoWaylandNative — нативный захват; при ошибке инициализации откат на gst.
-func startVideoWaylandNative(ctx context.Context, opts Options) (chan []byte, error) {
-	ch, err := nativePipeWireCapture(ctx, opts)
+func startVideoWaylandNative(ctx context.Context, opts Options) (chan []byte, chan time.Duration, error) {
+	video, dur, err := nativePipeWireCapture(ctx, opts)
 	if err != nil {
 		log.Printf("capture: native wayland (%v) — fallback to gst", err)
 		return startVideoWaylandGst(ctx, opts)
 	}
-	return ch, nil
+	return video, dur, nil
 }
 
-func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, error) {
+func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, chan time.Duration, error) {
 	ps, err := ensurePortal()
 	if err != nil {
-		return nil, fmt.Errorf("portal: %w", err)
+		return nil, nil, fmt.Errorf("portal: %w", err)
 	}
 	fd, err := ps.openPipeWire()
 	if err != nil {
-		return nil, fmt.Errorf("openpipewire: %w", err)
+		return nil, nil, fmt.Errorf("openpipewire: %w", err)
 	}
 	fps := opts.FPS
 	if fps <= 0 {
@@ -92,8 +100,20 @@ func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, erro
 		th -= th % 2
 	}
 
-	frames := make(chan []byte, 8)
+	frames := make(chan nativeFrame, 8)
 	nativeCh = frames
+	// Публичные каналы: сплиттер разводит nativeFrame на Video и VideoDur строго
+	// в лок-степе (по одному элементу на кадр), потому рассинхрона не бывает.
+	videoOut := make(chan []byte, 8)
+	durOut := make(chan time.Duration, 8)
+	go func() {
+		for f := range frames {
+			videoOut <- f.data
+			durOut <- f.dur
+		}
+		close(videoOut)
+		close(durOut)
+	}()
 	cfg := C.katana_native_cfg{
 		fd:     C.int(fd),
 		node:   C.uint(ps.node),
@@ -114,5 +134,5 @@ func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, erro
 		C.katana_native_stop()
 	}()
 	log.Printf("capture: native wayland (pipewire→vaapi, %dfps %dk)", fps, kbps)
-	return frames, nil
+	return videoOut, durOut, nil
 }
