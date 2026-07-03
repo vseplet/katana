@@ -193,9 +193,34 @@ func startVideoWayland(ctx context.Context, opts Options) (chan []byte, error) {
 	return frames, nil
 }
 
-// gstPipeline строит описание gst-пайплайна: PipeWire → (скейл) → x264enc →
-// Annex-B H264. config-interval=-1 повторяет SPS/PPS перед каждым кейфреймом,
-// чтобы новый зритель декодировал (аналог dump_extra=freq=keyframe у ffmpeg).
+// gstHas — есть ли gst-элемент (проверяем через gst-inspect-1.0).
+func gstHas(el string) bool {
+	p, err := exec.LookPath("gst-inspect-1.0")
+	if err != nil {
+		return false
+	}
+	return exec.Command(p, el).Run() == nil
+}
+
+// gstEncoderChain — H264-кодер, доступный в этой сборке GStreamer, с параметрами.
+// Приоритет: аппаратный VAAPI (на AMD Deck — почти бесплатно по CPU, тянет 4K) →
+// софтовые openh264/x264. У разных кодеров разные свойства и единицы битрейта.
+func gstEncoderChain(kbps, fps int) string {
+	switch {
+	case gstHas("vah264enc"): // GStreamer VA (gst-plugins-bad), аппаратный
+		return fmt.Sprintf("vapostproc ! vah264enc bitrate=%d key-int-max=%d", kbps, fps)
+	case gstHas("vaapih264enc"): // gstreamer-vaapi, аппаратный
+		return fmt.Sprintf("vaapipostproc ! vaapih264enc rate-control=cbr bitrate=%d keyframe-period=%d", kbps, fps)
+	case gstHas("openh264enc"): // Cisco OpenH264, софтовый (bitrate в БИТ/с)
+		return fmt.Sprintf("openh264enc bitrate=%d gop-size=%d complexity=0", kbps*1000, fps)
+	default: // x264enc, софтовый
+		return fmt.Sprintf("x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d key-int-max=%d", kbps, fps)
+	}
+}
+
+// gstPipeline строит описание gst-пайплайна: PipeWire → (скейл) → H264 (доступный
+// кодер) → Annex-B H264 в stdout. h264parse config-interval=1 повторяет SPS/PPS
+// (раз в секунду), чтобы новый зритель декодировал.
 func gstPipeline(opts Options, node uint32) []string {
 	kbps := bitrateKbps(opts.Bitrate)
 	fps := opts.FPS
@@ -215,10 +240,10 @@ func gstPipeline(opts Options, node uint32) []string {
 	desc := fmt.Sprintf(
 		"pipewiresrc fd=3 path=%d do-timestamp=true keepalive-time=1000 ! "+
 			"videoconvert ! videorate ! %s%s ! "+
-			"x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d key-int-max=%d ! "+
-			"h264parse config-interval=-1 ! "+
+			"%s ! "+
+			"h264parse config-interval=1 ! "+
 			"video/x-h264,stream-format=byte-stream,alignment=au ! "+
 			"fdsink fd=1 sync=false",
-		node, scale, rawCaps, kbps, fps)
+		node, scale, rawCaps, gstEncoderChain(kbps, fps))
 	return []string{"-q", desc}
 }

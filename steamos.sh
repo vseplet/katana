@@ -26,10 +26,15 @@ if [ "$WAYLAND" = 1 ]; then
   if ! command -v gst-launch-1.0 >/dev/null 2>&1; then
     echo "warn: gst-launch-1.0 не найден — видео на Wayland не пойдёт (звук/ввод/терминал будут)."
   else
-    for el in pipewiresrc x264enc h264parse; do
-      gst-inspect-1.0 "$el" >/dev/null 2>&1 || \
-        echo "warn: нет gst-элемента '$el' — видео не пойдёт. Нужны gstreamer плагины (pipewire + x264)."
+    for el in pipewiresrc h264parse videoconvert; do
+      gst-inspect-1.0 "$el" >/dev/null 2>&1 || echo "warn: нет gst-элемента '$el' — видео не пойдёт."
     done
+    ENC=""
+    for e in vah264enc vaapih264enc openh264enc x264enc; do
+      gst-inspect-1.0 "$e" >/dev/null 2>&1 && { ENC="$e"; break; }
+    done
+    [ -n "$ENC" ] && echo "note: H264-кодер GStreamer: $ENC" \
+      || echo "warn: не найден ни один H264-кодер gst (vah264enc/vaapih264enc/openh264enc/x264enc) — видео не пойдёт."
   fi
 fi
 
