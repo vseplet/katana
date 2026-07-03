@@ -19,7 +19,9 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/src -w /src/proto archlinux:latest bash -c '
             set -e
-            pacman -Sy --noconfirm --needed base-devel go git pipewire libpipewire libva ffmpeg pkgconf
+            pacman -Sy --noconfirm archlinux-keyring
+            pacman -Su --noconfirm
+            pacman -S --noconfirm --needed base-devel go git pipewire libpipewire libva ffmpeg pkgconf
             git config --global --add safe.directory /src || true
             export CGO_CFLAGS_ALLOW=".*" CGO_LDFLAGS_ALLOW=".*"
             CGO_ENABLED=1 GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags "-s -w" -o /src/katana-linux-amd64-native .
