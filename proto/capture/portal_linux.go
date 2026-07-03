@@ -20,6 +20,10 @@ type portalSession struct {
 	obj     dbus.BusObject
 	session dbus.ObjectPath
 	node    uint32 // ScreenCast-поток (для маппинга абсолютных координат мыши)
+	// Портал работает в ЛОГИЧЕСКИХ координатах потока (с учётом HiDPI-масштаба), а
+	// зритель/SourceRect — в физических пикселях DRM. scaleX/Y = логич./физич.
+	scaleX float64
+	scaleY float64
 }
 
 var (
@@ -102,7 +106,21 @@ func openPortal() (*portalSession, error) {
 		conn.Close()
 		return nil, fmt.Errorf("нет ScreenCast-потоков: %v", err)
 	}
-	return &portalSession{conn: conn, obj: obj, session: session, node: streams[0].Node}, nil
+	ps := &portalSession{conn: conn, obj: obj, session: session, node: streams[0].Node, scaleX: 1, scaleY: 1}
+
+	// Размер потока (логические пиксели) из props["size"] = (ii). Считаем масштаб
+	// относительно физического DRM-разрешения, в котором приходят координаты мыши.
+	if v, ok := streams[0].Props["size"]; ok {
+		if arr, ok := v.Value().([]interface{}); ok && len(arr) == 2 {
+			lw, _ := arr[0].(int32)
+			lh, _ := arr[1].(int32)
+			if pw, ph := ScreenSize(); pw > 0 && ph > 0 && lw > 0 && lh > 0 {
+				ps.scaleX = float64(lw) / float64(pw)
+				ps.scaleY = float64(lh) / float64(ph)
+			}
+		}
+	}
+	return ps, nil
 }
 
 // openPipeWire открывает свежий PipeWire-fd для видео (можно звать многократно).
@@ -119,12 +137,12 @@ var noOpts = map[string]dbus.Variant{}
 
 func (p *portalSession) motionAbs(x, y float64) {
 	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyPointerMotionAbsolute", 0,
-		p.session, noOpts, p.node, x, y).Err
+		p.session, noOpts, p.node, x*p.scaleX, y*p.scaleY).Err
 }
 
 func (p *portalSession) motionRel(dx, dy float64) {
 	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyPointerMotion", 0,
-		p.session, noOpts, dx, dy).Err
+		p.session, noOpts, dx*p.scaleX, dy*p.scaleY).Err
 }
 
 func (p *portalSession) button(btn int32, down bool) {
