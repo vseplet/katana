@@ -18,22 +18,18 @@ command -v ffmpeg >/dev/null 2>&1 || echo "warn: ffmpeg не найден — н
 WAYLAND=0
 case "${XDG_SESSION_TYPE}${WAYLAND_DISPLAY}" in *wayland*) WAYLAND=1;; esac
 
-# --- Видео на Wayland: kmsgrab снимает экран с DRM-сканаута, но требует прав
-# CAP_SYS_ADMIN у ffmpeg. /usr/bin/ffmpeg на read-only rootfs патчить нельзя,
-# поэтому кладём копию в ~/.katana/bin/ffmpeg (её хост берёт приоритетно) и вешаем
-# capability на копию. Разово, нужен sudo. ---
+# --- Видео на Wayland идёт через xdg-desktop-portal (ScreenCast) + PipeWire,
+# кодируется GStreamer'ом (pipewiresrc → x264enc). Проверим наличие gst и плагинов.
+# Портал при первом запуске покажет диалог KDE «разрешить захват экрана». ---
 if [ "$WAYLAND" = 1 ]; then
-  echo "note: сессия Wayland — видео через kmsgrab (нужны права ffmpeg на DRM)"
-  KBIN="$HOME/.katana/bin"; KFF="$KBIN/ffmpeg"
-  mkdir -p "$KBIN"
-  SYS_FF="$(command -v ffmpeg || echo /usr/bin/ffmpeg)"
-  if [ ! -x "$KFF" ] || [ "$SYS_FF" -nt "$KFF" ]; then
-    cp -f "$SYS_FF" "$KFF" 2>/dev/null || echo "warn: не смог скопировать ffmpeg в $KFF"
-  fi
-  if ! getcap "$KFF" 2>/dev/null | grep -q cap_sys_admin; then
-    echo "note: выдаю ffmpeg права на DRM (sudo setcap) — иначе kmsgrab не снимет экран"
-    sudo setcap cap_sys_admin+ep "$KFF" 2>/dev/null \
-      || echo "warn: setcap не удался — видео на Wayland не пойдёт (звук/ввод/терминал будут). Выполни вручную: sudo setcap cap_sys_admin+ep \"$KFF\""
+  echo "note: сессия Wayland — видео через портал ScreenCast + GStreamer (будет диалог «разрешить захват»)"
+  if ! command -v gst-launch-1.0 >/dev/null 2>&1; then
+    echo "warn: gst-launch-1.0 не найден — видео на Wayland не пойдёт (звук/ввод/терминал будут)."
+  else
+    for el in pipewiresrc x264enc h264parse; do
+      gst-inspect-1.0 "$el" >/dev/null 2>&1 || \
+        echo "warn: нет gst-элемента '$el' — видео не пойдёт. Нужны gstreamer плагины (pipewire + x264)."
+    done
   fi
 fi
 

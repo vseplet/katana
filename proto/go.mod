@@ -9,6 +9,7 @@ require (
 	github.com/coder/websocket v1.8.12
 	github.com/creack/pty v1.1.24
 	github.com/go-vgo/robotgo v1.0.2
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/pion/interceptor v0.1.37
 	github.com/pion/rtcp v1.2.15
@@ -31,7 +32,6 @@ require (
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/gen2brain/shm v0.2.1 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
-	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jezek/xgb v1.3.0 // indirect
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a // indirect
