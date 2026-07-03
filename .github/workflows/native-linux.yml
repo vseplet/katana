@@ -32,7 +32,7 @@ jobs:
             git config --global --add safe.directory /src || true
             export CGO_CFLAGS_ALLOW=".*" CGO_LDFLAGS_ALLOW=".*"
             CGO_ENABLED=1 GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags "-s -w" -o /src/katana-linux-amd64-native .
-            file /src/katana-linux-amd64-native
+            ls -la /src/katana-linux-amd64-native
             # Бандлим ffmpeg+кодек-либы рядом с бинарём, КРОМЕ системных (glibc,
             # GPU-драйвер/дисплей, PipeWire) — те берутся с целевой машины (soname
             # стабилен). ldd даёт полное транзитивное замыкание.
