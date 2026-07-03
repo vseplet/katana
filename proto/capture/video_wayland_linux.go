@@ -239,8 +239,14 @@ var (
 )
 
 // ffmpegHasVAAPI — собран ли ffmpeg с кодером h264_vaapi (кэшируется).
+// KATANA_NO_VAAPI=1 принудительно отключает VAAPI (для сравнения с софтом libx264
+// — диагностика, кто именно бьёт картинку под движением).
 func ffmpegHasVAAPI() bool {
 	vaapiOnce.Do(func() {
+		if os.Getenv("KATANA_NO_VAAPI") != "" {
+			vaapiOK = false
+			return
+		}
 		out, err := exec.Command(FFmpegPath(), "-hide_banner", "-encoders").Output()
 		vaapiOK = err == nil && strings.Contains(string(out), "h264_vaapi")
 	})
