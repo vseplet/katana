@@ -232,15 +232,21 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
 		init_encoder(S.format.size.width, S.format.size.height);
 }
 
-// on_process (поток PipeWire): ТОЛЬКО копируем последний кадр (быстро) — энкод
-// делает таймер, чтобы PipeWire не блокировался на GPU-энкоде.
+// on_process (поток PipeWire): ТОЛЬКО копируем СВЕЖИЙ кадр (быстро) — энкод делает
+// таймер. Вычёрпываем всю очередь буферов, оставляя только последний, чтобы не
+// энкодить устаревшие (иначе окно «скачет» между старым и новым кадром).
 static void on_process(void *userdata)
 {
 	(void)userdata;
-	struct pw_buffer *b = pw_stream_dequeue_buffer(S.stream);
-	if (b == NULL)
+	struct pw_buffer *b, *last = NULL;
+	while ((b = pw_stream_dequeue_buffer(S.stream)) != NULL) {
+		if (last)
+			pw_stream_queue_buffer(S.stream, last);
+		last = b;
+	}
+	if (last == NULL)
 		return;
-	struct spa_buffer *buf = b->buffer;
+	struct spa_buffer *buf = last->buffer;
 	if (S.h > 0 && buf->n_datas > 0 && buf->datas[0].data != NULL) {
 		struct spa_data *sd = &buf->datas[0];
 		int stride = (sd->chunk && sd->chunk->stride > 0) ? sd->chunk->stride : S.w * 4;
@@ -258,7 +264,7 @@ static void on_process(void *userdata)
 		}
 		pthread_mutex_unlock(&S.mtx);
 	}
-	pw_stream_queue_buffer(S.stream, b);
+	pw_stream_queue_buffer(S.stream, last);
 }
 
 // timer_fn: энкодит ПОСЛЕДНИЙ кадр ровно на cfg_fps (CFR, как videorate). Кадр

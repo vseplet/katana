@@ -33,6 +33,8 @@ func goNativeLog(msg *C.char) {
 	log.Printf("capture: native: %s", C.GoString(msg))
 }
 
+var nativeDrops, nativeTotal int
+
 //export goNativeH264
 func goNativeH264(data unsafe.Pointer, n C.int) {
 	ch := nativeCh
@@ -40,9 +42,14 @@ func goNativeH264(data unsafe.Pointer, n C.int) {
 		return
 	}
 	b := C.GoBytes(data, n)
+	nativeTotal++
 	select {
 	case ch <- b:
-	default: // канал полон — дропаем, чтобы не блокировать C-поток PipeWire
+	default: // канал полон — дропаем (иначе блокируем C-поток); P-кадр теряется
+		nativeDrops++
+	}
+	if nativeTotal%300 == 0 && nativeDrops > 0 {
+		log.Printf("capture: native dropped %d/%d h264 frames (channel full)", nativeDrops, nativeTotal)
 	}
 }
 
