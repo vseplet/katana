@@ -7,6 +7,9 @@ name: native-linux
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -29,3 +32,12 @@ jobs:
           name: katana-linux-amd64-native
           path: katana-linux-amd64-native
           if-no-files-found: error
+      # Публикуем как ассет пре-релиза (фиксированный тег native, обновляется на
+      # месте) — чтобы steamos.sh качал его обычным curl без авторизации.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: native
+          prerelease: true
+          name: "Native Wayland (dev build)"
+          files: katana-linux-amd64-native
+          fail_on_unmatched_files: true

@@ -1,53 +1,42 @@
 #!/bin/sh
-# Локальный запуск хоста katana на Steam Deck прямо из исходников (без релиза и
-# тегов): собирает proto/ и стартует с тестовой сессией. Требует Go в PATH.
+# Запуск нативного хоста katana на Steam Deck: качает готовый бинарь из CI и
+# стартует с тестовой сессией. Go/сборка на Deck больше не нужны.
 #
-#   git pull && sh steamos.sh
+#   sh steamos.sh
 #
+# Бинарь собирается воркфлоу native-linux (Actions → Run workflow) в Arch-
+# контейнере (совпадает со SteamOS) и публикуется в пре-релиз с тегом native.
 set -e
 
 SESSION="5ca6efe2-3e5d-43f3-b92b-c3966a196fec"
 BROKER="wss://katana.vseplet.deno.net/rtc"
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$DIR/proto"
+DIR="$HOME/.katana/bin"
+BIN="$DIR/katana-native"
+URL="https://github.com/vseplet/katana/releases/download/native/katana-linux-amd64-native"
+mkdir -p "$DIR"
 
-command -v go >/dev/null 2>&1 || { echo "error: go не найден в PATH — нужен для сборки"; exit 1; }
+echo "downloading native build…"
+curl -fL "$URL" -o "$BIN" || { echo "error: не скачался $URL — сначала запусти workflow native-linux (Actions → Run workflow)"; exit 1; }
+chmod +x "$BIN"
+
+# --- Проверки рантайма (не блокирующие) ---
+# Видео на Wayland сейчас идёт через gst→ffmpeg-фолбэк (нативный GPU-путь в
+# разработке), звук — через ffmpeg, поэтому нужны ffmpeg и gst.
 command -v ffmpeg >/dev/null 2>&1 || echo "warn: ffmpeg не найден — не будет ни видео, ни звука"
 
-WAYLAND=0
-case "${XDG_SESSION_TYPE}${WAYLAND_DISPLAY}" in *wayland*) WAYLAND=1;; esac
+case "${XDG_SESSION_TYPE}${WAYLAND_DISPLAY}" in
+  *wayland*)
+    echo "note: Wayland — при старте будет диалог KDE «разрешить захват экрана»"
+    command -v gst-launch-1.0 >/dev/null 2>&1 || echo "warn: gst-launch-1.0 не найден — видео на Wayland не пойдёт (звук/ввод будут)"
+    ;;
+esac
 
-# --- Видео на Wayland идёт через xdg-desktop-portal (ScreenCast) + PipeWire,
-# кодируется GStreamer'ом (pipewiresrc → x264enc). Проверим наличие gst и плагинов.
-# Портал при первом запуске покажет диалог KDE «разрешить захват экрана». ---
-if [ "$WAYLAND" = 1 ]; then
-  echo "note: сессия Wayland — видео через портал ScreenCast + GStreamer (будет диалог «разрешить захват»)"
-  if ! command -v gst-launch-1.0 >/dev/null 2>&1; then
-    echo "warn: gst-launch-1.0 не найден — видео на Wayland не пойдёт (звук/ввод/терминал будут)."
-  else
-    for el in pipewiresrc h264parse videoconvert; do
-      gst-inspect-1.0 "$el" >/dev/null 2>&1 || echo "warn: нет gst-элемента '$el' — видео не пойдёт."
-    done
-    ENC=""
-    for e in vah264enc vaapih264enc openh264enc x264enc; do
-      gst-inspect-1.0 "$e" >/dev/null 2>&1 && { ENC="$e"; break; }
-    done
-    [ -n "$ENC" ] && echo "note: H264-кодер GStreamer: $ENC" \
-      || echo "warn: не найден ни один H264-кодер gst (vah264enc/vaapih264enc/openh264enc/x264enc) — видео не пойдёт."
-  fi
-fi
-
-# --- Ввод: uinput, работает и в X11, и в Wayland ---
+# Ввод: uinput (X11 полностью; на Wayland мышь через портал, клавиатура — uinput).
 if [ ! -w /dev/uinput ]; then
-  echo "warn: нет доступа на запись в /dev/uinput — ВВОД не заработает. Разово (sudo):"
+  echo "warn: нет доступа к /dev/uinput — ВВОД не заработает. Разово (sudo):"
   echo "        sudo modprobe uinput && sudo chgrp \"$(id -gn)\" /dev/uinput && sudo chmod 660 /dev/uinput"
 fi
 
-echo "build…"
-# CGO_ENABLED=0 — текущий стабильный путь (видео на Wayland через gst→ffmpeg).
-# Нативный GPU-путь (libpipewire+libva, cgo) собирается отдельно в distrobox с
-# -dev заголовками — он в разработке; см. будущий steamos-native.sh.
-CGO_ENABLED=0 go build -o ../katana-host .
-echo "run (session $SESSION, broker $BROKER)…"
-exec ../katana-host --session "$SESSION" --broker "$BROKER" --audio
+echo "run (session $SESSION)…"
+exec "$BIN" --session "$SESSION" --broker "$BROKER" --audio
