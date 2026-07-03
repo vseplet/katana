@@ -1,13 +1,14 @@
 //go:build linux
 
-// Инъекция ввода на Linux через uinput (/dev/uinput) — работает и в X11, и в
-// Wayland (эмулирует устройство на уровне ядра, до дисплей-сервера; XTEST на
-// Wayland мёртв). Указатель эмулируется как ПЛАНШЕТ С ПЕРОМ (ABS_X/Y + перо в
-// proximity + INPUT_PROP_POINTER): libinput/KWin принимают его как абсолютный
-// указатель и двигают курсор в пиксель экрана. Клавиатура — отдельное устройство.
+// Инъекция ввода на Linux через uinput (/dev/uinput) — работает в X11 и Wayland
+// (эмулирует устройство на уровне ядра, до дисплей-сервера). Указатель — ОТНО-
+// СИТЕЛЬНАЯ мышь (KWin/libinput в Wayland двигают курсор от неё, в отличие от
+// абсолютных ABS/tablet-устройств, которые композитор игнорирует). Позицию курсора
+// ведём сами: при старте «приземляем» его в угол (0,0), дальше двигаем дельтами.
+// Клавиатура — отдельное устройство.
 //
-// Ограничения: клавиатура шлёт скан-коды (символ зависит от раскладки, ок для US/
-// ASCII). Клики пера: тип-нажатие = левая, стилус = правая, стилус2 = средняя.
+// Ограничение: из-за ускорения указателя libinput абсолютное позиционирование
+// может слегка «уплывать» на резких движениях. Точный путь — портал RemoteDesktop.
 package main
 
 import (
@@ -23,36 +24,27 @@ import (
 
 // --- uinput ioctl / event константы (linux/uinput.h, input-event-codes.h) ---
 const (
-	uiSetEvbit   = 0x40045564 // _IOW('U', 100, int)
-	uiSetKeybit  = 0x40045565
-	uiSetRelbit  = 0x40045566
-	uiSetAbsbit  = 0x40045567
-	uiSetPropbit = 0x4004556e // _IOW('U', 110, int)
-	uiDevCreate  = 0x5501     // _IO('U', 1)
-	uiDevDstry   = 0x5502
+	uiSetEvbit  = 0x40045564 // _IOW('U', 100, int)
+	uiSetKeybit = 0x40045565
+	uiSetRelbit = 0x40045566
+	uiDevCreate = 0x5501 // _IO('U', 1)
+	uiDevDstry  = 0x5502
 
 	evSyn = 0x00
 	evKey = 0x01
 	evRel = 0x02
-	evAbs = 0x03
 
-	synReport   = 0x00
-	absX        = 0x00
-	absY        = 0x01
-	absPressure = 0x18
-	relWheel    = 0x08
-	relHWheel   = 0x06
+	synReport = 0x00
+	relX      = 0x00
+	relY      = 0x01
+	relHWheel = 0x06
+	relWheel  = 0x08
 
-	btnLeft    = 0x110
-	btnRight   = 0x111
-	btnMiddle  = 0x112
-	btnToolPen = 0x140
-	btnTouch   = 0x14a
-	btnStylus  = 0x14b
-	btnStylus2 = 0x14c
+	btnLeft   = 0x110
+	btnRight  = 0x111
+	btnMiddle = 0x112
 
-	inputPropPointer = 0x00 // INPUT_PROP_POINTER — курсор следует за ABS (не touchscreen)
-	absCnt           = 0x40 // ABS_CNT
+	absCnt = 0x40 // ABS_CNT (для размера uinput_user_dev)
 )
 
 // inputDev — один виртуальный uinput-девайс.
@@ -76,9 +68,8 @@ func ioctl(f *os.File, req uintptr, arg uintptr) error {
 	return nil
 }
 
-// createUinput открывает /dev/uinput, включает события/оси/свойства и создаёт
-// устройство. abs — карта ось→максимум (пусто = без абсолютных осей/колеса).
-func createUinput(name string, keys []int, abs map[int]int, props []int) (*inputDev, error) {
+// createUinput открывает /dev/uinput, включает события/оси и создаёт устройство.
+func createUinput(name string, keys []int, rel []int) (*inputDev, error) {
 	f, err := os.OpenFile("/dev/uinput", os.O_WRONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
@@ -92,35 +83,24 @@ func createUinput(name string, keys []int, abs map[int]int, props []int) (*input
 	for _, k := range keys {
 		must(uiSetKeybit, k)
 	}
-	for _, p := range props {
-		must(uiSetPropbit, p)
-	}
-	if len(abs) > 0 {
-		must(uiSetEvbit, evAbs)
-		for code := range abs {
-			must(uiSetAbsbit, code)
-		}
+	if len(rel) > 0 {
 		must(uiSetEvbit, evRel)
-		must(uiSetRelbit, relWheel)
-		must(uiSetRelbit, relHWheel)
+		for _, r := range rel {
+			must(uiSetRelbit, r)
+		}
 	}
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
 
-	// uinput_user_dev: name[80] + input_id(8) + ff_effects_max(4) +
-	// absmax[64]+absmin[64]+absfuzz[64]+absflat[64] (по s32).
+	// uinput_user_dev: name[80] + input_id(8) + ff_effects_max(4) + abs-массивы.
 	buf := make([]byte, 80+8+4+absCnt*4*4)
 	copy(buf[:80], name)
 	binary.LittleEndian.PutUint16(buf[80:], 0x03) // BUS_USB
 	binary.LittleEndian.PutUint16(buf[82:], 0x1)  // vendor
 	binary.LittleEndian.PutUint16(buf[84:], 0x1)  // product
 	binary.LittleEndian.PutUint16(buf[86:], 0x1)  // version
-	absmax := 80 + 8 + 4                          // начало absmax[]
-	for code, max := range abs {
-		binary.LittleEndian.PutUint32(buf[absmax+code*4:], uint32(max))
-	}
 	if _, werr := f.Write(buf); werr != nil {
 		f.Close()
 		return nil, werr
@@ -140,7 +120,7 @@ func (d *inputDev) close() {
 	_ = d.f.Close()
 }
 
-// --- Состояние: планшет-указатель + клавиатура + позиция курсора ---
+// --- Состояние: относительная мышь + клавиатура + позиция курсора ---
 var (
 	inMu     sync.Mutex
 	ptr      *inputDev
@@ -153,8 +133,7 @@ var (
 	inputOK  bool
 )
 
-// ensureInput лениво поднимает uinput-девайсы при первом событии ввода. Ошибка
-// (нет прав на /dev/uinput) логируется, дальше ввод — no-op.
+// ensureInput лениво поднимает uinput-девайсы при первом событии ввода.
 func ensureInput() bool {
 	inMu.Lock()
 	defer inMu.Unlock()
@@ -167,18 +146,14 @@ func ensureInput() bool {
 	if scrW <= 0 || scrH <= 0 {
 		scrW, scrH = 1920, 1080
 	}
-	curX, curY = scrW/2, scrH/2
 
-	// Планшет-перо: ABS X/Y (пиксели экрана) + pressure, кнопки пера, свойство
-	// «указатель». Так libinput ведёт курсор за абсолютной позицией и в Wayland.
-	abs := map[int]int{absX: scrW - 1, absY: scrH - 1, absPressure: 1023}
-	keys := []int{btnLeft, btnRight, btnMiddle, btnToolPen, btnTouch, btnStylus, btnStylus2}
-	p, err := createUinput("katana-pointer", keys, abs, []int{inputPropPointer})
+	p, err := createUinput("katana-pointer",
+		[]int{btnLeft, btnRight, btnMiddle}, []int{relX, relY, relWheel, relHWheel})
 	if err != nil {
 		log.Printf("input: uinput pointer: %v (input disabled; need rw on /dev/uinput)", err)
 		return false
 	}
-	k, err := createUinput("katana-keyboard", allKeycodes(), nil, nil)
+	k, err := createUinput("katana-keyboard", allKeycodes(), nil)
 	if err != nil {
 		log.Printf("input: uinput keyboard: %v (input disabled)", err)
 		p.close()
@@ -186,14 +161,16 @@ func ensureInput() bool {
 	}
 	ptr, kbd = p, k
 
-	// Перо «в зоне» (proximity) + стартовая позиция → курсор появляется и следует.
-	ptr.emit(evKey, btnToolPen, 1)
-	ptr.emit(evAbs, absX, int32(curX))
-	ptr.emit(evAbs, absY, int32(curY))
+	// «Приземляем» курсор в левый-верхний угол: относительное устройство не знает
+	// реальной позиции, поэтому слэмим в (0,0) (композитор клампит), синхронизируя
+	// нашу модель. Дальше абсолютные координаты зрителя двигаем дельтами.
+	ptr.emit(evRel, relX, int32(-scrW*2))
+	ptr.emit(evRel, relY, int32(-scrH*2))
 	ptr.syn()
+	curX, curY = 0, 0
 
 	inputOK = true
-	log.Printf("input: uinput ready (%dx%d, pen-tablet)", scrW, scrH)
+	log.Printf("input: uinput ready (%dx%d, relative)", scrW, scrH)
 	return true
 }
 
@@ -217,15 +194,14 @@ func clampScr(v, hi int) int {
 	return v
 }
 
-// tabletBtn — кнопка зрителя → кнопка пера: левая=тип, правая=стилус, средняя=стилус2.
-func tabletBtn(button string) uint16 {
+func btnCode(button string) uint16 {
 	switch button {
 	case "right":
-		return btnStylus
+		return btnRight
 	case "center", "middle":
-		return btnStylus2
+		return btnMiddle
 	default:
-		return btnTouch
+		return btnLeft
 	}
 }
 
@@ -237,10 +213,11 @@ func moveMouse(x, y int) {
 	}
 	inMu.Lock()
 	defer inMu.Unlock()
-	curX, curY = clampScr(x, scrW), clampScr(y, scrH)
-	ptr.emit(evAbs, absX, int32(curX))
-	ptr.emit(evAbs, absY, int32(curY))
+	nx, ny := clampScr(x, scrW), clampScr(y, scrH)
+	ptr.emit(evRel, relX, int32(nx-curX))
+	ptr.emit(evRel, relY, int32(ny-curY))
 	ptr.syn()
+	curX, curY = nx, ny
 }
 
 func mouseLocation() (int, int) {
@@ -259,25 +236,22 @@ func mouseToggle(button string, down bool) {
 	if down {
 		v = 1
 	}
-	btn := tabletBtn(button)
-	if btn == btnTouch { // левая = касание пером: даём давление, иначе клик может не сработать
-		if down {
-			ptr.emit(evAbs, absPressure, 1023)
-		} else {
-			ptr.emit(evAbs, absPressure, 0)
-		}
-	}
-	ptr.emit(evKey, btn, v)
+	ptr.emit(evKey, btnCode(button), v)
 	ptr.syn()
 }
 
-func dragMouse(x, y int, button string) { moveMouse(x, y) } // кнопка/касание уже активно
+func dragMouse(x, y int, button string) { moveMouse(x, y) } // кнопка уже зажата
 
 func moveRel(dx, dy int) {
+	if !ensureInput() {
+		return
+	}
 	inMu.Lock()
-	x, y := curX+dx, curY+dy
-	inMu.Unlock()
-	moveMouse(x, y)
+	defer inMu.Unlock()
+	ptr.emit(evRel, relX, int32(dx))
+	ptr.emit(evRel, relY, int32(dy))
+	ptr.syn()
+	curX, curY = clampScr(curX+dx, scrW), clampScr(curY+dy, scrH)
 }
 
 func clickMouse(button string) {
@@ -290,7 +264,7 @@ func doubleClick(button string) {
 	clickMouse(button)
 }
 
-func dragRel(dx, dy int, button string) { moveRel(dx, dy) }
+func dragRel(dx, dy int, button string) { moveRel(dx, dy) } // кнопка уже зажата
 
 func scrollMouse(dx, dy int) {
 	if !ensureInput() {
@@ -359,7 +333,7 @@ func typeText(s string) {
 	for _, r := range s {
 		code, shift, ok := runeCode(r)
 		if !ok {
-			continue // символ вне текущей раскладки — пропускаем (v1)
+			continue
 		}
 		if shift {
 			kbd.emit(evKey, keyLeftShift, 1)
