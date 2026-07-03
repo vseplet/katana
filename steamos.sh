@@ -45,6 +45,9 @@ if [ ! -w /dev/uinput ]; then
 fi
 
 echo "build…"
-go build -o ../katana-host .
+# CGO_ENABLED=0 — текущий стабильный путь (видео на Wayland через gst→ffmpeg).
+# Нативный GPU-путь (libpipewire+libva, cgo) собирается отдельно в distrobox с
+# -dev заголовками — он в разработке; см. будущий steamos-native.sh.
+CGO_ENABLED=0 go build -o ../katana-host .
 echo "run (session $SESSION, broker $BROKER)…"
 exec ../katana-host --session "$SESSION" --broker "$BROKER" --audio

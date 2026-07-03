@@ -84,6 +84,11 @@ func gstLaunchPath() string {
 	return ""
 }
 
+// waylandVideoFn — функция захвата видео на Wayland. По умолчанию — gst→ffmpeg
+// (через CPU/пайп). В cgo-сборке init() в video_wayland_native_linux.go
+// переопределяет её на нативный путь (libpipewire+libva, кадр на GPU).
+var waylandVideoFn = startVideoWaylandGst
+
 // NewEncoder на Linux: ffmpeg/gst-энкодер, если доступно видео ИЛИ звук; иначе
 // headless-заглушка (только терминал).
 func NewEncoder() CaptureEncoder {
@@ -115,7 +120,7 @@ func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) 
 			video = v
 		}
 	case "wayland":
-		v, err := startVideoWayland(ctx, opts)
+		v, err := waylandVideoFn(ctx, opts)
 		if err != nil {
 			log.Printf("capture: video (wayland/portal): %v (continuing without video)", err)
 			video = closedChan()
