@@ -15,20 +15,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build (cgo, Arch container — matches SteamOS libs)
+      - name: Build (cgo, Arch pinned to ffmpeg 7.1 — matches SteamOS soname .10)
         run: |
           docker run --rm -v "$PWD":/src -w /src/proto archlinux:latest bash -c '
             set -e
-            pacman -Sy --noconfirm --needed base-devel go git pipewire libpipewire libva ffmpeg pkgconf
-            echo "=== headers ==="
-            pkg-config --exists libpipewire-0.3 libva libavcodec && echo "HEADERS OK" || { echo "MISSING HEADERS"; exit 1; }
-            echo "=== build ==="
+            # Пиним весь Arch на архивный снапшот с ffmpeg 7.1 (libavfilter.so.10,
+            # как на SteamOS n7.1.1) + сопоставимый glibc. Иначе Arch-latest даёт
+            # ffmpeg 8 (.so.11) и бинарь не находит либы на Deck.
+            SNAP=2024/11/15
+            printf "Server=https://archive.archlinux.org/repos/%s/\$repo/os/\$arch\n" "$SNAP" > /etc/pacman.d/mirrorlist
+            pacman -Syyuu --noconfirm
+            pacman -S --noconfirm --needed base-devel git pipewire libpipewire libva ffmpeg pkgconf curl
+            echo "=== versions ==="; pacman -Q ffmpeg glibc; ls -1 /usr/lib/libavfilter.so.*
+            # Go — свежий из тарбола (в снапшоте старый, а go.mod требует 1.25).
+            curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz
+            export PATH=/usr/local/go/bin:$PATH
             git config --global --add safe.directory /src || true
-            # Arch подсовывает hardening-флаги через pkg-config (-fno-strict-overflow
-            # и т.п.), а cgo их по умолчанию блокирует — разрешаем все.
+            # Arch подсовывает hardening-флаги через pkg-config — разрешаем cgo все.
             export CGO_CFLAGS_ALLOW=".*" CGO_LDFLAGS_ALLOW=".*"
             CGO_ENABLED=1 GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags "-s -w" -o ../katana-linux-amd64-native .
             file ../katana-linux-amd64-native
+            echo "=== runtime deps ==="; ldd ../katana-linux-amd64-native | grep -iE "libav|libsw|pipewire|libva" || true
           '
       - uses: actions/upload-artifact@v4
         with:
