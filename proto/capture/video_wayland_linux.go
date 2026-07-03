@@ -252,7 +252,7 @@ func ffmpegHasVAAPI() bool {
 func gstNV12Pipeline(node uint32, w, h, fps int) []string {
 	desc := fmt.Sprintf(
 		"pipewiresrc fd=3 path=%d do-timestamp=true keepalive-time=1000 ! "+
-			"videoconvert ! videorate ! videoscale ! "+
+			"videorate ! videoconvert n-threads=0 ! videoscale n-threads=0 ! "+
 			"video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1 ! "+
 			"fdsink fd=1 sync=false",
 		node, w, h, fps)
