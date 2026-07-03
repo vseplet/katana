@@ -17,17 +17,25 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
 
-// VideoAvailable — можно ли захватывать экран: нужен X11-дисплей ($DISPLAY) и
-// найденный ffmpeg. На headless-сервере (нет графики) — false, и хост поднимется
-// только с терминалом. Реального кадра это не гарантирует (иксы могут не пустить)
-// — тогда ffmpeg отвалится и видео-канал закроется, терминал продолжит работать.
+// VideoAvailable — можно ли захватывать экран через x11grab: нужен X11-дисплей
+// ($DISPLAY) и ffmpeg. Wayland-сессию исключаем: x11grab видит только пустой root
+// Xwayland (реальный композит недоступен) → был бы зелёный экран; для Wayland
+// нужен отдельный бэкенд (kmsgrab/portal, позже). Headless (нет графики) — false,
+// хост поднимется только с терминалом.
 func VideoAvailable() bool {
-	return os.Getenv("DISPLAY") != "" && FFmpegPath() != ""
+	if FFmpegPath() == "" {
+		return false
+	}
+	if os.Getenv("WAYLAND_DISPLAY") != "" || strings.EqualFold(os.Getenv("XDG_SESSION_TYPE"), "wayland") {
+		return false
+	}
+	return os.Getenv("DISPLAY") != ""
 }
 
 // AudioAvailable — доступен ли системный звук: PulseAudio (или PipeWire-pulse) и
@@ -96,7 +104,9 @@ func buildLinuxArgs(opts Options, audio bool) ([]string, bool) {
 		)
 	}
 	if audio {
-		args = append(args, "-f", "pulse", "-i", "default")
+		// @DEFAULT_MONITOR@ = монитор дефолтного sink (СИСТЕМНЫЙ вывод), а не
+		// микрофон (-i default брал бы источник по умолчанию = вход/шум).
+		args = append(args, "-f", "pulse", "-i", "@DEFAULT_MONITOR@")
 		args = append(args, "-map", "0:v")
 	}
 	args = append(args, linuxVideoOut(opts)...)
@@ -252,9 +262,66 @@ func readOggOpus(ctx context.Context, r io.Reader, out chan []byte) {
 	}
 }
 
-// Источники/ввод на Linux пока не реализованы (нет перечисления окон и инъекции
-// скролла) — заглушки, симметрично stub_other.go для прочих платформ.
-func ListSources() (Sources, error)            { return Sources{}, nil }
-func ActivateApp(_ int) error                  { return nil }
-func InjectScroll(_, _ int)                    {}
-func SourceRect(_ string, _ int) (Rect, error) { return Rect{}, nil }
+// Перечисление окон/приложений на Linux не реализовано (захват — весь экран).
+func ListSources() (Sources, error) { return Sources{}, nil }
+func ActivateApp(_ int) error       { return nil }
+func InjectScroll(_, _ int)         {} // скролл на Linux идёт через uinput (input_linux.go)
+
+// SourceRect на Linux — весь экран (x11grab снимает root целиком). Нужен для
+// маппинга нормализованных координат мыши зрителя в пиксели (см. handleMouse).
+func SourceRect(_ string, _ int) (Rect, error) {
+	w, h := ScreenSize()
+	if w <= 0 || h <= 0 {
+		return Rect{}, nil
+	}
+	return Rect{X: 0, Y: 0, W: float64(w), H: float64(h)}, nil
+}
+
+// ScreenSize определяет разрешение подключённого дисплея из DRM sysfs
+// (/sys/class/drm/<connector>/{status,modes}) — работает и в X11, и в Wayland,
+// без зависимости от дисплей-сервера. 0,0 если не удалось.
+func ScreenSize() (int, int) {
+	entries, err := os.ReadDir("/sys/class/drm")
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.Contains(name, "-") { // коннекторы: card0-HDMI-A-1 и т.п.
+			continue
+		}
+		st, err := os.ReadFile(filepath.Join("/sys/class/drm", name, "status"))
+		if err != nil || strings.TrimSpace(string(st)) != "connected" {
+			continue
+		}
+		modes, err := os.ReadFile(filepath.Join("/sys/class/drm", name, "modes"))
+		if err != nil {
+			continue
+		}
+		first := strings.SplitN(strings.TrimSpace(string(modes)), "\n", 2)[0]
+		if w, h, ok := parseMode(first); ok {
+			return w, h
+		}
+	}
+	return 0, 0
+}
+
+// parseMode разбирает строку режима вида "3840x2160" (возможен суффикс, напр. "i").
+func parseMode(s string) (int, int, bool) {
+	s = strings.TrimSpace(s)
+	i := strings.IndexByte(s, 'x')
+	if i <= 0 {
+		return 0, 0, false
+	}
+	w, err1 := strconv.Atoi(s[:i])
+	rest := s[i+1:]
+	j := 0
+	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+		j++
+	}
+	h, err2 := strconv.Atoi(rest[:j])
+	if err1 != nil || err2 != nil || w <= 0 || h <= 0 {
+		return 0, 0, false
+	}
+	return w, h, true
+}
