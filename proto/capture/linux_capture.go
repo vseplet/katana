@@ -30,6 +30,9 @@ func isWayland() bool {
 		strings.EqualFold(os.Getenv("XDG_SESSION_TYPE"), "wayland")
 }
 
+// IsWaylandSession — Wayland-сессия (ввод идёт через портал, а не uinput).
+func IsWaylandSession() bool { return isWayland() }
+
 // videoBackend — какой бэкенд видео использовать:
 //
 //	"wayland" — Wayland-сессия: портал ScreenCast + PipeWire (нужен gst-launch);

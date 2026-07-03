@@ -100,60 +100,17 @@ func startVideoWayland(ctx context.Context, opts Options) (chan []byte, error) {
 	if gst == "" {
 		return nil, fmt.Errorf("gst-launch-1.0 не найден (нужен для Wayland-захвата)")
 	}
-	conn, err := dbus.ConnectSessionBus()
+	// Объединённая портал-сессия (RemoteDesktop+ScreenCast) — синглтон; переживает
+	// перезапуски захвата (её же использует ввод). Здесь только берём свежий
+	// PipeWire-fd для видео; сессию/conn не закрываем.
+	ps, err := ensurePortal()
 	if err != nil {
-		return nil, fmt.Errorf("session bus: %w", err)
-	}
-	obj := conn.Object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
-
-	// 1) CreateSession
-	res, err := portalRequest(conn, obj, "org.freedesktop.portal.ScreenCast.CreateSession",
-		map[string]dbus.Variant{"session_handle_token": dbus.MakeVariant(newHandleToken())})
-	if err != nil {
-		conn.Close()
 		return nil, err
 	}
-	sh := sessionHandleOf(res)
-	if sh == "" {
-		conn.Close()
-		return nil, fmt.Errorf("портал не вернул session_handle")
-	}
-	session := dbus.ObjectPath(sh)
-
-	// 2) SelectSources: монитор целиком, курсор в кадре
-	if _, err := portalRequest(conn, obj, "org.freedesktop.portal.ScreenCast.SelectSources",
-		map[string]dbus.Variant{
-			"types":       dbus.MakeVariant(uint32(1)), // MONITOR
-			"cursor_mode": dbus.MakeVariant(uint32(2)), // EMBEDDED — курсор в видео
-			"multiple":    dbus.MakeVariant(false),
-		}, session); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	// 3) Start → streams (node id PipeWire). Тут KDE показывает диалог разрешения.
-	res, err = portalRequest(conn, obj, "org.freedesktop.portal.ScreenCast.Start",
-		map[string]dbus.Variant{}, session, "")
+	node := ps.node
+	fd, err := ps.openPipeWire()
 	if err != nil {
-		conn.Close()
 		return nil, err
-	}
-	var streams []struct {
-		Node  uint32
-		Props map[string]dbus.Variant
-	}
-	if err := dbus.Store([]interface{}{res["streams"].Value()}, &streams); err != nil || len(streams) == 0 {
-		conn.Close()
-		return nil, fmt.Errorf("нет ScreenCast-потоков: %v", err)
-	}
-	node := streams[0].Node
-
-	// 4) OpenPipeWireRemote → fd (обычный вызов, fd в ответе)
-	var fd dbus.UnixFD
-	if err := obj.Call("org.freedesktop.portal.ScreenCast.OpenPipeWireRemote", 0,
-		session, map[string]dbus.Variant{}).Store(&fd); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("OpenPipeWireRemote: %w", err)
 	}
 	pwFile := os.NewFile(uintptr(fd), "pipewire")
 
@@ -190,7 +147,6 @@ func startVideoWayland(ctx context.Context, opts Options) (chan []byte, error) {
 	rp, wp, perr := os.Pipe()
 	if perr != nil {
 		pwFile.Close()
-		conn.Close()
 		return nil, fmt.Errorf("pipe: %w", perr)
 	}
 	gstCmd.Stdout = wp
@@ -204,7 +160,6 @@ func startVideoWayland(ctx context.Context, opts Options) (chan []byte, error) {
 		rp.Close()
 		wp.Close()
 		pwFile.Close()
-		conn.Close()
 		return nil, fmt.Errorf("ffmpeg stdout: %w", err)
 	}
 
@@ -212,7 +167,6 @@ func startVideoWayland(ctx context.Context, opts Options) (chan []byte, error) {
 		rp.Close()
 		wp.Close()
 		pwFile.Close()
-		conn.Close()
 		return nil, fmt.Errorf("start gst: %w", err)
 	}
 	if err := ffCmd.Start(); err != nil {
@@ -221,7 +175,6 @@ func startVideoWayland(ctx context.Context, opts Options) (chan []byte, error) {
 		pwFile.Close()
 		_ = gstCmd.Process.Kill()
 		_ = gstCmd.Wait()
-		conn.Close()
 		return nil, fmt.Errorf("start ffmpeg: %w", err)
 	}
 	// Концы пайпа и fd PipeWire держат уже дочерние процессы — в родителе закрываем.
@@ -232,7 +185,6 @@ func startVideoWayland(ctx context.Context, opts Options) (chan []byte, error) {
 	frames := make(chan []byte, 4)
 	go func() {
 		defer close(frames)
-		defer conn.Close()
 		defer waitKill(gstCmd, "video-grab")
 		defer waitKill(ffCmd, "video-encode")
 		in := bufio.NewReader(ffOut)

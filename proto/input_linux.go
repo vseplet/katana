@@ -133,7 +133,12 @@ var (
 	inputOK  bool
 )
 
-// ensureInput лениво поднимает uinput-девайсы при первом событии ввода.
+// onWayland — ввод мыши идёт через портал RemoteDesktop (абсолютные координаты
+// через композитор), а не через uinput. Клавиатура на обеих сессиях — uinput.
+func onWayland() bool { return capture.IsWaylandSession() }
+
+// ensureInput лениво поднимает uinput-девайсы при первом событии ввода. На Wayland
+// поднимает ТОЛЬКО клавиатуру (мышь — через портал); на X11 — мышь+клавиатуру.
 func ensureInput() bool {
 	inMu.Lock()
 	defer inMu.Unlock()
@@ -147,30 +152,38 @@ func ensureInput() bool {
 		scrW, scrH = 1920, 1080
 	}
 
-	p, err := createUinput("katana-pointer",
-		[]int{btnLeft, btnRight, btnMiddle}, []int{relX, relY, relWheel, relHWheel})
-	if err != nil {
-		log.Printf("input: uinput pointer: %v (input disabled; need rw on /dev/uinput)", err)
-		return false
+	if !onWayland() {
+		p, err := createUinput("katana-pointer",
+			[]int{btnLeft, btnRight, btnMiddle}, []int{relX, relY, relWheel, relHWheel})
+		if err != nil {
+			log.Printf("input: uinput pointer: %v (input disabled; need rw on /dev/uinput)", err)
+			return false
+		}
+		ptr = p
+		// «Приземляем» курсор в угол (0,0) — относительное устройство не знает
+		// реальной позиции, слэмим в левый-верх, синхронизируя нашу модель.
+		ptr.emit(evRel, relX, int32(-scrW*2))
+		ptr.emit(evRel, relY, int32(-scrH*2))
+		ptr.syn()
+		curX, curY = 0, 0
 	}
+
 	k, err := createUinput("katana-keyboard", allKeycodes(), nil)
 	if err != nil {
 		log.Printf("input: uinput keyboard: %v (input disabled)", err)
-		p.close()
+		if ptr != nil {
+			ptr.close()
+		}
 		return false
 	}
-	ptr, kbd = p, k
-
-	// «Приземляем» курсор в левый-верхний угол: относительное устройство не знает
-	// реальной позиции, поэтому слэмим в (0,0) (композитор клампит), синхронизируя
-	// нашу модель. Дальше абсолютные координаты зрителя двигаем дельтами.
-	ptr.emit(evRel, relX, int32(-scrW*2))
-	ptr.emit(evRel, relY, int32(-scrH*2))
-	ptr.syn()
-	curX, curY = 0, 0
+	kbd = k
 
 	inputOK = true
-	log.Printf("input: uinput ready (%dx%d, relative)", scrW, scrH)
+	if onWayland() {
+		log.Printf("input: keyboard=uinput, mouse=portal (Wayland, %dx%d)", scrW, scrH)
+	} else {
+		log.Printf("input: uinput ready (%dx%d, relative)", scrW, scrH)
+	}
 	return true
 }
 
@@ -208,6 +221,13 @@ func btnCode(button string) uint16 {
 // --- Публичный API (сигнатуры совпадают с input_darwin.go / input_other.go) ---
 
 func moveMouse(x, y int) {
+	if onWayland() {
+		capture.PortalPointerMotion(float64(x), float64(y)) // абсолют через композитор
+		inMu.Lock()
+		curX, curY = x, y
+		inMu.Unlock()
+		return
+	}
 	if !ensureInput() {
 		return
 	}
@@ -227,6 +247,10 @@ func mouseLocation() (int, int) {
 }
 
 func mouseToggle(button string, down bool) {
+	if onWayland() {
+		capture.PortalPointerButton(int32(btnCode(button)), down)
+		return
+	}
 	if !ensureInput() {
 		return
 	}
@@ -243,6 +267,13 @@ func mouseToggle(button string, down bool) {
 func dragMouse(x, y int, button string) { moveMouse(x, y) } // кнопка уже зажата
 
 func moveRel(dx, dy int) {
+	if onWayland() {
+		capture.PortalPointerMotionRel(float64(dx), float64(dy))
+		inMu.Lock()
+		curX, curY = clampScr(curX+dx, scrW), clampScr(curY+dy, scrH)
+		inMu.Unlock()
+		return
+	}
 	if !ensureInput() {
 		return
 	}
@@ -267,6 +298,11 @@ func doubleClick(button string) {
 func dragRel(dx, dy int, button string) { moveRel(dx, dy) } // кнопка уже зажата
 
 func scrollMouse(dx, dy int) {
+	if onWayland() {
+		// Портал принимает пиксельную прокрутку (dy>0 = вниз, как у зрителя).
+		capture.PortalPointerAxis(float64(dx), float64(dy))
+		return
+	}
 	if !ensureInput() {
 		return
 	}
