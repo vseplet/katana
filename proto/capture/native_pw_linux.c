@@ -195,7 +195,10 @@ static void drain_packets(void)
 }
 
 // encode_bgrx: BGRx (CPU) → буфер-src → hwupload+scale_vaapi (GPU) → h264_vaapi.
-static void encode_bgrx(uint8_t *data, int stride, int w, int h)
+// keyframe=1 форсит IDR (pict_type=I) — нужно т.к. gop_size в КАДРАХ, а дедуп
+// режет fps на статике, из-за чего периодический кейфрейм уезжал на десятки сек и
+// вьювер не мог начать декодировать. Форсим по wall-времени → старт за ≤1с.
+static void encode_bgrx(uint8_t *data, int stride, int w, int h, int keyframe)
 {
 	int ret;
 	AVFrame *in = av_frame_alloc();
@@ -215,6 +218,12 @@ static void encode_bgrx(uint8_t *data, int stride, int w, int h)
 
 	AVFrame *hw = av_frame_alloc();
 	while ((ret = av_buffersink_get_frame(S.sink, hw)) >= 0) {
+		if (keyframe) {
+			hw->pict_type = AV_PICTURE_TYPE_I; // форс IDR
+			keyframe = 0;                      // только первый кадр за вызов
+		} else {
+			hw->pict_type = AV_PICTURE_TYPE_NONE;
+		}
 		ret = avcodec_send_frame(S.enc, hw);
 		av_frame_unref(hw);
 		if (ret < 0) {
@@ -284,6 +293,7 @@ static void *timer_fn(void *arg)
 {
 	(void)arg;
 	const long long KEEPALIVE_NS = 500000000LL; // 0.5s
+	const long long KEYFRAME_NS = 1000000000LL; // IDR минимум раз в 1с реального времени
 	const long long MAX_DUR_NS = 1000000000LL;  // клампим длительность (долгий простой)
 	long long interval = 1000000000LL / (S.cfg_fps > 0 ? S.cfg_fps : 30);
 	uint8_t *buf = NULL;
@@ -292,6 +302,7 @@ static void *timer_fn(void *arg)
 	int stat_n = 0;
 	long long last_cap_ns = 0;  // время захвата последнего ОТПРАВЛЕННОГО кадра
 	long long last_send_ns = 0; // wall-время последней отправки (для keepalive-длительности)
+	long long last_key_ns = 0;  // wall-время последнего IDR
 	long long next = now_ns() + interval;
 	while (g_running) {
 		// Планируем по абсолютному дедлайну: период = ровно interval (не
@@ -345,8 +356,14 @@ static void *timer_fn(void *arg)
 		last_cap_ns = cap_ns;
 		last_send_ns = now;
 
+		// Кейфрейм по wall-времени (а не по числу кадров): gop_size в кадрах +
+		// дедуп на статике = кейфрейм уезжает на десятки секунд, вьювер не стартует.
+		int key = (last_key_ns == 0) || (now - last_key_ns >= KEYFRAME_NS);
+		if (key)
+			last_key_ns = now;
+
 		long long t0 = now_ns();
-		encode_bgrx(buf, stride, w, h);
+		encode_bgrx(buf, stride, w, h, key);
 		stat_ns += now_ns() - t0;
 		stat_n++;
 		if (now_ns() >= next_log) {
