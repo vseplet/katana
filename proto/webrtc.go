@@ -76,8 +76,21 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 		defer wg.Done()
 		var n int
 		var loggedErr bool
+		// Длительность сэмпла = РЕАЛЬНОЕ время между кадрами (а не фиксированное
+		// 1/fps): иначе при фактическом fps ниже целевого RTP-часы уплывают от
+		// реального времени → зритель дёргается/переупорядочивает. Для источников,
+		// выдающих ровно fps (macOS SCK), реальная дельта ≈ 1/fps — поведение то же.
+		var last time.Time
 		for frame := range stream.Video {
-			if err := s.track.WriteSample(media.Sample{Data: frame, Duration: frameDur}); err != nil {
+			dur := frameDur
+			now := time.Now()
+			if !last.IsZero() {
+				if d := now.Sub(last); d > 0 {
+					dur = d
+				}
+			}
+			last = now
+			if err := s.track.WriteSample(media.Sample{Data: frame, Duration: dur}); err != nil {
 				// Не выходим на транзиентной ошибке (иначе видео встанет навсегда):
 				// логируем один раз и продолжаем, восстановимся на кейфрейме.
 				if !loggedErr {
