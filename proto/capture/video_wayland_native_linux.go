@@ -7,7 +7,7 @@ package capture
 // Mac (тег darwin) этот файл и .c не видит вообще. C-часть — native_pw_linux.c.
 
 /*
-#cgo pkg-config: libpipewire-0.3 libavcodec libavutil libswscale
+#cgo pkg-config: libpipewire-0.3 libavcodec libavfilter libavutil
 #include "native_pw_linux.h"
 */
 import "C"
@@ -66,13 +66,29 @@ func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, erro
 	}
 	kbps := bitrateKbps(opts.Bitrate)
 
+	// Целевой размер — из настройки Width зрителя (даунскейл на GPU через
+	// scale_vaapi). 0 = как в потоке (без даунскейла).
+	tw, th := 0, 0
+	if opts.Width > 0 {
+		tw = opts.Width
+		if sw, sh := ScreenSize(); sw > 0 && sh > 0 {
+			th = opts.Width * sh / sw
+		} else {
+			th = opts.Width * 9 / 16
+		}
+		tw -= tw % 2
+		th -= th % 2
+	}
+
 	frames := make(chan []byte, 8)
 	nativeCh = frames
 	cfg := C.katana_native_cfg{
-		fd:   C.int(fd),
-		node: C.uint(ps.node),
-		fps:  C.int(fps),
-		kbps: C.int(kbps),
+		fd:     C.int(fd),
+		node:   C.uint(ps.node),
+		width:  C.int(tw),
+		height: C.int(th),
+		fps:    C.int(fps),
+		kbps:   C.int(kbps),
 	}
 	go func() {
 		C.katana_native_start(cfg) // блокирует до katana_native_stop
