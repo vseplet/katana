@@ -1,0 +1,30 @@
+name: native-linux
+
+# Нативный Wayland-захват на GPU (libpipewire + libva/libavcodec, cgo). Собираем
+# ВНУТРИ Arch-контейнера, чтобы версии libpipewire/libva совпадали со SteamOS
+# (тоже Arch) → бинарь запустится на Deck. Ручной запуск (workflow_dispatch),
+# результат — артефакт katana-linux-amd64-native (без релиза/тега).
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (cgo, Arch container — matches SteamOS libs)
+        run: |
+          docker run --rm -v "$PWD":/src -w /src/proto archlinux:latest bash -c '
+            set -e
+            pacman -Sy --noconfirm --needed base-devel go git pipewire libpipewire libva ffmpeg pkgconf
+            echo "=== headers ==="
+            pkg-config --exists libpipewire-0.3 libva libavcodec && echo "HEADERS OK" || { echo "MISSING HEADERS"; exit 1; }
+            echo "=== build ==="
+            CGO_ENABLED=1 GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o ../katana-linux-amd64-native .
+            file ../katana-linux-amd64-native
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-linux-amd64-native
+          path: katana-linux-amd64-native
+          if-no-files-found: error
