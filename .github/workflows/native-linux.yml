@@ -15,27 +15,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build (cgo, Arch pinned to ffmpeg 7.1 — matches SteamOS soname .10)
+      - name: Build + bundle ffmpeg libs (cgo, Arch)
         run: |
           docker run --rm -v "$PWD":/src -w /src/proto archlinux:latest bash -c '
             set -e
-            # Пиним весь Arch на архивный снапшот с ffmpeg 7.1 (libavfilter.so.10,
-            # как на SteamOS n7.1.1) + сопоставимый glibc. Иначе Arch-latest даёт
-            # ffmpeg 8 (.so.11) и бинарь не находит либы на Deck.
-            SNAP=2024/11/15
-            printf "Server=https://archive.archlinux.org/repos/%s/\$repo/os/\$arch\n" "$SNAP" > /etc/pacman.d/mirrorlist
-            pacman -Syyuu --noconfirm
-            pacman -S --noconfirm --needed base-devel git pipewire libpipewire libva ffmpeg pkgconf curl
-            echo "=== versions ==="; pacman -Q ffmpeg glibc; ls -1 /usr/lib/libavfilter.so.*
-            # Go — свежий из тарбола (в снапшоте старый, а go.mod требует 1.25).
-            curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz
-            export PATH=/usr/local/go/bin:$PATH
+            pacman -Sy --noconfirm --needed base-devel go git pipewire libpipewire libva ffmpeg pkgconf
             git config --global --add safe.directory /src || true
-            # Arch подсовывает hardening-флаги через pkg-config — разрешаем cgo все.
             export CGO_CFLAGS_ALLOW=".*" CGO_LDFLAGS_ALLOW=".*"
-            CGO_ENABLED=1 GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags "-s -w" -o ../katana-linux-amd64-native .
-            file ../katana-linux-amd64-native
-            echo "=== runtime deps ==="; ldd ../katana-linux-amd64-native | grep -iE "libav|libsw|pipewire|libva" || true
+            CGO_ENABLED=1 GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags "-s -w" -o /src/katana-linux-amd64-native .
+            file /src/katana-linux-amd64-native
+            # Бандлим ffmpeg+кодек-либы рядом с бинарём, КРОМЕ системных (glibc,
+            # GPU-драйвер/дисплей, PipeWire) — те должны быть с Deck, т.к. привязаны
+            # к его железу/серверу. ldd даёт полное транзитивное замыкание.
+            mkdir -p /src/native-libs
+            DENY="ld-linux|/libc\.so|/libm\.so|/libmvec|libpthread|/libdl\.so|/librt\.so|libresolv|/libutil|libpipewire|/libva\.so|libva-|libdrm|libGL|libEGL|libgbm|libglapi|libX11|libxcb|libwayland|libstdc|libgcc_s"
+            ldd /src/katana-linux-amd64-native | grep "=> /" | sed "s/.*=> //; s/ (0x.*//" | sort -u | while read -r lib; do
+              echo "$lib" | grep -qE "$DENY" && continue
+              cp -v "$lib" /src/native-libs/
+            done
+            echo "=== bundled ==="; ls -1 /src/native-libs
+            tar -C /src -czf /src/native-libs.tar.gz native-libs
           '
       - uses: actions/upload-artifact@v4
         with:
@@ -49,5 +48,7 @@ jobs:
           tag_name: native
           prerelease: true
           name: "Native Wayland (dev build)"
-          files: katana-linux-amd64-native
+          files: |
+            katana-linux-amd64-native
+            native-libs.tar.gz
           fail_on_unmatched_files: true
