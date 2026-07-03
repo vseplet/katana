@@ -8,8 +8,10 @@
 #include "native_pw_linux.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -36,6 +38,13 @@ static void nlog(const char *fmt, ...)
 	goNativeLog(buf);
 }
 
+static long long now_ns(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (long long)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
 struct nstate {
 	struct pw_thread_loop *loop;
 	struct pw_context *context;
@@ -52,6 +61,16 @@ struct nstate {
 	AVCodecContext *enc;
 	int w, h, inited;
 	long long pts;
+
+	// Развязка захвата и энкода: on_process кладёт последний кадр в latest,
+	// таймер энкодит его ровно на fps (CFR, как videorate). Двойной буфер +
+	// мьютекс, чтобы энкод шёл вне блокировки (не тормозил PipeWire).
+	pthread_mutex_t mtx;
+	uint8_t *latest;   // последний BGRx-кадр
+	size_t latest_cap; // ёмкость буфера
+	int latest_stride;
+	int have;
+	pthread_t timer;
 };
 
 static struct nstate S;
@@ -153,7 +172,9 @@ static int init_encoder(int in_w, int in_h)
 		log_averr("avcodec_open2", ret);
 		return -1;
 	}
+	pthread_mutex_lock(&S.mtx);
 	S.inited = 1;
+	pthread_mutex_unlock(&S.mtx);
 	nlog("encoder ready in=%dx%d out=%dx%d @%d %dk",
 		in_w, in_h, out_w, out_h, S.cfg_fps, S.cfg_kbps);
 	return 0;
@@ -211,6 +232,8 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
 		init_encoder(S.format.size.width, S.format.size.height);
 }
 
+// on_process (поток PipeWire): ТОЛЬКО копируем последний кадр (быстро) — энкод
+// делает таймер, чтобы PipeWire не блокировался на GPU-энкоде.
 static void on_process(void *userdata)
 {
 	(void)userdata;
@@ -218,12 +241,73 @@ static void on_process(void *userdata)
 	if (b == NULL)
 		return;
 	struct spa_buffer *buf = b->buffer;
-	if (S.inited && buf->n_datas > 0 && buf->datas[0].data != NULL) {
+	if (S.h > 0 && buf->n_datas > 0 && buf->datas[0].data != NULL) {
 		struct spa_data *sd = &buf->datas[0];
 		int stride = (sd->chunk && sd->chunk->stride > 0) ? sd->chunk->stride : S.w * 4;
-		encode_bgrx((uint8_t *)sd->data, stride, S.w, S.h);
+		size_t need = (size_t)stride * S.h;
+		pthread_mutex_lock(&S.mtx);
+		if (S.latest_cap < need) {
+			free(S.latest);
+			S.latest = malloc(need);
+			S.latest_cap = S.latest ? need : 0;
+		}
+		if (S.latest) {
+			memcpy(S.latest, sd->data, need);
+			S.latest_stride = stride;
+			S.have = 1;
+		}
+		pthread_mutex_unlock(&S.mtx);
 	}
 	pw_stream_queue_buffer(S.stream, b);
+}
+
+// timer_fn: энкодит ПОСЛЕДНИЙ кадр ровно на cfg_fps (CFR, как videorate). Кадр
+// копируем под мьютексом, энкод — вне блокировки. Замеряет время энкода.
+static void *timer_fn(void *arg)
+{
+	(void)arg;
+	long long interval = 1000000000LL / (S.cfg_fps > 0 ? S.cfg_fps : 30);
+	uint8_t *buf = NULL;
+	size_t bufcap = 0;
+	long long stat_ns = 0, next_log = 0;
+	int stat_n = 0;
+	while (g_running) {
+		struct timespec ts = {interval / 1000000000LL, interval % 1000000000LL};
+		nanosleep(&ts, NULL);
+
+		pthread_mutex_lock(&S.mtx);
+		int ready = S.inited && S.have;
+		int stride = S.latest_stride, w = S.w, h = S.h;
+		if (ready) {
+			size_t need = (size_t)stride * h;
+			if (bufcap < need) {
+				free(buf);
+				buf = malloc(need);
+				bufcap = buf ? need : 0;
+			}
+			if (buf)
+				memcpy(buf, S.latest, need);
+			else
+				ready = 0;
+		}
+		pthread_mutex_unlock(&S.mtx);
+		if (!ready)
+			continue;
+
+		long long t0 = now_ns();
+		encode_bgrx(buf, stride, w, h);
+		stat_ns += now_ns() - t0;
+		stat_n++;
+		if (now_ns() >= next_log) {
+			if (stat_n > 0)
+				nlog("encode avg %lld ms over %d frames", (stat_ns / stat_n) / 1000000, stat_n);
+			stat_ns = 0;
+			stat_n = 0;
+			next_log = now_ns() + 5000000000LL;
+		}
+	}
+	free(buf);
+	return NULL;
 }
 
 static const struct pw_stream_events stream_events = {
@@ -239,6 +323,7 @@ int katana_native_start(katana_native_cfg cfg)
 	S.cfg_kbps = cfg.kbps > 0 ? cfg.kbps : 3000;
 	S.cfg_w = cfg.width;
 	S.cfg_h = cfg.height;
+	pthread_mutex_init(&S.mtx, NULL);
 	g_running = 1;
 
 	pw_init(NULL, NULL);
@@ -283,10 +368,14 @@ int katana_native_start(katana_native_cfg cfg)
 		PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, 1);
 	pw_thread_loop_unlock(S.loop);
 
+	pthread_create(&S.timer, NULL, timer_fn, NULL);
+
 	while (g_running) {
 		struct timespec ts = {0, 100 * 1000 * 1000};
 		nanosleep(&ts, NULL);
 	}
+
+	pthread_join(S.timer, NULL);
 
 	pw_thread_loop_lock(S.loop);
 	if (S.stream)
@@ -303,6 +392,8 @@ int katana_native_start(katana_native_cfg cfg)
 		avfilter_graph_free(&S.graph);
 	if (S.hw_device)
 		av_buffer_unref(&S.hw_device);
+	free(S.latest);
+	pthread_mutex_destroy(&S.mtx);
 	return 0;
 }
 
