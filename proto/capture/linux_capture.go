@@ -187,9 +187,16 @@ func bitrateKbps(b string) int {
 func startAudioProc(ctx context.Context) (chan []byte, error) {
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostats",
+		// Малый буфер захвата PulseAudio (низкая латентность, без «наплыва» пакетов).
+		"-fragment_size", "1920", // 48000*2ch*2B*20мс = 3840 байт кадра; фрагмент ~20мс
 		"-f", "pulse", "-i", "@DEFAULT_MONITOR@",
-		"-c:a", "libopus", "-b:a", "128k", "-application", "lowdelay",
-		"-page_duration", "20000",
+		// Ровно 48к/стерео — совпадает с RTP-часами Opus у зрителя. application=audio
+		// (не lowdelay: тот CELT-only, звучит «булькающе/водянисто» на музыке/системном
+		// звуке). frame_duration=20 → один Opus-кадр = один RTP-пакет = 20 мс.
+		"-ac", "2", "-ar", "48000",
+		"-c:a", "libopus", "-b:a", "128k", "-vbr", "on",
+		"-application", "audio", "-frame_duration", "20",
+		"-page_duration", "20000", "-flush_packets", "1",
 		"-f", "ogg", "pipe:1",
 	}
 	cmd := exec.CommandContext(ctx, FFmpegPath(), args...)
