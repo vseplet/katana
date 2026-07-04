@@ -24,12 +24,12 @@ type streamer struct {
 	track  *webrtc.TrackLocalStaticSample // видео
 	audio  *webrtc.TrackLocalStaticSample // Opus, nil если звук выключен
 
-	mu          sync.Mutex
-	cancel      context.CancelFunc // останавливает текущий захват
-	done        chan struct{}      // закрывается, когда писатели кадров вышли
-	setCursor   func(bool)         // живое переключение курсора хоста (без рестарта)
-	forceKeyFn  func()             // форс keyframe у энкодера (по PLI); nil если не поддерж.
-	setBitrate  func(kbps int)     // смена битрейта энкодера на лету; nil если не поддерж.
+	mu         sync.Mutex
+	cancel     context.CancelFunc // останавливает текущий захват
+	done       chan struct{}      // закрывается, когда писатели кадров вышли
+	setCursor  func(bool)         // живое переключение курсора хоста (без рестарта)
+	forceKeyFn func()             // форс keyframe у энкодера (по PLI); nil если не поддерж.
+	setBitrate func(kbps int)     // смена битрейта энкодера на лету; nil если не поддерж.
 }
 
 func newStreamer(parent context.Context, enc capture.CaptureEncoder, track, audio *webrtc.TrackLocalStaticSample) *streamer {
@@ -93,19 +93,19 @@ func (s *streamer) reconfigure(opts capture.Options) error {
 		}
 	}()
 
-	// Аудио (Opus, ~20 мс на пакет) — если есть трек и поток.
+	// Аудио (Opus, ~20 мс на пакет) — если есть трек и поток. Шлём как пришло:
+	// RTP-метку pion двигает по Duration (не по времени прихода), так что пачечная
+	// доставка меток не портит; тактование на нашей стороне (пробовали) только
+	// добавляет задержку и провалы на андерранах.
 	if s.audio != nil && stream.Audio != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			var loggedErr bool
 			for pkt := range stream.Audio {
-				if err := s.audio.WriteSample(media.Sample{Data: pkt, Duration: 20 * time.Millisecond}); err != nil {
-					if !loggedErr {
-						loggedErr = true
-						log.Printf("webrtc: write audio: %v (continuing)", err)
-					}
-					continue
+				if err := s.audio.WriteSample(media.Sample{Data: pkt, Duration: 20 * time.Millisecond}); err != nil && !loggedErr {
+					loggedErr = true
+					log.Printf("webrtc: write audio: %v (continuing)", err)
 				}
 			}
 		}()

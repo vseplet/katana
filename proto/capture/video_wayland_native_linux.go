@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -104,8 +105,19 @@ func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, erro
 		fps:    C.int(fps),
 		kbps:   C.int(kbps),
 	}
+	// ГОНКА СТАРТ/СТОП: katana_native_stop() лишь сбрасывает флаг, а start ставит
+	// его заново уже ПОСЛЕ — stop, прилетевший во время инициализации C (портал/
+	// PipeWire), терялся, и захват-сирота крутился вечно (а stop() стримера ждал
+	// его навсегда → хост не переподключался к брокеру). Поэтому: (1) с отменённым
+	// ctx вообще не стартуем; (2) стоп ПОВТОРЯЕМ, пока start реально не вернётся.
+	if ctx.Err() != nil {
+		syscall.Close(fd)
+		return nil, ctx.Err()
+	}
+	startDone := make(chan struct{})
 	go func() {
 		C.katana_native_start(cfg) // блокирует до katana_native_stop
+		close(startDone)
 		syscall.Close(fd)
 		close(frames)
 		nativeCh = nil
@@ -114,7 +126,14 @@ func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, erro
 	}()
 	go func() {
 		<-ctx.Done()
-		C.katana_native_stop()
+		for {
+			C.katana_native_stop()
+			select {
+			case <-startDone:
+				return
+			case <-time.After(200 * time.Millisecond): // стоп мог опередить старт — добиваем
+			}
+		}
 	}()
 	// Контур обратной связи WebRTC: PLI зрителя → мгновенный IDR; адаптация
 	// битрейта к сети → переоткрытие энкодера на лету.
