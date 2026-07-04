@@ -19,10 +19,25 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"syscall"
 	"time"
 	"unsafe"
 )
+
+// dumpFile — если задан env KATANA_H264_DUMP, дублируем сюда сырой Annex-B H264
+// (тот же поток, что уходит в WebRTC) для диагностики «без WebRTC»: играем файл
+// локально и смотрим, есть ли прыжки кадров ДО энкодера/сети.
+var dumpFile *os.File
+
+func init() {
+	if p := os.Getenv("KATANA_H264_DUMP"); p != "" {
+		if f, err := os.Create(p); err == nil {
+			dumpFile = f
+			log.Printf("capture: native: H264 dump -> %s", p)
+		}
+	}
+}
 
 // init переключает Wayland-видео на нативный путь в cgo-сборке.
 func init() {
@@ -46,6 +61,9 @@ func goNativeH264(data unsafe.Pointer, n C.int) {
 		return
 	}
 	b := C.GoBytes(data, n)
+	if dumpFile != nil {
+		dumpFile.Write(b)
+	}
 	nativeTotal++
 	select {
 	case ch <- b:

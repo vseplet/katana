@@ -17,6 +17,7 @@
 #include "backend_portal_vaapi_linux.h"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -114,6 +115,11 @@ struct nstate {
 	// тот же кадр. Так доставка ровная (фикс. длительность в WriteSample), а RTP-
 	// часы не плывут; при этом кадр не ресэмплится (энкодим всегда самый свежий).
 	AVFrame *latest_frame;
+	// Отложенный возврат буфера KWin: scale_vaapi читает dmabuf АСИНХРОННО (submit,
+	// get_frame возвращает до завершения GPU). Если вернуть буфер сразу, KWin
+	// перезапишет его пока идёт наше чтение → «кадр из прошлого». Держим текущий,
+	// возвращаем предыдущий (его scale уже точно дочитан — прошёл целый кадр).
+	struct pw_buffer *prev_dmabuf;
 };
 
 static struct nstate S;
@@ -712,7 +718,7 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
 	// Отвечаем параметрами буферов: тип данных (dmabuf vs shm) и число блоков.
 	uint8_t bufbuf[1024];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(bufbuf, sizeof(bufbuf));
-	const struct spa_pod *params[1];
+	const struct spa_pod *params[3];
 	uint32_t types = S.use_dmabuf ? (1u << SPA_DATA_DmaBuf)
 		: ((1u << SPA_DATA_MemPtr) | (1u << SPA_DATA_MemFd));
 	// dataType — битовая маска обычным Int (как OBS/gsr). blocks НЕ фиксируем: у
@@ -721,7 +727,23 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
 		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
 		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 1, 16),
 		SPA_PARAM_BUFFERS_dataType, SPA_POD_Int(types));
-	pw_stream_update_params(S.stream, params, 1);
+	// Запрашиваем SPA_META_Header — из него seq/pts кадра (диагностика порядка:
+	// KWin/PipeWire может повторно отдать старый completed frame → «прыжок назад»).
+	params[1] = spa_pod_builder_add_object(&b,
+		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
+		SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
+	// SPA_META_VideoDamage: KWin в buffer пишет только изменённую область, остальное
+	// в слоте пула — старьё. Запрашиваем список damage-прямоугольников, чтобы понять
+	// (и лечить: копировать в аккумулятор только их). Просим место на N регионов.
+	params[2] = spa_pod_builder_add_object(&b,
+		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage),
+		SPA_PARAM_META_size, SPA_POD_CHOICE_RANGE_Int(
+			(int)(sizeof(struct spa_meta_region) * 16),
+			(int)sizeof(struct spa_meta_region),
+			(int)(sizeof(struct spa_meta_region) * 16)));
+	pw_stream_update_params(S.stream, params, 3);
 
 	if (S.format.size.width > 0) {
 		if (S.use_dmabuf)
@@ -755,12 +777,70 @@ static void on_process(void *userdata)
 		return;
 	struct spa_buffer *buf = last->buffer;
 
+	// ДИАГНОСТИКА ПОРЯДКА (ChatGPT #1): seq/pts из SPA_META_Header + указатель
+	// буфера. Ловим аномалии: seq не растёт (повтор/откат) или тот же буфер снова.
+	{
+		struct spa_meta_header *hdr = spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(*hdr));
+		static int64_t dbg_last_seq = -1;
+		static void *dbg_last_buf;
+		static int dbg_seq_logged;
+		if (hdr) {
+			if (!dbg_seq_logged) {
+				dbg_seq_logged = 1;
+				nlog("SEQ: header present, seq=%u pts=%lld flags=0x%x", hdr->seq,
+					(long long)hdr->pts, hdr->flags);
+			}
+			if (dbg_last_seq >= 0 && (int64_t)hdr->seq <= dbg_last_seq)
+				nlog("SEQ ANOMALY: seq=%u <= prev=%lld  pts=%lld  buf=%p (prevbuf=%p)",
+					hdr->seq, (long long)dbg_last_seq, (long long)hdr->pts,
+					(void *)buf, dbg_last_buf);
+			dbg_last_seq = (int64_t)hdr->seq;
+		}
+		// Damage-меты: сколько прямоугольников и покрывают ли они весь кадр.
+		struct spa_meta *dm = spa_buffer_find_meta(buf, SPA_META_VideoDamage);
+		static int dmg_log_n;
+		if (dm && dmg_log_n < 8) {
+			dmg_log_n++;
+			int nreg = 0;
+			struct spa_meta_region *r;
+			spa_meta_for_each(r, dm) {
+				if (!spa_meta_region_is_valid(r))
+					break;
+				if (nreg < 4)
+					nlog("DAMAGE reg[%d]: %dx%d @%d,%d", nreg, r->region.size.width,
+						r->region.size.height, r->region.position.x, r->region.position.y);
+				nreg++;
+			}
+			nlog("DAMAGE: %d region(s) this frame (кадр %dx%d)", nreg, S.w, S.h);
+		} else if (!dm) {
+			static int nodmg_logged;
+			if (!nodmg_logged) { nodmg_logged = 1; nlog("DAMAGE: no meta"); }
+		} else {
+			static int nohdr_logged;
+			if (!nohdr_logged) { nohdr_logged = 1; nlog("SEQ: NO header meta"); }
+		}
+		dbg_last_buf = (void *)buf;
+	}
+
 	static int dbg_once = 0;
 	if (!dbg_once) {
 		dbg_once = 1;
 		nlog("on_process first: n_datas=%d type=%d fd=%d inited=%d use_dmabuf=%d",
 			buf->n_datas, buf->n_datas > 0 ? (int)buf->datas[0].type : -1,
 			buf->n_datas > 0 ? (int)buf->datas[0].fd : -1, S.inited, S.use_dmabuf);
+		// Диагностика синхронизации: типы всех мет и данных (ищем SyncTimeline=9 /
+		// SyncObj-данные), чтобы понять implicit vs explicit sync. Плюс: заблокировал
+		// ли poll (implicit fence был бы виден).
+		for (uint32_t i = 0; i < buf->n_metas; i++)
+			nlog("  meta[%u]: type=%u size=%u", i, buf->metas[i].type, buf->metas[i].size);
+		for (uint32_t i = 0; i < buf->n_datas; i++)
+			nlog("  data[%u]: type=%u fd=%ld", i, buf->datas[i].type, (long)buf->datas[i].fd);
+		if (buf->n_datas > 0 && buf->datas[0].fd >= 0) {
+			struct pollfd pfd = {.fd = (int)buf->datas[0].fd, .events = POLLIN};
+			long long t0 = now_ns();
+			int pr = poll(&pfd, 1, 20);
+			nlog("  poll(dmabuf): ret=%d revents=0x%x waited=%lldus", pr, pfd.revents, (now_ns() - t0) / 1000);
+		}
 	}
 
 	// Диагностика каденции прихода кадров от KWin: интервалы между on_process.
@@ -787,6 +867,13 @@ static void on_process(void *userdata)
 	if (S.use_dmabuf) {
 		if (S.inited && buf->n_datas > 0 && buf->datas[0].type == SPA_DATA_DmaBuf &&
 				buf->datas[0].fd >= 0) {
+			// FENCE: KWin (implicit sync) может отдать буфер ДО завершения GPU-записи.
+			// Без ожидания scale_vaapi читает ПРЕДЫДУЩЕЕ содержимое этого слота пула
+			// (кадр 3 назад при пуле в 3) → «прыжок назад, потом вперёд» на статике.
+			// poll(POLLIN) на dmabuf-fd блокирует до сигнала write-fence (кадр готов).
+			// Таймаут 12мс страхует от зависания (пропустим — возьмём как есть).
+			struct pollfd pfd = {.fd = buf->datas[0].fd, .events = POLLIN};
+			poll(&pfd, 1, 12);
 			// Конвертим dmabuf → СВОЯ nv12-поверхность ПОКА буфер KWin валиден.
 			AVFrame *drm = wrap_dmabuf(buf);
 			if (drm) {
@@ -801,23 +888,57 @@ static void on_process(void *userdata)
 				}
 			}
 		}
-		pw_stream_queue_buffer(S.stream, last); // буфер KWin уже не нужен (есть копия)
+		// Отложенный возврат: держим текущий буфер, возвращаем предыдущий (его
+		// асинхронный scale уже завершён) → KWin не перезапишет буфер под нашим
+		// чтением. Устраняет «кадр из прошлого».
+		if (S.prev_dmabuf)
+			pw_stream_queue_buffer(S.stream, S.prev_dmabuf);
+		S.prev_dmabuf = last;
 		return;
 	}
 
-	// CPU-путь: memcpy последнего BGRx-кадра.
+	// CPU-путь: KWin пишет в буфер ТОЛЬКО damage-регионы, остальное — старьё из слота
+	// пула. Держим S.latest как ПЕРСИСТЕНТНЫЙ аккумулятор: первый кадр (или без damage-
+	// меты) копируем целиком, дальше — только damage-прямоугольники. Так собираем
+	// когерентный полный кадр (иначе неизменённые зоны показывают старую картинку →
+	// «прыжок назад»).
 	if (S.h > 0 && buf->n_datas > 0 && buf->datas[0].data != NULL) {
 		struct spa_data *sd = &buf->datas[0];
 		int stride = (sd->chunk && sd->chunk->stride > 0) ? sd->chunk->stride : S.w * 4;
 		size_t need = (size_t)stride * S.h;
+		int w = stride / 4;
+		struct spa_meta *dm = spa_buffer_find_meta(buf, SPA_META_VideoDamage);
 		pthread_mutex_lock(&S.mtx);
 		if (S.latest_cap < need) {
 			free(S.latest);
 			S.latest = malloc(need);
 			S.latest_cap = S.latest ? need : 0;
+			S.have = 0; // новый буфер — нужен полный кадр
 		}
 		if (S.latest) {
-			memcpy(S.latest, sd->data, need);
+			if (!S.have || !dm || (S.latest_stride != stride)) {
+				memcpy(S.latest, sd->data, need); // первый кадр / нет damage — целиком
+			} else {
+				// применяем только damage-прямоугольники (0 регионов = ничего не
+				// менялось → аккумулятор как есть).
+				struct spa_meta_region *r;
+				spa_meta_for_each(r, dm) {
+					if (!spa_meta_region_is_valid(r))
+						break;
+					int rx = r->region.position.x, ry = r->region.position.y;
+					int rw = r->region.size.width, rh = r->region.size.height;
+					if (rx < 0) { rw += rx; rx = 0; }
+					if (ry < 0) { rh += ry; ry = 0; }
+					if (rx + rw > w) rw = w - rx;
+					if (ry + rh > S.h) rh = S.h - ry;
+					if (rw <= 0 || rh <= 0)
+						continue;
+					for (int y = ry; y < ry + rh; y++)
+						memcpy(S.latest + (size_t)y * stride + (size_t)rx * 4,
+							(uint8_t *)sd->data + (size_t)y * stride + (size_t)rx * 4,
+							(size_t)rw * 4);
+				}
+			}
 			S.latest_stride = stride;
 			S.have = 1;
 		}
@@ -1015,6 +1136,14 @@ int katana_native_start(katana_native_cfg cfg)
 	uint64_t mods_bgrx[MAX_MODS], mods_bgra[MAX_MODS];
 	int n_bgrx = egl_query_modifiers(DRM_FORMAT_XRGB8888, mods_bgrx, MAX_MODS);
 	int n_bgra = egl_query_modifiers(DRM_FORMAT_ARGB8888, mods_bgra, MAX_MODS);
+	// ЛОКАЛИЗАТОР: KATANA_FORCE_CPU=1 → не предлагаем dmabuf, только shm (CPU memcpy).
+	// Тот же VPP(hwupload→scale)+энкодер, но БЕЗ dmabuf-импорта. Если прыжки исчезнут
+	// на CPU-пути — виноват dmabuf-импорт/sync; останутся — VPP/энкодер/тикер.
+	if (getenv("KATANA_FORCE_CPU")) {
+		n_bgrx = 0;
+		n_bgra = 0;
+		nlog("KATANA_FORCE_CPU: dmabuf отключён, только shm (CPU-путь)");
+	}
 	nlog("egl modifiers: BGRx=%d BGRA=%d", n_bgrx, n_bgra);
 
 	uint8_t buffer[8192];
@@ -1030,8 +1159,14 @@ int katana_native_start(katana_native_cfg cfg)
 	// НЕ ставим PW_STREAM_FLAG_MAP_BUFFERS: с dmabuf он пытается mmap'ить буфер и
 	// стрим не доходит до streaming. Для dmabuf работаем с fd напрямую; для shm-
 	// фолбэка мапим сами при необходимости.
+	// FORCE_CPU: shm-путь требует mmap буфера (иначе datas[].data==NULL → чёрный
+	// экран). Ставим MAP_BUFFERS только в этом диагностическом режиме (dmabuf не
+	// предлагается, конфликта нет).
+	enum pw_stream_flags cflags = PW_STREAM_FLAG_AUTOCONNECT;
+	if (getenv("KATANA_FORCE_CPU"))
+		cflags |= PW_STREAM_FLAG_MAP_BUFFERS;
 	pw_stream_connect(S.stream, PW_DIRECTION_INPUT, cfg.node,
-		PW_STREAM_FLAG_AUTOCONNECT, params, np);
+		cflags, params, np);
 	pw_thread_loop_unlock(S.loop);
 
 	while (g_running) {
