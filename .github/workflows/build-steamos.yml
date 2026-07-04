@@ -2,9 +2,11 @@ name: build-steamos
 
 # Переиспользуемый рецепт сборки таргета SteamOS (Steam Deck, Desktop Mode:
 # KDE/AMD/Wayland). cgo: портал+PipeWire→VAAPI, dmabuf zero-copy. Собираем в СТАРОМ
-# дистрибутиве (Debian 12, glibc 2.36) → бинарь портативный по glibc; ffmpeg-либы
-# бандлим рядом, libpipewire/libva/GPU-драйвер берём системные (soname стабилен).
-# Единый источник правды по деп-листу — чтобы он не дрейфовал в двух воркфлоу.
+# дистрибутиве (Debian 12, glibc 2.36) → бинарь портативный по glibc.
+# ffmpeg собираем МИНИМАЛЬНЫЙ из исходников (только h264_vaapi + нужные фильтры) и
+# бандлим рядом ТОЛЬКО его 3 libav-либы (~1.7МБ). Из apt ffmpeg НЕ ставим: Debian
+# тянет ~148 либ кодек-зоопарка (~88МБ) вкл. libssl, который на LD_LIBRARY_PATH
+# ломает системный curl. libpipewire/libva/libdrm/gbm/GPU-драйвер — системные.
 # Целевой стек — см. proto/capture/doc.go.
 #
 # Вызывается из release.yml (по тегу v*) и steamos-dev.yml (ручной dev-канал).
@@ -34,48 +36,63 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build + bundle ffmpeg libs (cgo, Debian 12 — portable glibc 2.36)
+      - name: Build minimal ffmpeg + cgo binary (Debian 12 — portable glibc 2.36)
         run: |
           docker run --rm -v "$PWD":/src -w /src/proto debian:12 bash -c '
             set -e
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            # ВНИМАНИЕ: список должен покрывать всю cgo pkg-config строку из
-            # backend_portal_vaapi_linux.go: libpipewire-0.3 libavcodec libavfilter
-            # libavutil egl gbm libdrm. libegl-dev/libgbm-dev нужны для запроса
-            # dmabuf-модификаторов через EGL/gbm — без них сборка падает на pkg-config.
-            apt-get install -y --no-install-recommends build-essential git pkg-config curl ca-certificates \
-              libpipewire-0.3-dev libva-dev libdrm-dev libegl-dev libgbm-dev \
-              libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev
-            echo "=== versions ==="; ldd --version | head -1; pkg-config --modversion libavcodec
-            for p in egl gbm libdrm libpipewire-0.3; do pkg-config --exists "$p" || { echo "MISSING pkg-config: $p"; exit 1; }; done
+            # Хедеры зависимостей бэкенда (cgo pkg-config в backend_portal_vaapi_linux.go:
+            # libpipewire-0.3 egl gbm libdrm libva) + тулчейн для сборки ffmpeg
+            # (nasm/xz). libavcodec-dev НЕ ставим — ffmpeg собираем минимальный сами.
+            apt-get install -y --no-install-recommends build-essential git pkg-config curl ca-certificates xz-utils nasm \
+              libpipewire-0.3-dev libva-dev libdrm-dev libegl-dev libgbm-dev
+            for p in egl gbm libdrm libpipewire-0.3 libva; do pkg-config --exists "$p" || { echo "MISSING pkg-config: $p"; exit 1; }; done
+
+            # Минимальный ffmpeg (динамический, LGPL): только то, что зовёт backend —
+            # h264_vaapi + фильтры buffer/buffersink/hwupload/hwmap/scale_vaapi,
+            # vaapi+libdrm. Ни внешних кодеков, ни network, ни openssl. Версия 5.1 =
+            # мажор Debian 12 (тот же API, что у проверенной сборки). → /opt/ff.
+            curl -fsSL https://ffmpeg.org/releases/ffmpeg-5.1.6.tar.xz | tar -C /tmp -xJ
+            cd /tmp/ffmpeg-5.1.6
+            ./configure --prefix=/opt/ff --enable-shared --disable-static --disable-doc \
+              --disable-everything --disable-network --disable-avdevice --disable-postproc \
+              --enable-vaapi --enable-libdrm \
+              --enable-encoder=h264_vaapi \
+              --enable-filter=buffer,buffersink,hwupload,hwdownload,hwmap,scale_vaapi,format,null,copy
+            make -j"$(nproc)" >/dev/null
+            make install >/dev/null
+            echo "=== ffmpeg ==="; PKG_CONFIG_PATH=/opt/ff/lib/pkgconfig pkg-config --modversion libavcodec
+            cd /src/proto
+
             # Go — свежий из тарбола (в Debian старый, а go.mod требует 1.25).
             curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz
             export PATH=/usr/local/go/bin:$PATH
+            export PKG_CONFIG_PATH=/opt/ff/lib/pkgconfig
             git config --global --add safe.directory /src || true
             export CGO_CFLAGS_ALLOW=".*" CGO_LDFLAGS_ALLOW=".*"
             CGO_ENABLED=1 GOARCH=amd64 go build -buildvcs=false -trimpath \
               -ldflags "-s -w -X main.version=${{ inputs.release_tag }}" \
               -o /src/katana-steamos-amd64 .
             ls -la /src/katana-steamos-amd64
-            # Бандлим ffmpeg+кодек-либы рядом с бинарём, КРОМЕ системных (glibc,
-            # GPU-драйвер/дисплей, PipeWire) — те берутся с целевой машины (soname
-            # стабилен). ldd даёт полное транзитивное замыкание.
-            mkdir -p /src/native-libs
-            DENY="ld-linux|/libc\.so|/libm\.so|/libmvec|libpthread|/libdl\.so|/librt\.so|libresolv|/libutil|libpipewire|/libva\.so|libva-|libdrm|libGL|libEGL|libgbm|libglapi|libX11|libxcb|libwayland|libstdc|libgcc_s"
-            ldd /src/katana-steamos-amd64 | grep "=> /" | sed "s/.*=> //; s/ (0x.*//" | sort -u | while read -r lib; do
-              echo "$lib" | grep -qE "$DENY" && continue
-              cp -vL "$lib" /src/native-libs/
+
+            # Бандлим ТОЛЬКО наши минимальные ffmpeg-либы (всё, что бинарь резолвит из
+            # /opt/ff — это libavcodec/libavfilter/libavutil). Остальное (libva/libdrm/
+            # gbm/egl/glibc/X11…) системное — берётся с Deck (soname стабилен). Ни
+            # DENY-списка, ни просачивания системных либ (в т.ч. libssl).
+            mkdir -p /src/libs
+            LD_LIBRARY_PATH=/opt/ff/lib ldd /src/katana-steamos-amd64 | grep "=> /opt/ff/" | sed "s/.*=> //; s/ (0x.*//" | sort -u | while read -r lib; do
+              cp -vL "$lib" /src/libs/
             done
-            echo "=== bundled ==="; ls -1 /src/native-libs
-            tar -C /src -czf /src/native-libs.tar.gz native-libs
+            echo "=== bundled ==="; ls -1 /src/libs; du -sh /src/libs
+            tar -C /src -czf /src/katana-steamos-amd64-libs.tar.gz libs
           '
       - uses: actions/upload-artifact@v4
         with:
           name: katana-steamos-amd64
           path: |
             katana-steamos-amd64
-            native-libs.tar.gz
+            katana-steamos-amd64-libs.tar.gz
           if-no-files-found: error
       - uses: softprops/action-gh-release@v2
         with:
@@ -84,5 +101,5 @@ jobs:
           name: ${{ inputs.release_name != '' && inputs.release_name || inputs.release_tag }}
           files: |
             katana-steamos-amd64
-            native-libs.tar.gz
+            katana-steamos-amd64-libs.tar.gz
           fail_on_unmatched_files: true
