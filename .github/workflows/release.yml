@@ -1,10 +1,16 @@
 name: release
 
-# Сборка бинарников хоста и публикация в один GitHub Release.
-# macOS (arm64): cgo + ObjC (ScreenCaptureKit/VideoToolbox) — только на macOS, полный.
-# Linux (arm64/amd64): статик (CGO_ENABLED=0). Экран/звук — через ffmpeg (x11grab +
-# pulse) при наличии графики; без неё (серверы, контейнеры, Pi headless) — только
-# терминал по WebRTC. Ввод пока не реализован. ffmpeg нужен в рантайме (не вшит).
+# Релиз по тегу v*: ОТДЕЛЬНЫЙ бинарь под каждый таргет (без вранья про
+# «универсальность» — каждый заточен под своё окружение). Хост-детект внутри всё
+# равно есть, но артефакты собираются под конкретную платформу/профиль:
+#
+#   macos   — macOS arm64: cgo + ObjC (ScreenCaptureKit/VideoToolbox).
+#   steamos — Steam Deck / SteamOS Desktop Mode: cgo, портал+PipeWire→VAAPI (KDE/
+#             AMD/Wayland), dmabuf zero-copy + бандл ffmpeg. См. proto/capture/doc.go.
+#   linux   — обычный Linux / сервер: CGO_ENABLED=0, без нативных либ, запускается
+#             где угодно. Терминал по WebRTC + захват через внешний ffmpeg/gst
+#             (x11grab / wayland-gst), ввод uinput/портал. amd64 + arm64.
+#   windows — TODO (появится отдельной джобой).
 on:
   push:
     tags: ["v*"]
@@ -33,14 +39,22 @@ jobs:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           CGO_ENABLED=1 GOARCH=arm64 \
-            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-darwin-arm64 .
-          ../katana-darwin-arm64 -h 2>&1 | head -1 || true # smoke
+            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-macos-arm64 .
+          ../katana-macos-arm64 -h 2>&1 | head -1 || true # smoke
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: katana-darwin-arm64
+          files: katana-macos-arm64
           fail_on_unmatched_files: true
 
+  # SteamOS (Steam Deck, Desktop Mode). Рецепт общий с dev-каналом steamos-dev.yml.
+  steamos:
+    uses: ./.github/workflows/build-steamos.yml
+    with:
+      release_tag: ${{ github.event.inputs.tag || github.ref_name }}
+      prerelease: false
+
+  # Обычный Linux / сервер: чистый Go, запускается где угодно (без нативных либ).
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -48,20 +62,20 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: proto/go.mod
-      - name: Build (linux/arm64 + amd64, static, headless)
+      - name: Build (linux amd64 + arm64, CGO_ENABLED=0, портативный)
         working-directory: proto
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-linux-arm64 .
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-linux-arm64 .
           ../katana-linux-amd64 --version || true # smoke
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
-            katana-linux-arm64
             katana-linux-amd64
+            katana-linux-arm64
           fail_on_unmatched_files: true

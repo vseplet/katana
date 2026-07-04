@@ -1,0 +1,88 @@
+name: build-steamos
+
+# Переиспользуемый рецепт сборки таргета SteamOS (Steam Deck, Desktop Mode:
+# KDE/AMD/Wayland). cgo: портал+PipeWire→VAAPI, dmabuf zero-copy. Собираем в СТАРОМ
+# дистрибутиве (Debian 12, glibc 2.36) → бинарь портативный по glibc; ffmpeg-либы
+# бандлим рядом, libpipewire/libva/GPU-драйвер берём системные (soname стабилен).
+# Единый источник правды по деп-листу — чтобы он не дрейфовал в двух воркфлоу.
+# Целевой стек — см. proto/capture/doc.go.
+#
+# Вызывается из release.yml (по тегу v*) и steamos-dev.yml (ручной dev-канал).
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "тег релиза, куда прикрепить ассеты SteamOS"
+        required: true
+        type: string
+      prerelease:
+        description: "пометить релиз как pre-release"
+        required: false
+        default: false
+        type: boolean
+      release_name:
+        description: "имя релиза (по умолчанию = тег)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  steamos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + bundle ffmpeg libs (cgo, Debian 12 — portable glibc 2.36)
+        run: |
+          docker run --rm -v "$PWD":/src -w /src/proto debian:12 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            # ВНИМАНИЕ: список должен покрывать всю cgo pkg-config строку из
+            # backend_portal_vaapi_linux.go: libpipewire-0.3 libavcodec libavfilter
+            # libavutil egl gbm libdrm. libegl-dev/libgbm-dev нужны для запроса
+            # dmabuf-модификаторов через EGL/gbm — без них сборка падает на pkg-config.
+            apt-get install -y --no-install-recommends build-essential git pkg-config curl ca-certificates \
+              libpipewire-0.3-dev libva-dev libdrm-dev libegl-dev libgbm-dev \
+              libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev
+            echo "=== versions ==="; ldd --version | head -1; pkg-config --modversion libavcodec
+            for p in egl gbm libdrm libpipewire-0.3; do pkg-config --exists "$p" || { echo "MISSING pkg-config: $p"; exit 1; }; done
+            # Go — свежий из тарбола (в Debian старый, а go.mod требует 1.25).
+            curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz
+            export PATH=/usr/local/go/bin:$PATH
+            git config --global --add safe.directory /src || true
+            export CGO_CFLAGS_ALLOW=".*" CGO_LDFLAGS_ALLOW=".*"
+            CGO_ENABLED=1 GOARCH=amd64 go build -buildvcs=false -trimpath \
+              -ldflags "-s -w -X main.version=${{ inputs.release_tag }}" \
+              -o /src/katana-steamos-amd64 .
+            ls -la /src/katana-steamos-amd64
+            # Бандлим ffmpeg+кодек-либы рядом с бинарём, КРОМЕ системных (glibc,
+            # GPU-драйвер/дисплей, PipeWire) — те берутся с целевой машины (soname
+            # стабилен). ldd даёт полное транзитивное замыкание.
+            mkdir -p /src/native-libs
+            DENY="ld-linux|/libc\.so|/libm\.so|/libmvec|libpthread|/libdl\.so|/librt\.so|libresolv|/libutil|libpipewire|/libva\.so|libva-|libdrm|libGL|libEGL|libgbm|libglapi|libX11|libxcb|libwayland|libstdc|libgcc_s"
+            ldd /src/katana-steamos-amd64 | grep "=> /" | sed "s/.*=> //; s/ (0x.*//" | sort -u | while read -r lib; do
+              echo "$lib" | grep -qE "$DENY" && continue
+              cp -vL "$lib" /src/native-libs/
+            done
+            echo "=== bundled ==="; ls -1 /src/native-libs
+            tar -C /src -czf /src/native-libs.tar.gz native-libs
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-steamos-amd64
+          path: |
+            katana-steamos-amd64
+            native-libs.tar.gz
+          if-no-files-found: error
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          prerelease: ${{ inputs.prerelease }}
+          name: ${{ inputs.release_name != '' && inputs.release_name || inputs.release_tag }}
+          files: |
+            katana-steamos-amd64
+            native-libs.tar.gz
+          fail_on_unmatched_files: true

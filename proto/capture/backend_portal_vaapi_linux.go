@@ -2,13 +2,16 @@
 
 package capture
 
-// Нативный Wayland-захват на GPU: PipeWire → libav (VAAPI) → H264 в одном
-// процессе, без gst и raw-пайпа. Компилируется ТОЛЬКО в cgo-сборке под Linux —
-// Mac (тег darwin) этот файл и .c не видит вообще. C-часть — native_pw_linux.c.
+// Бэкенд захвата: xdg-desktop-portal (ScreenCast) + PipeWire → libav VAAPI → H264,
+// zero-copy через dmabuf. ЦЕЛЕВОЙ СТЕК: Wayland + KDE/KWin (или GNOME) портал +
+// AMD GPU (фильтр DCC-модификаторов в .c — AMD-специфика; Intel вероятно ОК,
+// NVIDIA — нет). Компилируется ТОЛЬКО в cgo-сборке под Linux; Mac (тег darwin)
+// этот файл и .c не видит. C-часть — backend_portal_vaapi_linux.c. Матрица
+// поддержки целиком — в doc.go.
 
 /*
-#cgo pkg-config: libpipewire-0.3 libavcodec libavfilter libavutil
-#include "native_pw_linux.h"
+#cgo pkg-config: libpipewire-0.3 libavcodec libavfilter libavutil egl gbm libdrm
+#include "backend_portal_vaapi_linux.h"
 */
 import "C"
 
@@ -17,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -92,6 +96,8 @@ func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, erro
 		th -= th % 2
 	}
 
+	// CFR-таймер в C гонит кадры ровно на fps (как Mac) → отдаём обычным байтовым
+	// каналом с фиксированной длительностью в WriteSample. Метки времени не нужны.
 	frames := make(chan []byte, 8)
 	nativeCh = frames
 	cfg := C.katana_native_cfg{
@@ -102,17 +108,40 @@ func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, erro
 		fps:    C.int(fps),
 		kbps:   C.int(kbps),
 	}
+	// ГОНКА СТАРТ/СТОП: katana_native_stop() лишь сбрасывает флаг, а start ставит
+	// его заново уже ПОСЛЕ — stop, прилетевший во время инициализации C (портал/
+	// PipeWire), терялся, и захват-сирота крутился вечно (а stop() стримера ждал
+	// его навсегда → хост не переподключался к брокеру). Поэтому: (1) с отменённым
+	// ctx вообще не стартуем; (2) стоп ПОВТОРЯЕМ, пока start реально не вернётся.
+	if ctx.Err() != nil {
+		syscall.Close(fd)
+		return nil, ctx.Err()
+	}
+	startDone := make(chan struct{})
 	go func() {
 		C.katana_native_start(cfg) // блокирует до katana_native_stop
+		close(startDone)
 		syscall.Close(fd)
 		close(frames)
 		nativeCh = nil
+		waylandForceKey, waylandSetBitrate = nil, nil
 		log.Printf("capture stopped (native)")
 	}()
 	go func() {
 		<-ctx.Done()
-		C.katana_native_stop()
+		for {
+			C.katana_native_stop()
+			select {
+			case <-startDone:
+				return
+			case <-time.After(200 * time.Millisecond): // стоп мог опередить старт — добиваем
+			}
+		}
 	}()
+	// Контур обратной связи WebRTC: PLI зрителя → мгновенный IDR; адаптация
+	// битрейта к сети → переоткрытие энкодера на лету.
+	waylandForceKey = func() { C.katana_native_force_key() }
+	waylandSetBitrate = func(kbps int) { C.katana_native_set_bitrate(C.int(kbps)) }
 	log.Printf("capture: native wayland (pipewire→vaapi, %dfps %dk)", fps, kbps)
 	return frames, nil
 }

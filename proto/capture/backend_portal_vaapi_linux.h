@@ -23,4 +23,12 @@ int katana_native_start(katana_native_cfg cfg);
 // Останавливает захват (можно звать из другого потока).
 void katana_native_stop(void);
 
+// Форсит IDR на ближайшем кадре (ответ на PLI зрителя — мгновенное восстановление
+// после потерь). Можно звать из любого потока.
+void katana_native_force_key(void);
+
+// Меняет битрейт на лету, kbps (адаптация к сети): энкодер переоткрывается на
+// ближайшем такте, следом IDR. Можно звать из любого потока.
+void katana_native_set_bitrate(int kbps);
+
 #endif

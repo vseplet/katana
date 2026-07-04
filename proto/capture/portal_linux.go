@@ -24,6 +24,16 @@ type portalSession struct {
 	// зритель/SourceRect — в физических пикселях DRM. scaleX/Y = логич./физич.
 	scaleX float64
 	scaleY float64
+
+	// Тень позиции курсора (физические px). Относительное движение (трекпад-режим
+	// мобилы) конвертим в АБСОЛЮТНОЕ: тень += дельта → NotifyPointerMotionAbsolute.
+	// Иначе относительный NotifyPointerMotion проходит через ускорение указателя
+	// KWin → реальная позиция расходится с моделью хоста → cursorpos врёт и
+	// вьювер «улетает в угол». Абсолют = точность 1:1 и валидный cursorpos.
+	posMu        sync.Mutex
+	shadowX      float64
+	shadowY      float64
+	physW, physH float64
 }
 
 var (
@@ -107,6 +117,13 @@ func openPortal() (*portalSession, error) {
 		return nil, fmt.Errorf("нет ScreenCast-потоков: %v", err)
 	}
 	ps := &portalSession{conn: conn, obj: obj, session: session, node: streams[0].Node, scaleX: 1, scaleY: 1}
+	// Тень курсора: физический размер экрана, старт в центре.
+	if pw, ph := ScreenSize(); pw > 0 && ph > 0 {
+		ps.physW, ps.physH = float64(pw), float64(ph)
+	} else {
+		ps.physW, ps.physH = 1920, 1080
+	}
+	ps.shadowX, ps.shadowY = ps.physW/2, ps.physH/2
 
 	// Размер потока (логические пиксели) из props["size"] = (ii). Считаем масштаб
 	// относительно физического DRM-разрешения, в котором приходят координаты мыши.
@@ -135,14 +152,40 @@ func (p *portalSession) openPipeWire() (int, error) {
 
 var noOpts = map[string]dbus.Variant{}
 
+func clampP(v, hi float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > hi-1 {
+		return hi - 1
+	}
+	return v
+}
+
 func (p *portalSession) motionAbs(x, y float64) {
+	p.posMu.Lock()
+	p.shadowX, p.shadowY = clampP(x, p.physW), clampP(y, p.physH)
+	p.posMu.Unlock()
 	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyPointerMotionAbsolute", 0,
 		p.session, noOpts, p.node, x*p.scaleX, y*p.scaleY).Err
 }
 
+// motionRel: дельта → тень → АБСОЛЮТНОЕ позиционирование (см. коммент к тени).
 func (p *portalSession) motionRel(dx, dy float64) {
-	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyPointerMotion", 0,
-		p.session, noOpts, dx*p.scaleX, dy*p.scaleY).Err
+	p.posMu.Lock()
+	p.shadowX = clampP(p.shadowX+dx, p.physW)
+	p.shadowY = clampP(p.shadowY+dy, p.physH)
+	x, y := p.shadowX, p.shadowY
+	p.posMu.Unlock()
+	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyPointerMotionAbsolute", 0,
+		p.session, noOpts, p.node, x*p.scaleX, y*p.scaleY).Err
+}
+
+// cursorPos — позиция курсора по модели портала (физические px).
+func (p *portalSession) cursorPos() (float64, float64) {
+	p.posMu.Lock()
+	defer p.posMu.Unlock()
+	return p.shadowX, p.shadowY
 }
 
 func (p *portalSession) button(btn int32, down bool) {
@@ -210,4 +253,17 @@ func PortalKeyboard(code int32, down bool) {
 	if p, err := ensurePortal(); err == nil {
 		p.keycode(code, down)
 	}
+}
+
+// PortalCursorPos — текущая позиция курсора по модели портала (физические px).
+// ok=false, если портал-сессии ещё нет.
+func PortalCursorPos() (x, y float64, ok bool) {
+	portalMu.Lock()
+	p := portalSess
+	portalMu.Unlock()
+	if p == nil {
+		return 0, 0, false
+	}
+	x, y = p.cursorPos()
+	return x, y, true
 }

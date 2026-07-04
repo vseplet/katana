@@ -1,0 +1,19 @@
+name: steamos-dev
+
+# Ручной DEV-канал сборки SteamOS-таргета (НЕ основной — основной путь в release.yml
+# по тегу v*). Публикует в rolling-тег `native`, откуда steamos.sh качает свежий
+# бинарь без релиза. Сам рецепт сборки — в переиспользуемом build-steamos.yml
+# (единый деп-лист, без дрейфа).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  steamos:
+    uses: ./.github/workflows/build-steamos.yml
+    with:
+      release_tag: native
+      prerelease: true
+      release_name: "SteamOS (dev build)"

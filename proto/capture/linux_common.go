@@ -2,26 +2,24 @@
 
 package capture
 
-// Захват на Linux, общая часть: выбор видео-бэкенда по сессии (X11 → x11grab в
-// video_x11_linux.go; Wayland → xdg-desktop-portal ScreenCast + PipeWire в
-// video_wayland_linux.go), захват звука (PulseAudio → Opus) и вспомогалки
-// (разрешение экрана, источники). Видео и звук — независимые процессы: сбой
-// одного не роняет другой.
+// Захват на Linux, общая часть: детект окружения, выбор видео-бэкенда по сессии
+// (X11 → x11grab в backend_x11grab_linux.go; Wayland → портал+PipeWire→VAAPI в
+// backend_portal_vaapi_linux.* или fallback gst в backend_wayland_gst_linux.go) и
+// вспомогалки (разрешение экрана, источники). Звук — в audio_pulse_linux.go.
+// Видео и звук — независимые процессы: сбой одного не роняет другой.
+//
+// Целевой стек и матрица поддержки (KDE/AMD/Wayland) — в doc.go. Здесь же —
+// runtime-детект (describeEnv) и честный лог выбранного бэкенда.
 
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	"bufio"
-
-	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
 
 // isWayland — текущая графическая сессия Wayland (тогда x11grab не годится).
@@ -54,18 +52,78 @@ func videoBackend() string {
 // VideoAvailable — есть ли рабочий видео-бэкенд.
 func VideoAvailable() bool { return videoBackend() != "" }
 
-// AudioAvailable — доступен ли системный звук: PulseAudio (или PipeWire-pulse) и
-// ffmpeg. Проверяем PULSE_SERVER и стандартный per-user сокет.
-func AudioAvailable() bool {
-	if FFmpegPath() == "" {
-		return false
+// desktopEnv — окружение рабочего стола из XDG_CURRENT_DESKTOP ("KDE"/"GNOME"/…),
+// в нижнем регистре; "" если не задано. Портал RemoteDesktop (ввод) есть только
+// у KDE/GNOME — см. матрицу в doc.go.
+func desktopEnv() string {
+	de := os.Getenv("XDG_CURRENT_DESKTOP")
+	if de == "" {
+		de = os.Getenv("XDG_SESSION_DESKTOP")
 	}
-	if os.Getenv("PULSE_SERVER") != "" {
-		return true
+	// XDG_CURRENT_DESKTOP может быть списком "KDE:plasma" — берём первый.
+	if i := strings.IndexAny(de, ":;"); i > 0 {
+		de = de[:i]
 	}
-	sock := filepath.Join(fmt.Sprintf("/run/user/%d", os.Getuid()), "pulse", "native")
-	_, err := os.Stat(sock)
-	return err == nil
+	return strings.ToLower(strings.TrimSpace(de))
+}
+
+// gpuVendor — вендор первой видеокарты из /sys/class/drm по PCI vendor id.
+// DMABUF→VAAPI zero-copy tuned под AMD; см. doc.go. "" если не определить.
+func gpuVendor() string {
+	entries, err := os.ReadDir("/sys/class/drm")
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), "card") || strings.Contains(e.Name(), "-") {
+			continue
+		}
+		v, err := os.ReadFile(filepath.Join("/sys/class/drm", e.Name(), "device", "vendor"))
+		if err != nil {
+			continue
+		}
+		switch strings.TrimSpace(string(v)) {
+		case "0x1002":
+			return "AMD"
+		case "0x8086":
+			return "Intel"
+		case "0x10de":
+			return "NVIDIA"
+		default:
+			return strings.TrimSpace(string(v))
+		}
+	}
+	return ""
+}
+
+// describeEnv — строка окружения для лога («session=… desktop=… gpu=… backend=…»)
+// плюс предупреждение, если стек вне целевого профиля (не KDE/GNOME или NVIDIA).
+// Делает зависимость от KDE/AMD видимой в рантайме, а не только в исходниках.
+func describeEnv(backend string) string {
+	session := "x11"
+	if isWayland() {
+		session = "wayland"
+	}
+	de, gpu := desktopEnv(), gpuVendor()
+	msg := fmt.Sprintf("session=%s desktop=%s gpu=%s backend=%s", session, orNA(de), orNA(gpu), orNA(backend))
+	var warn []string
+	if backend == "wayland" && de != "kde" && de != "gnome" && de != "" {
+		warn = append(warn, "портал RemoteDesktop (ввод мыши) есть только у KDE/GNOME — на "+de+" ввод может не работать")
+	}
+	if gpu == "NVIDIA" {
+		warn = append(warn, "NVIDIA: VAAPI-энкод не поддержан, ожидается фолбэк/сбой видео")
+	}
+	if len(warn) > 0 {
+		msg += " | WARN: " + strings.Join(warn, "; ")
+	}
+	return msg
+}
+
+func orNA(s string) string {
+	if s == "" {
+		return "n/a"
+	}
+	return s
 }
 
 // gstLaunchPath — путь к gst-launch-1.0 (для Wayland-видео из PipeWire). Сначала
@@ -89,6 +147,15 @@ func gstLaunchPath() string {
 // переопределяет её на нативный путь (libpipewire+libva, кадр на GPU).
 var waylandVideoFn = startVideoWaylandGst
 
+// Хуки нативного энкодера для WebRTC-контура: форс IDR (ответ на PLI зрителя) и
+// смена битрейта на лету (адаптация к сети). Задаёт нативный путь; gst-путь
+// сбрасывает в nil (не поддерживает). Без них любая потеря пакета сыпет картинку
+// до планового IDR, а битрейт не подстраивается под канал.
+var (
+	waylandForceKey   func()
+	waylandSetBitrate func(kbps int)
+)
+
 // NewEncoder на Linux: ffmpeg/gst-энкодер, если доступно видео ИЛИ звук; иначе
 // headless-заглушка (только терминал).
 func NewEncoder() CaptureEncoder {
@@ -105,6 +172,7 @@ type FFmpegLinux struct{}
 func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) {
 	backend := videoBackend()
 	audio := opts.Audio && AudioAvailable()
+	log.Printf("capture: %s audio=%v", describeEnv(backend), audio)
 	if backend == "" && !audio {
 		return noVideoEncoder{}.Start(ctx, opts)
 	}
@@ -140,7 +208,13 @@ func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) 
 			audioCh = a
 		}
 	}
-	return &Stream{Video: video, Audio: audioCh}, nil
+	st := &Stream{Video: video, Audio: audioCh}
+	if backend == "wayland" {
+		// Нативный путь умеет PLI→IDR и смену битрейта; gst-путь оставляет nil.
+		st.ForceKeyframe = waylandForceKey
+		st.SetBitrate = waylandSetBitrate
+	}
+	return st, nil
 }
 
 func closedChan() chan []byte {
@@ -166,39 +240,6 @@ func bitrateKbps(b string) int {
 	return n * mult
 }
 
-// startAudioProc запускает аудио-ffmpeg (PulseAudio → Opus) и возвращает канал
-// Opus-пакетов. @DEFAULT_MONITOR@ = монитор дефолтного sink (СИСТЕМНЫЙ вывод), а
-// не микрофон.
-func startAudioProc(ctx context.Context) (chan []byte, error) {
-	args := []string{
-		"-hide_banner", "-loglevel", "error", "-nostats",
-		"-f", "pulse", "-i", "@DEFAULT_MONITOR@",
-		"-c:a", "libopus", "-b:a", "128k", "-application", "lowdelay",
-		"-page_duration", "20000",
-		"-f", "ogg", "pipe:1",
-	}
-	cmd := exec.CommandContext(ctx, FFmpegPath(), args...)
-	log.Printf("capture: ffmpeg audio %s", strings.Join(args, " "))
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stderr pipe: %w", err)
-	}
-	go logStderr(stderr)
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start ffmpeg: %w", err)
-	}
-	out := make(chan []byte, 16)
-	go func() {
-		defer waitKill(cmd, "audio")
-		readOggOpus(ctx, stdout, out)
-	}()
-	return out, nil
-}
-
 // waitKill гарантирует остановку subprocess и логирует завершение.
 func waitKill(cmd *exec.Cmd, what string) {
 	if cmd.Process != nil {
@@ -206,32 +247,6 @@ func waitKill(cmd *exec.Cmd, what string) {
 	}
 	_ = cmd.Wait()
 	log.Printf("capture stopped (%s)", what)
-}
-
-// readOggOpus читает Opus-страницы из ogg-потока и шлёт пакеты в канал (≈20 мс).
-func readOggOpus(ctx context.Context, r io.Reader, out chan []byte) {
-	defer close(out)
-	reader, _, err := oggreader.NewWith(bufio.NewReader(r))
-	if err != nil {
-		if ctx.Err() == nil {
-			log.Printf("capture: ogg header: %v", err)
-		}
-		return
-	}
-	for {
-		page, _, err := reader.ParseNextPage()
-		if err != nil {
-			if ctx.Err() == nil {
-				log.Printf("audio: ogg read: %v", err)
-			}
-			return
-		}
-		select {
-		case out <- page:
-		case <-ctx.Done():
-			return
-		}
-	}
 }
 
 // Перечисление окон/приложений на Linux не реализовано (захват — весь экран).

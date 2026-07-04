@@ -30,6 +30,7 @@ var (
 	tokSeq uint64
 )
 
+
 func newHandleToken() string {
 	tokMu.Lock()
 	tokSeq++
@@ -98,6 +99,7 @@ func sessionHandleOf(res map[string]dbus.Variant) string {
 // канал кадров. Это ФОЛБЭК-путь (через CPU-копию/пайп). Нативный путь на GPU
 // (libpipewire+libva, cgo) переопределяет waylandVideoFn в cgo-сборке.
 func startVideoWaylandGst(ctx context.Context, opts Options) (chan []byte, error) {
+	waylandForceKey, waylandSetBitrate = nil, nil // gst-путь этого не умеет
 	gst := gstLaunchPath()
 	if gst == "" {
 		return nil, fmt.Errorf("gst-launch-1.0 не найден (нужен для Wayland-захвата)")
