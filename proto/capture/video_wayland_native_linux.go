@@ -7,7 +7,7 @@ package capture
 // Mac (тег darwin) этот файл и .c не видит вообще. C-часть — native_pw_linux.c.
 
 /*
-#cgo pkg-config: libpipewire-0.3 libavcodec libavfilter libavutil
+#cgo pkg-config: libpipewire-0.3 libavcodec libavfilter libavutil egl gbm libdrm
 #include "native_pw_linux.h"
 */
 import "C"
@@ -92,6 +92,8 @@ func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, erro
 		th -= th % 2
 	}
 
+	// CFR-таймер в C гонит кадры ровно на fps (как Mac) → отдаём обычным байтовым
+	// каналом с фиксированной длительностью в WriteSample. Метки времени не нужны.
 	frames := make(chan []byte, 8)
 	nativeCh = frames
 	cfg := C.katana_native_cfg{
