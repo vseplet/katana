@@ -14,7 +14,7 @@
 //      памяти, memcpy последнего кадра, таймер энкодит его ровно на fps (CFR).
 //      Включается, если dmabuf не согласовался. Не хуже прежних стабильных 60fps.
 
-#include "native_pw_linux.h"
+#include "backend_portal_vaapi_linux.h"
 
 #include <fcntl.h>
 #include <pthread.h>

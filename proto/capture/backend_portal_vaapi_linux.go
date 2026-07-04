@@ -2,13 +2,16 @@
 
 package capture
 
-// Нативный Wayland-захват на GPU: PipeWire → libav (VAAPI) → H264 в одном
-// процессе, без gst и raw-пайпа. Компилируется ТОЛЬКО в cgo-сборке под Linux —
-// Mac (тег darwin) этот файл и .c не видит вообще. C-часть — native_pw_linux.c.
+// Бэкенд захвата: xdg-desktop-portal (ScreenCast) + PipeWire → libav VAAPI → H264,
+// zero-copy через dmabuf. ЦЕЛЕВОЙ СТЕК: Wayland + KDE/KWin (или GNOME) портал +
+// AMD GPU (фильтр DCC-модификаторов в .c — AMD-специфика; Intel вероятно ОК,
+// NVIDIA — нет). Компилируется ТОЛЬКО в cgo-сборке под Linux; Mac (тег darwin)
+// этот файл и .c не видит. C-часть — backend_portal_vaapi_linux.c. Матрица
+// поддержки целиком — в doc.go.
 
 /*
 #cgo pkg-config: libpipewire-0.3 libavcodec libavfilter libavutil egl gbm libdrm
-#include "native_pw_linux.h"
+#include "backend_portal_vaapi_linux.h"
 */
 import "C"
 
