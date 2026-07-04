@@ -4,8 +4,8 @@
 #
 #   sh steamos.sh
 #
-# Бинарь собирается воркфлоу native-linux (Actions → Run workflow) в Arch-
-# контейнере (совпадает со SteamOS) и публикуется в пре-релиз с тегом native.
+# Бинарь собирается воркфлоу steamos-dev (Actions → Run workflow) в Debian 12
+# (портативный glibc) и публикуется в rolling-пре-релиз с тегом native.
 set -e
 
 SESSION="5ca6efe2-3e5d-43f3-b92b-c3966a196fec"
@@ -18,7 +18,7 @@ REL="https://github.com/vseplet/katana/releases/download/native"
 mkdir -p "$KAT/bin"
 
 echo "downloading native build + ffmpeg libs…"
-curl -fL "$REL/katana-linux-amd64-native" -o "$BIN" || { echo "error: не скачался бинарь — сначала запусти workflow native-linux (Actions → Run workflow)"; exit 1; }
+curl -fL "$REL/katana-steamos-amd64" -o "$BIN" || { echo "error: не скачался бинарь — сначала запусти workflow steamos-dev (Actions → Run workflow)"; exit 1; }
 curl -fL "$REL/native-libs.tar.gz" -o "$KAT/native-libs.tar.gz" || { echo "error: не скачались либы"; exit 1; }
 rm -rf "$LIBS"
 tar -C "$KAT" -xzf "$KAT/native-libs.tar.gz"  # → $KAT/native-libs/
