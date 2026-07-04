@@ -1142,12 +1142,21 @@ func (p *peer) closePC() {
 	}
 }
 
+// inputDebug — KATANA_INPUT_DEBUG=1 включает лог сырых mouse-событий.
+var inputDebug = os.Getenv("KATANA_INPUT_DEBUG") != ""
+
 // dispatchInput обрабатывает события ввода (mouse/scroll/cursor/key/type) — общий
 // путь для DataChannel (основной) и WebSocket (фолбэк).
 func (p *peer) dispatchInput(msg *signalMessage) {
 	switch msg.Type {
 	case "mouse":
 		if msg.Mouse != nil {
+			// KATANA_INPUT_DEBUG=1: сырой поток mouse-событий (отладка мобильного
+			// тача — «курсор улетает в угол»).
+			if inputDebug {
+				log.Printf("input: mouse action=%q x=%.4f y=%.4f dx=%d dy=%d btn=%q",
+					msg.Mouse.Action, msg.Mouse.X, msg.Mouse.Y, msg.Mouse.Dx, msg.Mouse.Dy, msg.Mouse.Button)
+			}
 			p.handleMouse(msg.Mouse)
 		}
 	case "scroll":

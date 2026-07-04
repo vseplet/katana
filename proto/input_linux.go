@@ -241,6 +241,13 @@ func moveMouse(x, y int) {
 }
 
 func mouseLocation() (int, int) {
+	// Wayland: позиция из модели портала (единственный, кто реально двигает
+	// курсор) — иначе локальная тень с нуля врёт и cursorpos улетает в угол.
+	if onWayland() {
+		if x, y, ok := capture.PortalCursorPos(); ok {
+			return int(x), int(y)
+		}
+	}
 	inMu.Lock()
 	defer inMu.Unlock()
 	return curX, curY

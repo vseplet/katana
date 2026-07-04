@@ -89,6 +89,15 @@ func gstLaunchPath() string {
 // переопределяет её на нативный путь (libpipewire+libva, кадр на GPU).
 var waylandVideoFn = startVideoWaylandGst
 
+// Хуки нативного энкодера для WebRTC-контура: форс IDR (ответ на PLI зрителя) и
+// смена битрейта на лету (адаптация к сети). Задаёт нативный путь; gst-путь
+// сбрасывает в nil (не поддерживает). Без них любая потеря пакета сыпет картинку
+// до планового IDR, а битрейт не подстраивается под канал.
+var (
+	waylandForceKey   func()
+	waylandSetBitrate func(kbps int)
+)
+
 // NewEncoder на Linux: ffmpeg/gst-энкодер, если доступно видео ИЛИ звук; иначе
 // headless-заглушка (только терминал).
 func NewEncoder() CaptureEncoder {
@@ -140,7 +149,13 @@ func (f *FFmpegLinux) Start(ctx context.Context, opts Options) (*Stream, error) 
 			audioCh = a
 		}
 	}
-	return &Stream{Video: video, Audio: audioCh}, nil
+	st := &Stream{Video: video, Audio: audioCh}
+	if backend == "wayland" {
+		// Нативный путь умеет PLI→IDR и смену битрейта; gst-путь оставляет nil.
+		st.ForceKeyframe = waylandForceKey
+		st.SetBitrate = waylandSetBitrate
+	}
+	return st, nil
 }
 
 func closedChan() chan []byte {

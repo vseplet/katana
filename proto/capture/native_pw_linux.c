@@ -82,8 +82,12 @@ struct nstate {
 	AVFilterGraph *graph;
 	AVFilterContext *src, *sink;
 	AVCodecContext *enc;
-	int w, h, inited;
+	int w, h, out_w, out_h, inited;
 	long long pts;
+
+	// Запросы из Go (под mtx): форс IDR (PLI зрителя) и смена битрейта на лету.
+	int key_req;
+	int kbps_req; // 0 = нет запроса
 
 	// Режим захвата, выбранный при согласовании формата.
 	int use_dmabuf;       // 1 = dmabuf zero-copy, 0 = CPU MemPtr
@@ -406,6 +410,66 @@ static int init_encoder_dmabuf(int in_w, int in_h)
 
 static void *enc_thread_fn(void *arg);
 
+// open_codec: (пере)открывает h264_vaapi на hw_frames_ctx из sink с текущими
+// S.cfg_kbps/S.out_w/S.out_h. Зовётся при инициализации и при смене битрейта.
+// GOP длинный (4с): IDR в основном по PLI (см. katana_native_force_key) — без
+// секундных IDR-бёрстов, которые душат канал.
+static int open_codec(void)
+{
+	int ret;
+	const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
+	if (!codec) {
+		nlog("h264_vaapi not found");
+		return -1;
+	}
+	S.enc = avcodec_alloc_context3(codec);
+	S.enc->width = S.out_w;
+	S.enc->height = S.out_h;
+	S.enc->pix_fmt = AV_PIX_FMT_VAAPI;
+	S.enc->time_base = (AVRational){1, S.cfg_fps};
+	S.enc->framerate = (AVRational){S.cfg_fps, 1};
+	S.enc->bit_rate = (int64_t)S.cfg_kbps * 1000; // из настроек (--bitrate/зритель)
+	S.enc->gop_size = S.cfg_fps * 4;
+	S.enc->max_b_frames = 0;
+	S.enc->refs = 1;
+	S.enc->flags |= AV_CODEC_FLAG_LOW_DELAY;
+	AVBufferRef *fctx = av_buffersink_get_hw_frames_ctx(S.sink);
+	if (!fctx) {
+		nlog("no hw_frames_ctx from sink");
+		return -1;
+	}
+	S.enc->hw_frames_ctx = av_buffer_ref(fctx);
+	if ((ret = avcodec_open2(S.enc, codec, NULL)) < 0) {
+		log_averr("avcodec_open2", ret);
+		avcodec_free_context(&S.enc);
+		return -1;
+	}
+	return 0;
+}
+
+// check_reqs: забирает запросы из Go (форс IDR по PLI, смена битрейта) на такте
+// энкод-потока. Возвращает 1, если ближайший кадр должен быть IDR.
+static int check_reqs(void)
+{
+	pthread_mutex_lock(&S.mtx);
+	int fk = S.key_req;
+	int kb = S.kbps_req;
+	S.key_req = 0;
+	S.kbps_req = 0;
+	pthread_mutex_unlock(&S.mtx);
+	if (kb > 0 && kb != S.cfg_kbps) {
+		S.cfg_kbps = kb;
+		avcodec_free_context(&S.enc);
+		if (open_codec() == 0) {
+			nlog("bitrate -> %dk (encoder reopened)", kb);
+			fk = 1; // новый поток энкодера — начинаем с IDR
+		} else {
+			nlog("bitrate change failed (encoder reopen)");
+		}
+	}
+	return fk;
+}
+
 // init_encoder: общий хвост — открыть h264_vaapi на hw_frames_ctx из sink и
 // поднять энкод-поток. graph уже собран (cpu/dmabuf).
 static int init_encoder(int in_w, int in_h)
@@ -425,33 +489,10 @@ static int init_encoder(int in_w, int in_h)
 			nlog("dmabuf encoder init failed — will not stream (check fallback)");
 		return -1;
 	}
-
-	const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
-	if (!codec) {
-		nlog("h264_vaapi not found");
+	S.out_w = out_w;
+	S.out_h = out_h;
+	if (open_codec() < 0)
 		return -1;
-	}
-	S.enc = avcodec_alloc_context3(codec);
-	S.enc->width = out_w;
-	S.enc->height = out_h;
-	S.enc->pix_fmt = AV_PIX_FMT_VAAPI;
-	S.enc->time_base = (AVRational){1, S.cfg_fps};
-	S.enc->framerate = (AVRational){S.cfg_fps, 1};
-	S.enc->bit_rate = (int64_t)S.cfg_kbps * 1000; // из настроек (--bitrate/зритель)
-	S.enc->gop_size = S.cfg_fps;
-	S.enc->max_b_frames = 0;
-	S.enc->refs = 1;
-	S.enc->flags |= AV_CODEC_FLAG_LOW_DELAY;
-	AVBufferRef *fctx = av_buffersink_get_hw_frames_ctx(S.sink);
-	if (!fctx) {
-		nlog("no hw_frames_ctx from sink");
-		return -1;
-	}
-	S.enc->hw_frames_ctx = av_buffer_ref(fctx);
-	if ((ret = avcodec_open2(S.enc, codec, NULL)) < 0) {
-		log_averr("avcodec_open2", ret);
-		return -1;
-	}
 	pthread_mutex_lock(&S.mtx);
 	S.inited = 1;
 	pthread_mutex_unlock(&S.mtx);
@@ -465,10 +506,29 @@ static int init_encoder(int in_w, int in_h)
 	return 0;
 }
 
+// Диагностика размеров пакетов: I-кадры vs P-кадры (бёрсты IDR душат канал).
+static long long dbg_i_bytes, dbg_p_bytes, dbg_pkt_log;
+static int dbg_i_n, dbg_p_n;
+
 static void drain_packets(void)
 {
 	AVPacket *pkt = av_packet_alloc();
 	while (avcodec_receive_packet(S.enc, pkt) == 0) {
+		if (pkt->flags & AV_PKT_FLAG_KEY) {
+			dbg_i_bytes += pkt->size;
+			dbg_i_n++;
+		} else {
+			dbg_p_bytes += pkt->size;
+			dbg_p_n++;
+		}
+		if (now_ns() >= dbg_pkt_log) {
+			nlog("pkt stats: I n=%d avg=%lldKB; P n=%d avg=%lldKB",
+				dbg_i_n, dbg_i_n ? dbg_i_bytes / dbg_i_n / 1024 : 0,
+				dbg_p_n, dbg_p_n ? dbg_p_bytes / dbg_p_n / 1024 : 0);
+			dbg_i_bytes = dbg_p_bytes = 0;
+			dbg_i_n = dbg_p_n = 0;
+			dbg_pkt_log = now_ns() + 5000000000LL;
+		}
 		goNativeH264(pkt->data, pkt->size);
 		av_packet_unref(pkt);
 	}
@@ -703,6 +763,27 @@ static void on_process(void *userdata)
 			buf->n_datas > 0 ? (int)buf->datas[0].fd : -1, S.inited, S.use_dmabuf);
 	}
 
+	// Диагностика каденции прихода кадров от KWin: интервалы между on_process.
+	static long long dbg_last_arr, dbg_arr_log;
+	static long long dbg_min = 1LL << 60, dbg_max, dbg_sum;
+	static int dbg_n, dbg_gaps;
+	long long arr_t = now_ns();
+	if (dbg_last_arr) {
+		long long d = arr_t - dbg_last_arr;
+		if (d < dbg_min) dbg_min = d;
+		if (d > dbg_max) dbg_max = d;
+		dbg_sum += d;
+		dbg_n++;
+		if (d > 25000000LL) dbg_gaps++; // пауза >25мс (пропуск такта 60Гц)
+	}
+	dbg_last_arr = arr_t;
+	if (arr_t >= dbg_arr_log && dbg_n > 0) {
+		nlog("arrival: n=%d avg=%.1fms min=%.1fms max=%.1fms gaps>25ms=%d",
+			dbg_n, dbg_sum / 1e6 / dbg_n, dbg_min / 1e6, dbg_max / 1e6, dbg_gaps);
+		dbg_min = 1LL << 60; dbg_max = dbg_sum = 0; dbg_n = dbg_gaps = 0;
+		dbg_arr_log = arr_t + 5000000000LL;
+	}
+
 	if (S.use_dmabuf) {
 		if (S.inited && buf->n_datas > 0 && buf->datas[0].type == SPA_DATA_DmaBuf &&
 				buf->datas[0].fd >= 0) {
@@ -751,9 +832,9 @@ static void on_process(void *userdata)
 // Mac-тикер). На статике переотправляем тот же кадр → ровный поток с фиксированной
 // длительностью в WriteSample (RTP-часы не плывут, зритель не дёргается и не
 // сыпется — проверено: Mac-путь с той же моделью работает идеально). memcpy'а нет
-// (кадр — dmabuf-хендл), поэтому RT-поток PipeWire не перегружается. IDR форсим по
-// wall-clock раз в 1с.
-#define KEY_INTERVAL_NS 1000000000LL
+// (кадр — dmabuf-хендл), поэтому RT-поток PipeWire не перегружается. IDR — по PLI
+// зрителя (check_reqs) + страховочный wall-clock раз в 4с (PLI мог потеряться).
+#define KEY_INTERVAL_NS 4000000000LL
 static void dmabuf_timer_loop(void)
 {
 	long long interval = 1000000000LL / (S.cfg_fps > 0 ? S.cfg_fps : 30);
@@ -774,11 +855,16 @@ static void dmabuf_timer_loop(void)
 		pthread_mutex_lock(&S.mtx);
 		AVFrame *f = S.latest_frame ? av_frame_clone(S.latest_frame) : NULL;
 		pthread_mutex_unlock(&S.mtx);
+		int req_key = check_reqs(); // PLI/битрейт — даже если кадра ещё нет
 		if (!f)
 			continue;
+		if (!S.enc) { // переоткрытие битрейта упало — пропускаем такт
+			av_frame_free(&f);
+			continue;
+		}
 
 		long long t = now_ns();
-		int force_key = (last_key == 0) || (t - last_key >= KEY_INTERVAL_NS);
+		int force_key = req_key || (last_key == 0) || (t - last_key >= KEY_INTERVAL_NS);
 		if (force_key)
 			last_key = t;
 		f->pts = S.pts++;
@@ -835,7 +921,8 @@ static void cpu_timer_loop(void)
 				ready = 0;
 		}
 		pthread_mutex_unlock(&S.mtx);
-		if (!ready)
+		int req_key = check_reqs(); // PLI/битрейт и в CPU-фолбэке
+		if (!ready || !S.enc)
 			continue;
 
 		AVFrame *in = av_frame_alloc();
@@ -846,7 +933,7 @@ static void cpu_timer_loop(void)
 		in->linesize[0] = stride;
 		in->pts = S.pts++;
 		long long t0 = now_ns();
-		encode_frame(in, 0); // CFR 60fps + gop=fps → IDR раз в ~1с сам собой
+		encode_frame(in, req_key);
 		av_frame_free(&in);
 		stat_ns += now_ns() - t0;
 		stat_n++;
@@ -985,4 +1072,22 @@ int katana_native_start(katana_native_cfg cfg)
 void katana_native_stop(void)
 {
 	g_running = 0;
+}
+
+void katana_native_force_key(void)
+{
+	if (!g_running)
+		return;
+	pthread_mutex_lock(&S.mtx);
+	S.key_req = 1;
+	pthread_mutex_unlock(&S.mtx);
+}
+
+void katana_native_set_bitrate(int kbps)
+{
+	if (!g_running || kbps <= 0)
+		return;
+	pthread_mutex_lock(&S.mtx);
+	S.kbps_req = kbps;
+	pthread_mutex_unlock(&S.mtx);
 }

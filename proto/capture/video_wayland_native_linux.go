@@ -109,12 +109,17 @@ func nativePipeWireCapture(ctx context.Context, opts Options) (chan []byte, erro
 		syscall.Close(fd)
 		close(frames)
 		nativeCh = nil
+		waylandForceKey, waylandSetBitrate = nil, nil
 		log.Printf("capture stopped (native)")
 	}()
 	go func() {
 		<-ctx.Done()
 		C.katana_native_stop()
 	}()
+	// Контур обратной связи WebRTC: PLI зрителя → мгновенный IDR; адаптация
+	// битрейта к сети → переоткрытие энкодера на лету.
+	waylandForceKey = func() { C.katana_native_force_key() }
+	waylandSetBitrate = func(kbps int) { C.katana_native_set_bitrate(C.int(kbps)) }
 	log.Printf("capture: native wayland (pipewire→vaapi, %dfps %dk)", fps, kbps)
 	return frames, nil
 }
