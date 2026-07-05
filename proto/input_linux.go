@@ -7,6 +7,7 @@
 //     но БЕЗ RemoteDesktop-сессии (значит захват можно вести персистируемой
 //     ScreenCast-сессией и не показывать диалог каждый запуск).
 //   - X11: относительная мышь (дельты; позицию ведём сами, старт — угол 0,0).
+//
 // Клавиатура — отдельное uinput-устройство на обеих сессиях.
 //
 // Конструктор устройств обобщён (EV_KEY/EV_REL/EV_ABS + INPUT_PROP) — под будущий
@@ -45,15 +46,15 @@ const (
 	relHWheel = 0x06
 	relWheel  = 0x08
 
-	absX    = 0x00
-	absY    = 0x01
-	absZ    = 0x02 // левый триггер (геймпад)
-	absRX   = 0x03 // правый стик X
-	absRY   = 0x04 // правый стик Y
-	absRZ   = 0x05 // правый триггер
-	absHat0X = 0x10 // крестовина X
-	absHat0Y = 0x11 // крестовина Y
-	absMax  = 32767 // диапазон абсолютных осей (как QEMU usb-tablet)
+	absX     = 0x00
+	absY     = 0x01
+	absZ     = 0x02  // левый триггер (геймпад)
+	absRX    = 0x03  // правый стик X
+	absRY    = 0x04  // правый стик Y
+	absRZ    = 0x05  // правый триггер
+	absHat0X = 0x10  // крестовина X
+	absHat0Y = 0x11  // крестовина Y
+	absMax   = 32767 // диапазон абсолютных осей (как QEMU usb-tablet)
 
 	// BTN_* для геймпада Xbox-типа (linux/input-event-codes.h)
 	btnGamepadA     = 0x130
@@ -130,7 +131,16 @@ func ioctl(f *os.File, req uintptr, arg uintptr) error {
 // устройство. keys — EV_KEY коды (кнопки/клавиши), rels — EV_REL оси, abses —
 // EV_ABS оси с диапазоном, props — INPUT_PROP_* свойства. Обобщён под указатель,
 // клавиатуру и будущий геймпад.
-func createUinput(name string, keys, rels []int, abses []absAxis, props []int) (*inputDev, error) {
+// usbID подменяет шину/VID/PID/версию виртуального устройства. Нужен геймпаду:
+// с дефолтным 0001:0001 его нет ни в одной базе маппингов (SDL game-controller
+// DB), поэтому браузерный Gamepad API и «голая» ОС его не распознают (Steam Input
+// читает evdev напрямую и нетребователен — потому в играх работает и так). Спуф
+// под Xbox 360 wired (045e:028e) даёт стандартный маппинг везде: наш layout
+// (стики X/Y+RX/RY, аналог. триггеры Z/RZ, крестовина HAT, кнопки A/B/X/Y/TL/TR/
+// SELECT/START/MODE/THUMBL/THUMBR) в точности повторяет xpad.
+type usbID struct{ bus, vendor, product, version uint16 }
+
+func createUinput(name string, keys, rels []int, abses []absAxis, props []int, id ...usbID) (*inputDev, error) {
 	f, err := os.OpenFile("/dev/uinput", os.O_WRONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
@@ -168,12 +178,16 @@ func createUinput(name string, keys, rels []int, abses []absAxis, props []int) (
 
 	// uinput_user_dev: name[80] + input_id(8) + ff_effects_max(4) +
 	// absmax[64]@92 + absmin[64]@348 + absfuzz[64]@604 + absflat[64]@860.
+	dev := usbID{bus: 0x03, vendor: 0x1, product: 0x1, version: 0x1} // BUS_USB, generic
+	if len(id) > 0 {
+		dev = id[0]
+	}
 	buf := make([]byte, 80+8+4+absCnt*4*4)
 	copy(buf[:80], name)
-	binary.LittleEndian.PutUint16(buf[80:], 0x03) // BUS_USB
-	binary.LittleEndian.PutUint16(buf[82:], 0x1)  // vendor
-	binary.LittleEndian.PutUint16(buf[84:], 0x1)  // product
-	binary.LittleEndian.PutUint16(buf[86:], 0x1)  // version
+	binary.LittleEndian.PutUint16(buf[80:], dev.bus)
+	binary.LittleEndian.PutUint16(buf[82:], dev.vendor)
+	binary.LittleEndian.PutUint16(buf[84:], dev.product)
+	binary.LittleEndian.PutUint16(buf[86:], dev.version)
 	for _, a := range abses {
 		binary.LittleEndian.PutUint32(buf[92+a.code*4:], uint32(int32(a.max)))
 		binary.LittleEndian.PutUint32(buf[348+a.code*4:], uint32(int32(a.min)))
@@ -597,7 +611,8 @@ var gpBtnCodes = map[int]uint16{
 
 var (
 	gpMu    sync.Mutex
-	gp      *inputDev
+	gp      *inputDev    // uinput-геймпад (fallback)
+	gpu     *uhidGamepad // uhid-геймпад (предпочтительный; nil если /dev/uhid недоступен)
 	gpReady bool
 	hatBtns [4]bool // [0]=up [1]=down [2]=left [3]=right
 )
@@ -606,9 +621,23 @@ func ensureGamepad() bool {
 	gpMu.Lock()
 	defer gpMu.Unlock()
 	if gpReady {
-		return gp != nil
+		return gpu != nil || gp != nil
 	}
 	gpReady = true
+
+	// Путь 1 (предпочтительный): uhid — HID-устройство «как физический Xbox».
+	// Видно и Steam (hidraw), и браузеру/не-Steam (evdev). Нужен доступ к
+	// /dev/uhid (udev-правило uaccess); при EACCES откатываемся на uinput.
+	if u, err := newUhidGamepad(); err == nil {
+		gpu = u
+		log.Printf("input: gamepad via uhid (Xbox Wireless Controller, 045e:0b13)")
+		return true
+	} else {
+		log.Printf("input: uhid gamepad unavailable (%v) — fallback to uinput evdev", err)
+	}
+
+	// Путь 2 (fallback): uinput evdev. Работает в Steam-играх, но Steam
+	// эксклюзивно грабит evdev → браузер/не-Steam его не видят.
 	var err error
 	gp, err = createUinput("katana-gamepad",
 		[]int{
@@ -629,6 +658,7 @@ func ensureGamepad() bool {
 			{absHat0Y, -1, 1},
 		},
 		nil,
+		usbID{bus: 0x03, vendor: 0x045e, product: 0x028e, version: 0x0114}, // Xbox 360 wired
 	)
 	if err != nil {
 		log.Printf("input: uinput gamepad: %v", err)
@@ -643,6 +673,10 @@ func gamepadButton(btn int, down bool, val float64) {
 	}
 	gpMu.Lock()
 	defer gpMu.Unlock()
+	if gpu != nil {
+		gpu.button(btn, down, val)
+		return
+	}
 	// Триггеры: аналоговая ось + цифровая кнопка
 	if btn == 6 {
 		gp.emit(evAbs, absZ, int32(val*255))
@@ -703,6 +737,10 @@ func gamepadAxis(axis int, val float64) {
 	}
 	gpMu.Lock()
 	defer gpMu.Unlock()
+	if gpu != nil {
+		gpu.axis(axis, val)
+		return
+	}
 	v := int32(val * 32767)
 	if v < -32767 {
 		v = -32767
