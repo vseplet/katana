@@ -2,14 +2,20 @@
 
 package capture
 
-// Единая сессия xdg-desktop-portal для Wayland: RemoteDesktop (инъекция мыши/
-// клавиатуры) + ScreenCast (захват экрана) в ОДНОМ сеансе — один диалог KDE
-// «разрешить удалённое управление и захват экрана». Абсолютная позиция курсора
-// идёт через NotifyPointerMotionAbsolute (истинные координаты через композитор,
-// без uinput-ускорения). Сессия — синглтон на весь процесс хоста.
+// Сессия xdg-desktop-portal для Wayland: ЧИСТЫЙ ScreenCast (только захват экрана,
+// без RemoteDesktop). Ввод (мышь/клавиатура) идёт мимо портала — через uinput
+// (см. proto/input_linux.go), поэтому сессия не содержит удалённого управления.
+// Это принципиально: KDE отказывается персистить сессии с управлением вводом
+// («Remote desktop sessions cannot persist»), а чистый ScreenCast — персистит.
+// Поэтому здесь используем persist_mode=2 + restore_token: диалог KDE показывается
+// ОДИН раз, дальше грант восстанавливается по токену (переживает рестарт,
+// перезагрузку и обновление SteamOS — токен лежит на /home). Сессия — синглтон.
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/godbus/dbus/v5"
@@ -19,21 +25,7 @@ type portalSession struct {
 	conn    *dbus.Conn
 	obj     dbus.BusObject
 	session dbus.ObjectPath
-	node    uint32 // ScreenCast-поток (для маппинга абсолютных координат мыши)
-	// Портал работает в ЛОГИЧЕСКИХ координатах потока (с учётом HiDPI-масштаба), а
-	// зритель/SourceRect — в физических пикселях DRM. scaleX/Y = логич./физич.
-	scaleX float64
-	scaleY float64
-
-	// Тень позиции курсора (физические px). Относительное движение (трекпад-режим
-	// мобилы) конвертим в АБСОЛЮТНОЕ: тень += дельта → NotifyPointerMotionAbsolute.
-	// Иначе относительный NotifyPointerMotion проходит через ускорение указателя
-	// KWin → реальная позиция расходится с моделью хоста → cursorpos врёт и
-	// вьювер «улетает в угол». Абсолют = точность 1:1 и валидный cursorpos.
-	posMu        sync.Mutex
-	shadowX      float64
-	shadowY      float64
-	physW, physH float64
+	node    uint32 // ScreenCast-поток (PipeWire node id для захвата)
 }
 
 var (
@@ -42,8 +34,47 @@ var (
 	portalErr  error // кэш отказа/ошибки — чтобы не долбить диалогом повторно
 )
 
-// ensurePortal лениво создаёт объединённую RemoteDesktop+ScreenCast сессию (один
-// раз). При отказе пользователя кэширует ошибку (до перезапуска хоста).
+// --- restore_token: персист гранта захвата между запусками ---------------------
+// Файл в $XDG_STATE_HOME (по умолчанию ~/.local/state) — на SteamOS это отдельный
+// раздел /home, переживающий перезагрузку и обновление системы.
+
+func tokenPath() string {
+	dir := os.Getenv("XDG_STATE_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(dir, "katana", "screencast.token")
+}
+
+func loadToken() string {
+	p := tokenPath()
+	if p == "" {
+		return ""
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func saveToken(tok string) {
+	p := tokenPath()
+	if p == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return
+	}
+	_ = os.WriteFile(p, []byte(tok), 0o600)
+}
+
+// ensurePortal лениво создаёт ScreenCast-сессию (один раз). При отказе пользователя
+// кэширует ошибку (до перезапуска хоста).
 func ensurePortal() (*portalSession, error) {
 	portalMu.Lock()
 	defer portalMu.Unlock()
@@ -69,8 +100,8 @@ func openPortal() (*portalSession, error) {
 	}
 	obj := conn.Object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
 
-	// 1) RemoteDesktop.CreateSession
-	res, err := portalRequest(conn, obj, "org.freedesktop.portal.RemoteDesktop.CreateSession",
+	// 1) ScreenCast.CreateSession
+	res, err := portalRequest(conn, obj, "org.freedesktop.portal.ScreenCast.CreateSession",
 		map[string]dbus.Variant{"session_handle_token": dbus.MakeVariant(newHandleToken())})
 	if err != nil {
 		conn.Close()
@@ -83,30 +114,38 @@ func openPortal() (*portalSession, error) {
 	}
 	session := dbus.ObjectPath(sh)
 
-	// 2) RemoteDesktop.SelectDevices: клавиатура(1)+указатель(2) = 3
-	if _, err := portalRequest(conn, obj, "org.freedesktop.portal.RemoteDesktop.SelectDevices",
-		map[string]dbus.Variant{"types": dbus.MakeVariant(uint32(3))}, session); err != nil {
-		conn.Close()
-		return nil, err
+	// 2) ScreenCast.SelectSources: монитор, курсор в кадре, persist до отзыва.
+	// restore_token добавляем ТОЛЬКО если он валиден (KDE отвергает пустую строку:
+	// «Restore token is not a valid UUID string»). На первом запуске шлём лишь
+	// persist_mode — KDE покажет диалог и вернёт токен в результате Start.
+	selOpts := map[string]dbus.Variant{
+		"types":        dbus.MakeVariant(uint32(1)), // MONITOR
+		"cursor_mode":  dbus.MakeVariant(uint32(2)), // EMBEDDED (курсор в кадре)
+		"multiple":     dbus.MakeVariant(false),
+		"persist_mode": dbus.MakeVariant(uint32(2)), // persist until revoked
 	}
-
-	// 3) ScreenCast.SelectSources в ТОЙ ЖЕ сессии: монитор, курсор в кадре
+	if tok := loadToken(); tok != "" {
+		selOpts["restore_token"] = dbus.MakeVariant(tok)
+	}
 	if _, err := portalRequest(conn, obj, "org.freedesktop.portal.ScreenCast.SelectSources",
-		map[string]dbus.Variant{
-			"types":       dbus.MakeVariant(uint32(1)), // MONITOR
-			"cursor_mode": dbus.MakeVariant(uint32(2)), // EMBEDDED
-			"multiple":    dbus.MakeVariant(false),
-		}, session); err != nil {
+		selOpts, session); err != nil {
 		conn.Close()
 		return nil, err
 	}
 
-	// 4) RemoteDesktop.Start → диалог KDE (экран + управление), возвращает streams
-	res, err = portalRequest(conn, obj, "org.freedesktop.portal.RemoteDesktop.Start",
+	// 3) ScreenCast.Start → диалог KDE (первый раз), возвращает streams + токен.
+	res, err = portalRequest(conn, obj, "org.freedesktop.portal.ScreenCast.Start",
 		map[string]dbus.Variant{}, session, "")
 	if err != nil {
 		conn.Close()
 		return nil, err
+	}
+	// Сохраняем restore_token (портал мог его ротировать) для следующего запуска.
+	if v, ok := res["restore_token"]; ok {
+		if tok, _ := v.Value().(string); tok != "" {
+			saveToken(tok)
+			log.Printf("portal: restore_token saved (screencast persist)")
+		}
 	}
 	var streams []struct {
 		Node  uint32
@@ -116,28 +155,7 @@ func openPortal() (*portalSession, error) {
 		conn.Close()
 		return nil, fmt.Errorf("нет ScreenCast-потоков: %v", err)
 	}
-	ps := &portalSession{conn: conn, obj: obj, session: session, node: streams[0].Node, scaleX: 1, scaleY: 1}
-	// Тень курсора: физический размер экрана, старт в центре.
-	if pw, ph := ScreenSize(); pw > 0 && ph > 0 {
-		ps.physW, ps.physH = float64(pw), float64(ph)
-	} else {
-		ps.physW, ps.physH = 1920, 1080
-	}
-	ps.shadowX, ps.shadowY = ps.physW/2, ps.physH/2
-
-	// Размер потока (логические пиксели) из props["size"] = (ii). Считаем масштаб
-	// относительно физического DRM-разрешения, в котором приходят координаты мыши.
-	if v, ok := streams[0].Props["size"]; ok {
-		if arr, ok := v.Value().([]interface{}); ok && len(arr) == 2 {
-			lw, _ := arr[0].(int32)
-			lh, _ := arr[1].(int32)
-			if pw, ph := ScreenSize(); pw > 0 && ph > 0 && lw > 0 && lh > 0 {
-				ps.scaleX = float64(lw) / float64(pw)
-				ps.scaleY = float64(lh) / float64(ph)
-			}
-		}
-	}
-	return ps, nil
+	return &portalSession{conn: conn, obj: obj, session: session, node: streams[0].Node}, nil
 }
 
 // openPipeWire открывает свежий PipeWire-fd для видео (можно звать многократно).
@@ -148,122 +166,4 @@ func (p *portalSession) openPipeWire() (int, error) {
 		return 0, fmt.Errorf("OpenPipeWireRemote: %w", err)
 	}
 	return int(fd), nil
-}
-
-var noOpts = map[string]dbus.Variant{}
-
-func clampP(v, hi float64) float64 {
-	if v < 0 {
-		return 0
-	}
-	if v > hi-1 {
-		return hi - 1
-	}
-	return v
-}
-
-func (p *portalSession) motionAbs(x, y float64) {
-	p.posMu.Lock()
-	p.shadowX, p.shadowY = clampP(x, p.physW), clampP(y, p.physH)
-	p.posMu.Unlock()
-	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyPointerMotionAbsolute", 0,
-		p.session, noOpts, p.node, x*p.scaleX, y*p.scaleY).Err
-}
-
-// motionRel: дельта → тень → АБСОЛЮТНОЕ позиционирование (см. коммент к тени).
-func (p *portalSession) motionRel(dx, dy float64) {
-	p.posMu.Lock()
-	p.shadowX = clampP(p.shadowX+dx, p.physW)
-	p.shadowY = clampP(p.shadowY+dy, p.physH)
-	x, y := p.shadowX, p.shadowY
-	p.posMu.Unlock()
-	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyPointerMotionAbsolute", 0,
-		p.session, noOpts, p.node, x*p.scaleX, y*p.scaleY).Err
-}
-
-// cursorPos — позиция курсора по модели портала (физические px).
-func (p *portalSession) cursorPos() (float64, float64) {
-	p.posMu.Lock()
-	defer p.posMu.Unlock()
-	return p.shadowX, p.shadowY
-}
-
-func (p *portalSession) button(btn int32, down bool) {
-	st := uint32(0)
-	if down {
-		st = 1
-	}
-	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyPointerButton", 0,
-		p.session, noOpts, btn, st).Err
-}
-
-func (p *portalSession) axis(dx, dy float64) {
-	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyPointerAxis", 0,
-		p.session, noOpts, dx, dy).Err
-}
-
-func (p *portalSession) keycode(code int32, down bool) {
-	st := uint32(0)
-	if down {
-		st = 1
-	}
-	_ = p.obj.Call("org.freedesktop.portal.RemoteDesktop.NotifyKeyboardKeycode", 0,
-		p.session, noOpts, code, st).Err
-}
-
-// --- Экспортируемый API для main-пакета (ввод на Wayland через портал) ---
-
-// PortalInputReady — готова ли портал-сессия принимать ввод (без попытки создать).
-func PortalInputReady() bool {
-	portalMu.Lock()
-	defer portalMu.Unlock()
-	return portalSess != nil
-}
-
-// PortalPointerMotion — абсолютная позиция курсора (пиксели потока = экрана).
-func PortalPointerMotion(x, y float64) {
-	if p, err := ensurePortal(); err == nil {
-		p.motionAbs(x, y)
-	}
-}
-
-// PortalPointerMotionRel — относительное движение (трекпад-режим мобилы).
-func PortalPointerMotionRel(dx, dy float64) {
-	if p, err := ensurePortal(); err == nil {
-		p.motionRel(dx, dy)
-	}
-}
-
-// PortalPointerButton — кнопка мыши (btn — evdev-код BTN_LEFT/RIGHT/MIDDLE).
-func PortalPointerButton(btn int32, down bool) {
-	if p, err := ensurePortal(); err == nil {
-		p.button(btn, down)
-	}
-}
-
-// PortalPointerAxis — прокрутка (dx/dy).
-func PortalPointerAxis(dx, dy float64) {
-	if p, err := ensurePortal(); err == nil {
-		p.axis(dx, dy)
-	}
-}
-
-// PortalKeyboard — клавиша (code — evdev keycode).
-func PortalKeyboard(code int32, down bool) {
-	if p, err := ensurePortal(); err == nil {
-		p.keycode(code, down)
-	}
-}
-
-// PortalCursorPos — текущая позиция курсора по модели портала (физические px).
-// ok=false, если портал-сессии ещё нет.
-func PortalCursorPos() (x, y float64, ok bool) {
-	portalMu.Lock()
-	p := portalSess
-	portalMu.Unlock()
-	if p == nil {
-		return 0, 0, false
-	}
-	x, y = p.cursorPos()
-	return x, y, true
 }
