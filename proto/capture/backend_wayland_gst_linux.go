@@ -242,9 +242,10 @@ var (
 	vaapiOK   bool
 )
 
-// ffmpegHasVAAPI — собран ли ffmpeg с кодером h264_vaapi (кэшируется).
-// KATANA_NO_VAAPI=1 принудительно отключает VAAPI (для сравнения с софтом libx264
-// — диагностика, кто именно бьёт картинку под движением).
+// ffmpegHasVAAPI — собран ли ffmpeg с кодером h264_vaapi И работает ли VAAPI на
+// данном железе (кэшируется). Двухэтапная проверка: сначала наличие кодека в
+// списке, затем реальный probe инициализации — VideoCore Pi имеет renderD128, но
+// VAAPI не поднимается (unknown libva error). KATANA_NO_VAAPI=1 отключает VAAPI.
 func ffmpegHasVAAPI() bool {
 	vaapiOnce.Do(func() {
 		if os.Getenv("KATANA_NO_VAAPI") != "" {
@@ -252,7 +253,26 @@ func ffmpegHasVAAPI() bool {
 			return
 		}
 		out, err := exec.Command(FFmpegPath(), "-hide_banner", "-encoders").Output()
-		vaapiOK = err == nil && strings.Contains(string(out), "h264_vaapi")
+		if err != nil || !strings.Contains(string(out), "h264_vaapi") {
+			return
+		}
+		node := renderNode()
+		if node == "" {
+			return
+		}
+		// Probe реальной инициализации VAAPI — падает на VideoCore/NVIDIA даже
+		// при наличии render-ноды.
+		err = exec.Command(FFmpegPath(),
+			"-hide_banner", "-loglevel", "fatal",
+			"-init_hw_device", "vaapi=va:"+node,
+			"-f", "lavfi", "-i", "nullsrc=s=16x16",
+			"-frames:v", "0",
+			"-f", "null", "-").Run()
+		if err != nil {
+			log.Printf("capture: VAAPI probe failed (%s) — falling back to software encoding", node)
+			return
+		}
+		vaapiOK = true
 	})
 	return vaapiOK
 }

@@ -764,3 +764,92 @@ func gamepadAxis(axis int, val float64) {
 	gp.emit(evAbs, code, v)
 	gp.syn()
 }
+
+// hidToEvdev — USB HID Usage ID (страница Keyboard, 0x07) → evdev KEY_*.
+// Таблица покрывает все клавиши стандартной клавиатуры PC (US ANSI + ISO).
+var hidToEvdev = map[uint8]uint16{
+	0x04: 30, 0x05: 48, 0x06: 46, 0x07: 32, 0x08: 18, 0x09: 33, // a b c d e f
+	0x0A: 34, 0x0B: 35, 0x0C: 23, 0x0D: 36, 0x0E: 37, 0x0F: 38, // g h i j k l
+	0x10: 50, 0x11: 49, 0x12: 24, 0x13: 25, 0x14: 16, 0x15: 19, // m n o p q r
+	0x16: 31, 0x17: 20, 0x18: 22, 0x19: 47, 0x1A: 17, 0x1B: 45, // s t u v w x
+	0x1C: 21, 0x1D: 44,                                           // y z
+	0x1E: 2, 0x1F: 3, 0x20: 4, 0x21: 5, 0x22: 6,                 // 1 2 3 4 5
+	0x23: 7, 0x24: 8, 0x25: 9, 0x26: 10, 0x27: 11,               // 6 7 8 9 0
+	0x28: 28,  // Enter
+	0x29: 1,   // Escape
+	0x2A: 14,  // Backspace
+	0x2B: 15,  // Tab
+	0x2C: 57,  // Space
+	0x2D: 12,  // Minus (-)
+	0x2E: 13,  // Equal (=)
+	0x2F: 26,  // BracketLeft ([)
+	0x30: 27,  // BracketRight (])
+	0x31: 43,  // Backslash (\)
+	0x33: 39,  // Semicolon (;)
+	0x34: 40,  // Quote (')
+	0x35: 41,  // Backquote (`)
+	0x36: 51,  // Comma (,)
+	0x37: 52,  // Period (.)
+	0x38: 53,  // Slash (/)
+	0x39: 58,  // CapsLock
+	0x3A: 59, 0x3B: 60, 0x3C: 61, 0x3D: 62, 0x3E: 63, 0x3F: 64, // F1-F6
+	0x40: 65, 0x41: 66, 0x42: 67, 0x43: 68, 0x44: 87, 0x45: 88, // F7-F12
+	0x46: 99,  // PrintScreen
+	0x47: 70,  // ScrollLock
+	0x48: 119, // Pause
+	0x49: 110, // Insert
+	0x4A: 102, // Home
+	0x4B: 104, // PageUp
+	0x4C: 111, // Delete
+	0x4D: 107, // End
+	0x4E: 109, // PageDown
+	0x4F: 106, // ArrowRight
+	0x50: 105, // ArrowLeft
+	0x51: 108, // ArrowDown
+	0x52: 103, // ArrowUp
+	0x53: 69,  // NumLock
+	0x54: 98,  // Numpad /
+	0x55: 55,  // Numpad *
+	0x56: 74,  // Numpad -
+	0x57: 78,  // Numpad +
+	0x58: 96,  // Numpad Enter
+	0x59: 79, 0x5A: 80, 0x5B: 81, 0x5C: 75, 0x5D: 76, // Numpad 1-5
+	0x5E: 77, 0x5F: 71, 0x60: 72, 0x61: 73,            // Numpad 6-9
+	0x62: 82, 0x63: 83,                                 // Numpad 0, Dot
+	0x64: 86,  // IntlBackslash (ISO §)
+	0x65: 127, // ContextMenu
+	0x68: 183, 0x69: 184, 0x6A: 185, 0x6B: 186, // F13-F16
+	0x6C: 187, 0x6D: 188, 0x6E: 189, 0x6F: 190, // F17-F20
+	0x70: 191, 0x71: 192, 0x72: 193, 0x73: 194, // F21-F24
+	0xE0: 29,  // ControlLeft
+	0xE1: 42,  // ShiftLeft
+	0xE2: 56,  // AltLeft
+	0xE3: 125, // MetaLeft (Super)
+	0xE4: 97,  // ControlRight
+	0xE5: 54,  // ShiftRight
+	0xE6: 100, // AltRight
+	0xE7: 126, // MetaRight (Super)
+}
+
+// keyDownHID / keyUpHID — state-based ввод: нажать/отпустить клавишу по HID-коду.
+func keyDownHID(hid uint8) {
+	code, ok := hidToEvdev[hid]
+	if !ok || !ensureInput() {
+		return
+	}
+	inMu.Lock()
+	defer inMu.Unlock()
+	kbd.emit(evKey, code, 1)
+	kbd.syn()
+}
+
+func keyUpHID(hid uint8) {
+	code, ok := hidToEvdev[hid]
+	if !ok || !ensureInput() {
+		return
+	}
+	inMu.Lock()
+	defer inMu.Unlock()
+	kbd.emit(evKey, code, 0)
+	kbd.syn()
+}

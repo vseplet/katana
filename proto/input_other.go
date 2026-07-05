@@ -22,3 +22,5 @@ func keyUp(key string, mods []string)               {}
 func typeText(s string)                             {}
 func gamepadButton(_ int, _ bool, _ float64)        {}
 func gamepadAxis(_ int, _ float64)                  {}
+func keyDownHID(_ uint8)                            {}
+func keyUpHID(_ uint8)                              {}

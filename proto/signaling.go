@@ -416,6 +416,8 @@ type peer struct {
 	// captureActive — вьювер захватил указатель (игра, Pointer Lock). Пока true:
 	// движение шлётся как action "rel" (→ relative-устройство), cursorpos не шлём.
 	captureActive bool
+	// kbState — текущие нажатые HID-коды клавиш от этого зрителя (state-based ввод).
+	kbState map[uint8]bool
 
 	inputDC          *webrtc.DataChannel // канал ввода (для отчёта позиции курсора)
 	lastCursorReport time.Time           // троттлинг cursorpos
@@ -715,6 +717,7 @@ func (h *hub) removePeer(pid string) {
 	if p == nil {
 		return
 	}
+	p.releaseKbState()
 	p.closePC()
 	delete(h.peers, pid)
 	log.Printf("broker: viewer %s left (%d remaining)", pid, len(h.peers))
@@ -1109,6 +1112,10 @@ func (p *peer) buildLocked() error {
 			}
 		})
 		dc.OnMessage(func(m webrtc.DataChannelMessage) {
+			if !m.IsString {
+				p.dispatchInputBin(m.Data)
+				return
+			}
 			var im signalMessage
 			if json.Unmarshal(m.Data, &im) != nil {
 				return
@@ -1424,4 +1431,54 @@ func (p *peer) handleMouse(m *mouseMsg) {
 			moveMouse(x, y)
 		}
 	}
+}
+
+// dispatchInputBin декодирует бинарные сообщения с канала input.
+//
+//	0x06  kb state: [count u8] [hid_code u8 × count]
+func (p *peer) dispatchInputBin(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	switch data[0] {
+	case 0x06: // keyboard state
+		if len(data) < 2 {
+			return
+		}
+		n := int(data[1])
+		if len(data) < 2+n {
+			return
+		}
+		p.applyKbState(data[2 : 2+n])
+	}
+}
+
+// applyKbState дифает новый набор HID-кодов с предыдущим и инжектит press/release.
+func (p *peer) applyKbState(codes []byte) {
+	next := make(map[uint8]bool, len(codes))
+	for _, c := range codes {
+		next[c] = true
+	}
+	if p.kbState == nil {
+		p.kbState = map[uint8]bool{}
+	}
+	for c := range p.kbState {
+		if !next[c] {
+			keyUpHID(c)
+		}
+	}
+	for c := range next {
+		if !p.kbState[c] {
+			keyDownHID(c)
+		}
+	}
+	p.kbState = next
+}
+
+// releaseKbState отпускает все зажатые клавиши зрителя (при дисконнекте).
+func (p *peer) releaseKbState() {
+	for c := range p.kbState {
+		keyUpHID(c)
+	}
+	p.kbState = nil
 }
