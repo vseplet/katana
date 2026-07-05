@@ -10,7 +10,7 @@ package capture
 // поддержки целиком — в doc.go.
 
 /*
-#cgo pkg-config: libpipewire-0.3 libavcodec libavfilter libavutil egl gbm libdrm
+#cgo pkg-config: libpipewire-0.3 libavcodec libavfilter libavutil libva egl gbm libdrm
 #include "backend_portal_vaapi_linux.h"
 */
 import "C"
