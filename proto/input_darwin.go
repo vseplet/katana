@@ -50,6 +50,13 @@ func dragRel(dx, dy int, button string) {
 // нативный CGEvent с пиксельными единицами, а не строчный robotgo.Scroll.
 func scrollMouse(dx, dy int) { capture.InjectScroll(dx, dy) }
 
+// moveRelRaw — захват мыши для игр (pointer-lock). На macOS отдельного relative-
+// устройства нет; отдаём как обычное относительное движение (best-effort).
+func moveRelRaw(dx, dy int) { moveRel(dx, dy) }
+
+// releaseAllButtons — страховка при выходе из захвата (на macOS не требуется).
+func releaseAllButtons() {}
+
 // tapKey нажимает клавишу key с модификаторами mods ("ctrl"|"alt"|"cmd"|"shift").
 // Для спец-клавиш (enter/tab/стрелки/…) и шорткатов (Cmd+C и т.п.).
 func tapKey(key string, mods []string) {

@@ -9,4 +9,7 @@ type capsInfo struct {
 	Input    bool // управление мышью/клавиатурой доступно
 	Terminal bool // общий терминал доступен (обычно всегда)
 	Gamepad  bool // виртуальный геймпад доступен (uinput на Linux)
+	// MouseCapture — есть сырой relative-ввод для захвата мыши в играх (uinput на
+	// Linux). Вьювер по флагу включает Pointer Lock. См. docs/mouse-capture.md.
+	MouseCapture bool
 }

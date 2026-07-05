@@ -58,6 +58,12 @@ type signalMessage struct {
 	Input    bool `json:"input,omitempty"`
 	Terminal bool `json:"terminal,omitempty"`
 	Gamepad  bool `json:"gamepad,omitempty"`
+	// MouseCapture — хост умеет сырой relative-ввод для захвата мыши в играх
+	// (action "rel" + сообщение "capture"). Вьювер по этому флагу включает режим
+	// захвата (Pointer Lock). См. docs/mouse-capture.md.
+	MouseCapture bool `json:"mouseCapture,omitempty"`
+	// On — вкл/выкл для сообщения "capture" (курсор захвачен игрой на вьювере).
+	On bool `json:"on,omitempty"`
 	// Broker → host для TUI: "sessioninfo" (владелец+план) и "presence" (зрители).
 	Owner   string        `json:"owner,omitempty"`
 	Plan    string        `json:"plan,omitempty"`
@@ -111,9 +117,11 @@ type gamepadMsg struct {
 type mouseMsg struct {
 	X      float64 `json:"x"`
 	Y      float64 `json:"y"`
-	Action string  `json:"action"` // move | down | up | moverel | click
+	Action string  `json:"action"` // move|down|up | moverel|dragrel|click|press|release | rel
 	Button string  `json:"button"` // left | right
-	// Относительное движение (трекпад-режим мобилы), в пикселях хоста.
+	// Относительное движение. Dx/Dy — пиксели хоста.
+	//   moverel/dragrel — десктопный трекпад мобилы (→ абсолютное позиционирование);
+	//   rel             — сырой захват мыши для игр (→ relative uinput-устройство).
 	Dx int `json:"dx,omitempty"`
 	Dy int `json:"dy,omitempty"`
 }
@@ -401,6 +409,9 @@ type peer struct {
 
 	btnDown string // зажатая кнопка мыши ("" если нет) — для drag
 	dragged bool   // были ли move с зажатой кнопкой (отличить drag от клика)
+	// captureActive — вьювер захватил указатель (игра, Pointer Lock). Пока true:
+	// движение шлётся как action "rel" (→ relative-устройство), cursorpos не шлём.
+	captureActive bool
 
 	inputDC          *webrtc.DataChannel // канал ввода (для отчёта позиции курсора)
 	lastCursorReport time.Time           // троттлинг cursorpos
@@ -1089,7 +1100,7 @@ func (p *peer) buildLocked() error {
 		dc.OnOpen(func() {
 			hn, _ := os.Hostname()
 			caps := hostCaps()
-			if b, err := json.Marshal(signalMessage{Type: "hostinfo", OS: osLabel(), Hostname: hn, Ffmpeg: capture.FFmpegPath() != "", Video: caps.Video, AudioCap: caps.Audio, Input: caps.Input, Terminal: caps.Terminal, Gamepad: caps.Gamepad}); err == nil {
+			if b, err := json.Marshal(signalMessage{Type: "hostinfo", OS: osLabel(), Hostname: hn, Ffmpeg: capture.FFmpegPath() != "", Video: caps.Video, AudioCap: caps.Audio, Input: caps.Input, Terminal: caps.Terminal, Gamepad: caps.Gamepad, MouseCapture: caps.MouseCapture}); err == nil {
 				_ = dc.SendText(string(b))
 			}
 		})
@@ -1217,6 +1228,14 @@ func (p *peer) dispatchInput(msg *signalMessage) {
 				gamepadAxis(msg.Pad.Idx, msg.Pad.Val)
 			}
 		}
+	case "capture":
+		// Вьювер захватил/отпустил указатель (Pointer Lock в игре). Роутинг движения
+		// stateless по action ("rel" vs "move") — этот флаг лишь для housekeeping:
+		// не слать назад cursorpos в захвате и отпустить кнопки при выходе.
+		p.captureActive = msg.On
+		if !msg.On {
+			releaseAllButtons()
+		}
 	}
 }
 
@@ -1226,8 +1245,8 @@ func (p *peer) dispatchInput(msg *signalMessage) {
 // прямоугольнику источника) — для подсветки курсора и follow-pan при зуме на
 // мобиле. Троттлинг ~30/с, чтобы не флудить канал.
 func (p *peer) reportCursor() {
-	if p.inputDC == nil {
-		return
+	if p.inputDC == nil || p.captureActive {
+		return // в захвате абсолютной позиции курсора нет — кольцо не шлём
 	}
 	now := time.Now()
 	if now.Sub(p.lastCursorReport) >= 25*time.Millisecond {
@@ -1271,6 +1290,11 @@ func (p *peer) handleMouse(m *mouseMsg) {
 		btn = "right"
 	}
 	switch m.Action {
+	case "rel":
+		// Захват мыши для игр: сырые дельты → relative-устройство. Без reportCursor
+		// (в захвате нет осмысленной абсолютной позиции курсора).
+		moveRelRaw(m.Dx, m.Dy)
+		return
 	case "moverel":
 		moveRel(m.Dx, m.Dy)
 		p.reportCursor()

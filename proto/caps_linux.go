@@ -12,8 +12,9 @@ func hostCaps() capsInfo {
 	return capsInfo{
 		Video:    capture.VideoAvailable(),
 		Audio:    capture.AudioAvailable(),
-		Input:    InputAvailable(),
-		Terminal: true,
-		Gamepad:  InputAvailable(), // геймпад требует /dev/uinput (тот же гейт, что и ввод)
+		Input:        InputAvailable(),
+		Terminal:     true,
+		Gamepad:      InputAvailable(), // геймпад требует /dev/uinput (тот же гейт, что и ввод)
+		MouseCapture: InputAvailable(), // relative-указатель — тот же /dev/uinput
 	}
 }

@@ -30,15 +30,63 @@ type streamer struct {
 	setCursor  func(bool)         // живое переключение курсора хоста (без рестарта)
 	forceKeyFn func()             // форс keyframe у энкодера (по PLI); nil если не поддерж.
 	setBitrate func(kbps int)     // смена битрейта энкодера на лету; nil если не поддерж.
+
+	// Коалесинг живых переконфигураций. Быстрый перебор (слайдер разрешения и др.)
+	// схлопываем в ОДИН рестарт захвата после паузы: каждый рестарт пере-подключает
+	// PipeWire к ScreenCast-ноде KWin, а та от частых пере-подключений деградирует —
+	// поток «тормозит наглухо» до перезапуска хоста. Первый (стартовый) вызов —
+	// синхронный (нужна ошибка старта); живые — дебаунс. rcGen инвалидирует
+	// отложенный таймер при stop()/новом вызове.
+	rcMu      sync.Mutex
+	rcStarted bool
+	rcPending *capture.Options
+	rcTimer   *time.Timer
+	rcGen     uint64
 }
 
 func newStreamer(parent context.Context, enc capture.CaptureEncoder, track, audio *webrtc.TrackLocalStaticSample) *streamer {
 	return &streamer{parent: parent, enc: enc, track: track, audio: audio}
 }
 
-// reconfigure останавливает текущий захват (если был) и запускает новый
-// с указанными опциями, продолжая писать в тот же трек.
+// reconfigure применяет новые опции захвата. Первый вызов (старт потока) —
+// синхронный, чтобы вернуть ошибку старта. Последующие живые смены ДЕБАУНСЯТСЯ и
+// коалесятся: быстрая серия (перебор слайдера) даёт ОДИН рестарт после паузы,
+// а не N — иначе частый ре-коннект PipeWire убивает ScreenCast-ноду KWin.
 func (s *streamer) reconfigure(opts capture.Options) error {
+	s.rcMu.Lock()
+	if !s.rcStarted {
+		s.rcStarted = true
+		s.rcMu.Unlock()
+		return s.applyReconfigure(opts) // старт — синхронно, с ошибкой
+	}
+	s.rcPending = &opts
+	s.rcGen++
+	gen := s.rcGen
+	if s.rcTimer != nil {
+		s.rcTimer.Stop()
+	}
+	s.rcTimer = time.AfterFunc(350*time.Millisecond, func() {
+		s.rcMu.Lock()
+		if gen != s.rcGen { // отменён stop()'ом или вытеснен новым вызовом
+			s.rcMu.Unlock()
+			return
+		}
+		p := s.rcPending
+		s.rcPending = nil
+		s.rcMu.Unlock()
+		if p != nil {
+			if err := s.applyReconfigure(*p); err != nil {
+				log.Printf("streamer: live reconfigure: %v", err)
+			}
+		}
+	})
+	s.rcMu.Unlock()
+	return nil
+}
+
+// applyReconfigure останавливает текущий захват (если был) и запускает новый
+// с указанными опциями, продолжая писать в тот же трек.
+func (s *streamer) applyReconfigure(opts capture.Options) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -158,6 +206,17 @@ func (s *streamer) setBitrateKbps(kbps int) {
 
 // stop останавливает захват.
 func (s *streamer) stop() {
+	// Гасим отложенную живую переконфигурацию: rcGen++ инвалидирует уже
+	// взведённый таймер (его колбэк увидит gen != s.rcGen и выйдет), чтобы
+	// финальный teardown не породил спонтанный рестарт захвата.
+	s.rcMu.Lock()
+	s.rcGen++
+	s.rcPending = nil
+	if s.rcTimer != nil {
+		s.rcTimer.Stop()
+	}
+	s.rcMu.Unlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cancel != nil {

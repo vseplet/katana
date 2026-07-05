@@ -10,6 +10,8 @@ func mouseLocation() (int, int)            { return 0, 0 }
 func mouseToggle(button string, down bool) {}
 func dragMouse(x, y int, button string)    {}
 func moveRel(dx, dy int)                   {}
+func moveRelRaw(dx, dy int)                {}
+func releaseAllButtons()                   {}
 func clickMouse(button string)             {}
 func doubleClick(button string)            {}
 func dragRel(dx, dy int, button string)    {}

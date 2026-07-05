@@ -4,3 +4,6 @@ proto/proto_bin
 *.out
 
 .DS_Store
+
+/katana-host
+/native-libs/

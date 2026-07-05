@@ -30,7 +30,7 @@ const (
 	uiSetKeybit  = 0x40045565
 	uiSetRelbit  = 0x40045566
 	uiSetAbsbit  = 0x40045567 // _IOW('U', 103, int)
-	uiSetPropbit = 0x40045568 // _IOW('U', 104, int)
+	uiSetPropbit = 0x4004556e // _IOW('U', 110, int) — БЫЛО 0x...68 (это MSCBIT!)
 	uiDevCreate  = 0x5501     // _IO('U', 1)
 	uiDevDstry   = 0x5502
 
@@ -308,6 +308,80 @@ func btnCode(button string) uint16 {
 	default:
 		return btnLeft
 	}
+}
+
+// --- Относительный указатель для игр (захват мыши / pointer-lock) ---------------
+// Отдельное uinput-устройство с REL_X/REL_Y: игры в режиме захвата указателя
+// читают сырые относительные дельты (обзор мышью). Абсолютное устройство (ptr)
+// для этого не годится — оно не порождает REL-движения, и в захвате мышь «мертва».
+// Роутинг по типу события (action "rel" → сюда, "move" → абсолют) — хост не держит
+// «режим», рассинхрон невозможен. Устройство ленивое (при первом сыром движении).
+
+var (
+	relMu     sync.Mutex
+	ptrRel    *inputDev
+	ptrRelSet bool
+)
+
+func ensurePtrRel() bool {
+	relMu.Lock()
+	defer relMu.Unlock()
+	if ptrRelSet {
+		return ptrRel != nil
+	}
+	ptrRelSet = true
+	p, err := createUinput("katana-pointer-rel",
+		[]int{btnLeft, btnRight, btnMiddle},
+		[]int{relX, relY, relWheel, relHWheel}, nil, nil)
+	if err != nil {
+		log.Printf("input: uinput rel pointer: %v (game mouse capture disabled)", err)
+		ptrRel = nil
+		return false
+	}
+	ptrRel = p
+	return true
+}
+
+// moveRelRaw — сырые относительные дельты на relative-устройство (для игр с
+// захватом указателя). НЕ аккумулируем и НЕ трогаем модель курсора: игра сама
+// применяет свою чувствительность.
+func moveRelRaw(dx, dy int) {
+	if dx == 0 && dy == 0 {
+		return
+	}
+	if !ensurePtrRel() {
+		return
+	}
+	relMu.Lock()
+	defer relMu.Unlock()
+	if dx != 0 {
+		ptrRel.emit(evRel, relX, int32(dx))
+	}
+	if dy != 0 {
+		ptrRel.emit(evRel, relY, int32(dy))
+	}
+	ptrRel.syn()
+}
+
+// releaseAllButtons — отпускает все кнопки мыши на обоих указателях. Страховка при
+// выходе из захвата: зажатая в игре кнопка не должна «залипнуть».
+func releaseAllButtons() {
+	inMu.Lock()
+	if ptr != nil {
+		for _, b := range []uint16{btnLeft, btnRight, btnMiddle} {
+			ptr.emit(evKey, b, 0)
+		}
+		ptr.syn()
+	}
+	inMu.Unlock()
+	relMu.Lock()
+	if ptrRel != nil {
+		for _, b := range []uint16{btnLeft, btnRight, btnMiddle} {
+			ptrRel.emit(evKey, b, 0)
+		}
+		ptrRel.syn()
+	}
+	relMu.Unlock()
 }
 
 // --- Публичный API (сигнатуры совпадают с input_darwin.go / input_other.go) ---
