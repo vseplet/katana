@@ -167,7 +167,8 @@ func (m hostModel) View() string {
 	}
 	b.WriteString(lbl.Render("provides ") +
 		chk(m.caps.Video, "video") + "  " + chk(m.caps.Audio, "audio") + "  " +
-		chk(m.caps.Input, "input") + "  " + chk(m.caps.Terminal, "terminal") + "\n")
+		chk(m.caps.Input, "input") + "  " + chk(m.caps.Terminal, "terminal") + "  " +
+		chk(m.caps.Gamepad, "gamepad") + "\n")
 	// Все зрители одной строкой: users  alice ×2 · bob · guest
 	b.WriteString(lbl.Render("users    "))
 	if len(m.list) == 0 {

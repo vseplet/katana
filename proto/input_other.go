@@ -14,5 +14,9 @@ func clickMouse(button string)             {}
 func doubleClick(button string)            {}
 func dragRel(dx, dy int, button string)    {}
 func scrollMouse(dx, dy int)               {}
-func tapKey(key string, mods []string)     {}
-func typeText(s string)                    {}
+func tapKey(key string, mods []string)              {}
+func keyDown(key string, mods []string)             {}
+func keyUp(key string, mods []string)               {}
+func typeText(s string)                             {}
+func gamepadButton(_ int, _ bool, _ float64)        {}
+func gamepadAxis(_ int, _ float64)                  {}

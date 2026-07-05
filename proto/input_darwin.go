@@ -63,3 +63,27 @@ func tapKey(key string, mods []string) {
 // typeText печатает произвольный текст (символы/регистр/юникод) — для обычного
 // набора (TypeStr корректно обрабатывает shift-символы, в отличие от KeyTap).
 func typeText(s string) { robotgo.TypeStr(s) }
+
+// keyDown зажимает клавишу без отпускания (для state-based ввода: зажатые клавиши,
+// геймпад WASD, и т.п.). Пара к keyUp.
+func keyDown(key string, mods []string) {
+	args := make([]interface{}, len(mods))
+	for i, m := range mods {
+		args[i] = m
+	}
+	_ = robotgo.KeyDown(key, args...)
+}
+
+// keyUp отпускает клавишу, ранее зажатую keyDown.
+func keyUp(key string, mods []string) {
+	args := make([]interface{}, len(mods))
+	for i, m := range mods {
+		args[i] = m
+	}
+	_ = robotgo.KeyUp(key, args...)
+}
+
+// gamepadButton и gamepadAxis — заглушки на macOS (нативный HID-геймпад требует
+// отдельного драйвера; инъекция через uinput недоступна).
+func gamepadButton(_ int, _ bool, _ float64) {}
+func gamepadAxis(_ int, _ float64)            {}

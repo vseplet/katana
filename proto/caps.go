@@ -8,4 +8,5 @@ type capsInfo struct {
 	Audio    bool // передача звука доступна
 	Input    bool // управление мышью/клавиатурой доступно
 	Terminal bool // общий терминал доступен (обычно всегда)
+	Gamepad  bool // виртуальный геймпад доступен (uinput на Linux)
 }

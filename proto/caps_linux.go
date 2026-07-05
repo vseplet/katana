@@ -14,5 +14,6 @@ func hostCaps() capsInfo {
 		Audio:    capture.AudioAvailable(),
 		Input:    InputAvailable(),
 		Terminal: true,
+		Gamepad:  InputAvailable(), // геймпад требует /dev/uinput (тот же гейт, что и ввод)
 	}
 }

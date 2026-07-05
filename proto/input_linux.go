@@ -45,9 +45,30 @@ const (
 	relHWheel = 0x06
 	relWheel  = 0x08
 
-	absX   = 0x00
-	absY   = 0x01
-	absMax = 32767 // диапазон абсолютных осей (как QEMU usb-tablet)
+	absX    = 0x00
+	absY    = 0x01
+	absZ    = 0x02 // левый триггер (геймпад)
+	absRX   = 0x03 // правый стик X
+	absRY   = 0x04 // правый стик Y
+	absRZ   = 0x05 // правый триггер
+	absHat0X = 0x10 // крестовина X
+	absHat0Y = 0x11 // крестовина Y
+	absMax  = 32767 // диапазон абсолютных осей (как QEMU usb-tablet)
+
+	// BTN_* для геймпада Xbox-типа (linux/input-event-codes.h)
+	btnGamepadA     = 0x130
+	btnGamepadB     = 0x131
+	btnGamepadX     = 0x133
+	btnGamepadY     = 0x134
+	btnGamepadTL    = 0x136 // Left bumper
+	btnGamepadTR    = 0x137 // Right bumper
+	btnGamepadTL2   = 0x138 // Left trigger (digital)
+	btnGamepadTR2   = 0x139 // Right trigger (digital)
+	btnGamepadSel   = 0x13a // Select/Back
+	btnGamepadStart = 0x13b
+	btnGamepadMode  = 0x13c // Guide/Home
+	btnGamepadThL   = 0x13d // Left stick click
+	btnGamepadThR   = 0x13e // Right stick click
 
 	inputPropPointer = 0x00 // INPUT_PROP_POINTER — «устройству нужен курсор»
 
@@ -419,6 +440,50 @@ func tapKey(key string, mods []string) {
 	kbd.syn()
 }
 
+func keyDown(key string, mods []string) {
+	if !ensureInput() {
+		return
+	}
+	code, ok := keyCode(key)
+	if !ok {
+		return
+	}
+	inMu.Lock()
+	defer inMu.Unlock()
+	for _, m := range mods {
+		if c, ok := modKeyCode(m); ok {
+			kbd.emit(evKey, c, 1)
+		}
+	}
+	if len(mods) > 0 {
+		kbd.syn()
+	}
+	kbd.emit(evKey, code, 1)
+	kbd.syn()
+}
+
+func keyUp(key string, mods []string) {
+	if !ensureInput() {
+		return
+	}
+	code, ok := keyCode(key)
+	if !ok {
+		return
+	}
+	inMu.Lock()
+	defer inMu.Unlock()
+	kbd.emit(evKey, code, 0)
+	kbd.syn()
+	for i := len(mods) - 1; i >= 0; i-- {
+		if c, ok := modKeyCode(mods[i]); ok {
+			kbd.emit(evKey, c, 0)
+		}
+	}
+	if len(mods) > 0 {
+		kbd.syn()
+	}
+}
+
 func typeText(s string) {
 	if !ensureInput() {
 		return
@@ -443,4 +508,147 @@ func typeText(s string) {
 			kbd.syn()
 		}
 	}
+}
+
+// --- Геймпад (виртуальный Xbox-подобный геймпад через uinput) ---
+
+// gpBtnCodes — маппинг индекса Gamepad API → BTN_* код uinput.
+// Индексы 6,7 (триггеры) и 12-15 (крестовина) обрабатываются отдельно.
+var gpBtnCodes = map[int]uint16{
+	0: btnGamepadA, 1: btnGamepadB, 2: btnGamepadX, 3: btnGamepadY,
+	4: btnGamepadTL, 5: btnGamepadTR,
+	8: btnGamepadSel, 9: btnGamepadStart, 10: btnGamepadThL, 11: btnGamepadThR,
+	16: btnGamepadMode,
+}
+
+var (
+	gpMu    sync.Mutex
+	gp      *inputDev
+	gpReady bool
+	hatBtns [4]bool // [0]=up [1]=down [2]=left [3]=right
+)
+
+func ensureGamepad() bool {
+	gpMu.Lock()
+	defer gpMu.Unlock()
+	if gpReady {
+		return gp != nil
+	}
+	gpReady = true
+	var err error
+	gp, err = createUinput("katana-gamepad",
+		[]int{
+			btnGamepadA, btnGamepadB, btnGamepadX, btnGamepadY,
+			btnGamepadTL, btnGamepadTR, btnGamepadTL2, btnGamepadTR2,
+			btnGamepadSel, btnGamepadStart, btnGamepadMode,
+			btnGamepadThL, btnGamepadThR,
+		},
+		nil,
+		[]absAxis{
+			{absX, -32767, 32767},
+			{absY, -32767, 32767},
+			{absZ, 0, 255},
+			{absRX, -32767, 32767},
+			{absRY, -32767, 32767},
+			{absRZ, 0, 255},
+			{absHat0X, -1, 1},
+			{absHat0Y, -1, 1},
+		},
+		nil,
+	)
+	if err != nil {
+		log.Printf("input: uinput gamepad: %v", err)
+		gp = nil
+	}
+	return gp != nil
+}
+
+func gamepadButton(btn int, down bool, val float64) {
+	if !ensureGamepad() {
+		return
+	}
+	gpMu.Lock()
+	defer gpMu.Unlock()
+	// Триггеры: аналоговая ось + цифровая кнопка
+	if btn == 6 {
+		gp.emit(evAbs, absZ, int32(val*255))
+		b := int32(0)
+		if down {
+			b = 1
+		}
+		gp.emit(evKey, btnGamepadTL2, b)
+		gp.syn()
+		return
+	}
+	if btn == 7 {
+		gp.emit(evAbs, absRZ, int32(val*255))
+		b := int32(0)
+		if down {
+			b = 1
+		}
+		gp.emit(evKey, btnGamepadTR2, b)
+		gp.syn()
+		return
+	}
+	// Крестовина: кнопки 12-15 → ABS_HAT0X/Y
+	if btn >= 12 && btn <= 15 {
+		hatBtns[btn-12] = down
+		x := int32(0)
+		y := int32(0)
+		if hatBtns[2] {
+			x = -1
+		} else if hatBtns[3] {
+			x = 1
+		}
+		if hatBtns[0] {
+			y = -1
+		} else if hatBtns[1] {
+			y = 1
+		}
+		gp.emit(evAbs, absHat0X, x)
+		gp.emit(evAbs, absHat0Y, y)
+		gp.syn()
+		return
+	}
+	// Обычные кнопки
+	code, ok := gpBtnCodes[btn]
+	if !ok {
+		return
+	}
+	v := int32(0)
+	if down {
+		v = 1
+	}
+	gp.emit(evKey, code, v)
+	gp.syn()
+}
+
+func gamepadAxis(axis int, val float64) {
+	if !ensureGamepad() {
+		return
+	}
+	gpMu.Lock()
+	defer gpMu.Unlock()
+	v := int32(val * 32767)
+	if v < -32767 {
+		v = -32767
+	}
+	if v > 32767 {
+		v = 32767
+	}
+	var code uint16
+	switch axis {
+	case 0:
+		code = absX
+	case 1:
+		code = absY
+	case 2:
+		code = absRX
+	case 3:
+		code = absRY
+	default:
+		return
+	}
+	gp.emit(evAbs, code, v)
+	gp.syn()
 }

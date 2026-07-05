@@ -33,6 +33,7 @@ type signalMessage struct {
 	Dir       string                   `json:"dir,omitempty"` // zoom: "in" | "out"
 	Key       *keyMsg                  `json:"key,omitempty"`
 	Text      string                   `json:"text,omitempty"` // для "type": набор текста
+	Pad       *gamepadMsg              `json:"pad,omitempty"`  // для "gamepad"
 	// Vid — идентификатор зрителя (viewer/peer id). Несколько зрителей делят один
 	// WS хоста через брокер; vid адресует сигналинг конкретному зрителю. Зритель
 	// генерирует его при подключении и проставляет во все свои сообщения; хост
@@ -56,6 +57,7 @@ type signalMessage struct {
 	AudioCap bool `json:"audioCap,omitempty"`
 	Input    bool `json:"input,omitempty"`
 	Terminal bool `json:"terminal,omitempty"`
+	Gamepad  bool `json:"gamepad,omitempty"`
 	// Broker → host для TUI: "sessioninfo" (владелец+план) и "presence" (зрители).
 	Owner   string        `json:"owner,omitempty"`
 	Plan    string        `json:"plan,omitempty"`
@@ -92,6 +94,16 @@ type scrollMsg struct {
 type keyMsg struct {
 	Key  string   `json:"key"`
 	Mods []string `json:"mods,omitempty"`
+}
+
+// gamepadMsg — событие геймпада от браузера (Gamepad API).
+// Kind="btn": кнопка (Idx — индекс, Down — нажата, Val — аналоговое значение 0..1).
+// Kind="axis": ось (Idx — индекс, Val — значение -1..1).
+type gamepadMsg struct {
+	Kind string  `json:"kind"` // "btn" | "axis"
+	Idx  int     `json:"idx"`
+	Down bool    `json:"down"`
+	Val  float64 `json:"val"`
 }
 
 // mouseMsg — событие мыши от браузера. X/Y — нормализованные [0,1] координаты
@@ -1076,7 +1088,8 @@ func (p *peer) buildLocked() error {
 		p.inputDC = dc // для отчёта позиции курсора вьюеру
 		dc.OnOpen(func() {
 			hn, _ := os.Hostname()
-			if b, err := json.Marshal(signalMessage{Type: "hostinfo", OS: osLabel(), Hostname: hn, Ffmpeg: capture.FFmpegPath() != "", Video: hostCaps().Video, AudioCap: hostCaps().Audio, Input: hostCaps().Input, Terminal: hostCaps().Terminal}); err == nil {
+			caps := hostCaps()
+			if b, err := json.Marshal(signalMessage{Type: "hostinfo", OS: osLabel(), Hostname: hn, Ffmpeg: capture.FFmpegPath() != "", Video: caps.Video, AudioCap: caps.Audio, Input: caps.Input, Terminal: caps.Terminal, Gamepad: caps.Gamepad}); err == nil {
 				_ = dc.SendText(string(b))
 			}
 		})
@@ -1183,9 +1196,26 @@ func (p *peer) dispatchInput(msg *signalMessage) {
 		if msg.Key != nil && msg.Key.Key != "" {
 			tapKey(msg.Key.Key, msg.Key.Mods)
 		}
+	case "keydown":
+		if msg.Key != nil && msg.Key.Key != "" {
+			keyDown(msg.Key.Key, msg.Key.Mods)
+		}
+	case "keyup":
+		if msg.Key != nil && msg.Key.Key != "" {
+			keyUp(msg.Key.Key, msg.Key.Mods)
+		}
 	case "type":
 		if msg.Text != "" {
 			typeText(msg.Text)
+		}
+	case "gamepad":
+		if msg.Pad != nil {
+			switch msg.Pad.Kind {
+			case "btn":
+				gamepadButton(msg.Pad.Idx, msg.Pad.Down, msg.Pad.Val)
+			case "axis":
+				gamepadAxis(msg.Pad.Idx, msg.Pad.Val)
+			}
 		}
 	}
 }
