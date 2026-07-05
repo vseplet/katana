@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -64,6 +66,8 @@ type signalMessage struct {
 	MouseCapture bool `json:"mouseCapture,omitempty"`
 	// On — вкл/выкл для сообщения "capture" (курсор захвачен игрой на вьювере).
 	On bool `json:"on,omitempty"`
+	// T — timestamp (performance.now() браузера) для ping/pong RTT-замера.
+	T float64 `json:"t,omitempty"`
 	// Broker → host для TUI: "sessioninfo" (владелец+план) и "presence" (зрители).
 	Owner   string        `json:"owner,omitempty"`
 	Plan    string        `json:"plan,omitempty"`
@@ -1120,6 +1124,10 @@ func (p *peer) buildLocked() error {
 				if im.PID > 0 {
 					_ = capture.ActivateApp(im.PID)
 				}
+			case "ping":
+				if b, err := json.Marshal(signalMessage{Type: "pong", T: im.T}); err == nil {
+					_ = dc.SendText(string(b))
+				}
 			case "config":
 				p.h.onConfig(im) // зритель меняет общие настройки (источник/разрешение)
 			case "renegotiate":
@@ -1131,6 +1139,21 @@ func (p *peer) buildLocked() error {
 				p.h.requestKeyframe()
 			default:
 				p.dispatchInput(&im)
+			}
+		})
+	}
+	// input-fast: unordered + unreliable для мыши/осей — без очереди ретрансмитов.
+	fastOrdered := false
+	fastMaxRetransmits := uint16(0)
+	if dc, err := pc.CreateDataChannel("input-fast", &webrtc.DataChannelInit{
+		Ordered:        &fastOrdered,
+		MaxRetransmits: &fastMaxRetransmits,
+	}); err != nil {
+		log.Printf("signaling: input-fast channel: %v", err)
+	} else {
+		dc.OnMessage(func(m webrtc.DataChannelMessage) {
+			if !m.IsString {
+				p.dispatchInputFast(m.Data)
 			}
 		})
 	}
@@ -1236,6 +1259,54 @@ func (p *peer) dispatchInput(msg *signalMessage) {
 		if !msg.On {
 			releaseAllButtons()
 		}
+	}
+}
+
+// dispatchInputFast декодирует бинарные сообщения с канала input-fast
+// (unordered+unreliable): движение мыши, оси геймпада, триггеры.
+//
+//	0x01  mouse abs:     [x float32le] [y float32le]          → 9 байт
+//	0x02  mouse rel:     [dx int16le] [dy int16le] [drag u8]  → 6 байт
+//	0x04  gp axis:       [idx u8] [val int16le]               → 4 байта
+//	0x05  gp trigger:    [idx u8] [down u8] [val u8]          → 4 байта
+func (p *peer) dispatchInputFast(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	switch data[0] {
+	case 0x01: // mouse abs (hover/move)
+		if len(data) < 9 {
+			return
+		}
+		x := float64(math.Float32frombits(binary.LittleEndian.Uint32(data[1:5])))
+		y := float64(math.Float32frombits(binary.LittleEndian.Uint32(data[5:9])))
+		p.handleMouse(&mouseMsg{X: x, Y: y, Action: "move"})
+	case 0x02: // mouse rel (moverel / dragrel — трекпад мобилы)
+		if len(data) < 6 {
+			return
+		}
+		dx := int(int16(binary.LittleEndian.Uint16(data[1:3])))
+		dy := int(int16(binary.LittleEndian.Uint16(data[3:5])))
+		action := "moverel"
+		if data[5] != 0 {
+			action = "dragrel"
+		}
+		p.handleMouse(&mouseMsg{Action: action, Dx: dx, Dy: dy})
+	case 0x04: // gamepad axis (стики)
+		if len(data) < 4 {
+			return
+		}
+		idx := int(data[1])
+		val := float64(int16(binary.LittleEndian.Uint16(data[2:4]))) / 32767.0
+		gamepadAxis(idx, val)
+	case 0x05: // gamepad trigger (btn 6/7 — аналоговые)
+		if len(data) < 4 {
+			return
+		}
+		idx := int(data[1])
+		down := data[2] != 0
+		val := float64(data[3]) / 255.0
+		gamepadButton(idx, down, val)
 	}
 }
 
