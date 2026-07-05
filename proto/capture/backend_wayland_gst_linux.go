@@ -260,13 +260,17 @@ func ffmpegHasVAAPI() bool {
 		if node == "" {
 			return
 		}
-		// Probe реальной инициализации VAAPI — падает на VideoCore/NVIDIA даже
-		// при наличии render-ноды.
+		// Probe реальной инициализации VAAPI и кодирования — падает на VideoCore/NVIDIA
+		// даже при наличии render-ноды. /dev/zero даёт нулевой NV12 (16x16).
 		err = exec.Command(FFmpegPath(),
-			"-hide_banner", "-loglevel", "fatal",
+			"-hide_banner", "-loglevel", "error",
 			"-init_hw_device", "vaapi=va:"+node,
-			"-f", "lavfi", "-i", "nullsrc=s=16x16",
-			"-frames:v", "0",
+			"-filter_hw_device", "va",
+			"-f", "rawvideo", "-pixel_format", "nv12", "-video_size", "16x16",
+			"-i", "/dev/zero",
+			"-frames:v", "1",
+			"-vf", "hwupload",
+			"-c:v", "h264_vaapi",
 			"-f", "null", "-").Run()
 		if err != nil {
 			log.Printf("capture: VAAPI probe failed (%s) — falling back to software encoding", node)
