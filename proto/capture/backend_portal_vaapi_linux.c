@@ -17,7 +17,6 @@
 #include "backend_portal_vaapi_linux.h"
 
 #include <fcntl.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -42,7 +41,10 @@
 #include <libavfilter/buffersrc.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
+#include <libavutil/hwcontext_vaapi.h>
 #include <libavutil/opt.h>
+
+#include <va/va.h>
 
 extern void goNativeH264(void *data, int len);
 extern void goNativeLog(char *msg); // C-логи → в лог хоста (Go)
@@ -115,11 +117,23 @@ struct nstate {
 	// тот же кадр. Так доставка ровная (фикс. длительность в WriteSample), а RTP-
 	// часы не плывут; при этом кадр не ресэмплится (энкодим всегда самый свежий).
 	AVFrame *latest_frame;
-	// Отложенный возврат буфера KWin: scale_vaapi читает dmabuf АСИНХРОННО (submit,
-	// get_frame возвращает до завершения GPU). Если вернуть буфер сразу, KWin
-	// перезапишет его пока идёт наше чтение → «кадр из прошлого». Держим текущий,
-	// возвращаем предыдущий (его scale уже точно дочитан — прошёл целый кадр).
-	struct pw_buffer *prev_dmabuf;
+
+	// dmabuf DAMAGE-аккумулятор (GPU). KWin в каждый буфер пула пишет ТОЛЬКО
+	// изменённые прямоугольники (SPA_META_VideoDamage), неизменённое — старьё из
+	// прошлого использования слота → на статике «прыжок назад». Держим полный кадр
+	// в своей VAAPI-поверхности: на приходе копируем предыдущий аккумулятор целиком
+	// (база) и накатываем damage-прямоугольники из свежего буфера (VPP). Пинг-понг
+	// из двух поверхностей — одну и ту же нельзя читать и писать в одном VPP-проходе.
+	AVBufferRef *va_device;   // VAAPI-устройство (VPP + цель hwmap)
+	AVBufferRef *map_frames;  // derived VAAPI frames ctx для hwmap входного PRIME
+	AVBufferRef *acc_frames;  // VAAPI frames ctx (sw=BGR0) для аккумуляторов
+	AVFrame *acc[2];          // пинг-понг: полный кадр в VAAPI (исходный RGB)
+	int acc_cur;              // индекс актуального аккумулятора
+	int acc_have;             // есть валидный полный кадр (иначе первый — целиком)
+	VADisplay va_dpy;
+	VAConfigID vpp_cfg;
+	VAContextID vpp_ctx;
+	int vpp_ready;
 };
 
 static struct nstate S;
@@ -324,8 +338,154 @@ static int init_encoder_cpu(int in_w, int in_h)
 	return 0;
 }
 
-// init_encoder_dmabuf: DRM-устройство + DRM_PRIME frames ctx для входа; graph
-// hwmap=derive_device=vaapi (импорт dmabuf в VAAPI, zero-copy) → scale_vaapi nv12.
+// --- dmabuf: VA-API VPP-аккумулятор damage-регионов --------------------------
+
+// vpp_setup: VAAPI-устройство, derived frames ctx для hwmap входного PRIME,
+// две RGB-поверхности-аккумулятора и VPP-контекст (VAEntrypointVideoProc).
+// va_dpy берём из ffmpeg-устройства — общий VADisplay с энкодером/scale.
+static int vpp_setup(int in_w, int in_h)
+{
+	int ret;
+	enum AVPixelFormat sw = spa_to_av(S.format.format);
+
+	// VAAPI-устройство деривим из DRM (общая render-нода) — так же, как фильтр
+	// hwmap с derive_device=vaapi; иначе derived frames ctx может не сойтись.
+	if ((ret = av_hwdevice_ctx_create_derived(&S.va_device, AV_HWDEVICE_TYPE_VAAPI,
+			S.drm_device, 0)) < 0) {
+		log_averr("vaapi hwdevice derive", ret);
+		return -1;
+	}
+	// hwmap-цель: VAAPI frames ctx, деривированный из DRM frames ctx (общий fd —
+	// zero-copy импорт dmabuf в VA-поверхность, как делает фильтр hwmap).
+	if ((ret = av_hwframe_ctx_create_derived(&S.map_frames, AV_PIX_FMT_VAAPI,
+			S.va_device, S.drm_frames, AV_HWFRAME_MAP_READ)) < 0) {
+		log_averr("map frames derive", ret);
+		return -1;
+	}
+	// Аккумуляторы: полноразмерные RGB VAAPI-поверхности (sw_format = исходный).
+	S.acc_frames = av_hwframe_ctx_alloc(S.va_device);
+	if (!S.acc_frames) {
+		nlog("acc frames alloc failed");
+		return -1;
+	}
+	AVHWFramesContext *afc = (AVHWFramesContext *)S.acc_frames->data;
+	afc->format = AV_PIX_FMT_VAAPI;
+	afc->sw_format = sw;
+	afc->width = in_w;
+	afc->height = in_h;
+	if ((ret = av_hwframe_ctx_init(S.acc_frames)) < 0) {
+		log_averr("acc frames init", ret);
+		return -1;
+	}
+	for (int i = 0; i < 2; i++) {
+		S.acc[i] = av_frame_alloc();
+		if ((ret = av_hwframe_get_buffer(S.acc_frames, S.acc[i], 0)) < 0) {
+			log_averr("acc frame get", ret);
+			return -1;
+		}
+	}
+
+	AVHWDeviceContext *dc = (AVHWDeviceContext *)S.va_device->data;
+	AVVAAPIDeviceContext *vc = (AVVAAPIDeviceContext *)dc->hwctx;
+	S.va_dpy = vc->display;
+	VAStatus st = vaCreateConfig(S.va_dpy, VAProfileNone, VAEntrypointVideoProc,
+		NULL, 0, &S.vpp_cfg);
+	if (st != VA_STATUS_SUCCESS) {
+		nlog("vaCreateConfig(VPP): %s", vaErrorStr(st));
+		return -1;
+	}
+	st = vaCreateContext(S.va_dpy, S.vpp_cfg, in_w, in_h, VA_PROGRESSIVE,
+		NULL, 0, &S.vpp_ctx);
+	if (st != VA_STATUS_SUCCESS) {
+		nlog("vaCreateContext(VPP): %s", vaErrorStr(st));
+		return -1;
+	}
+	S.vpp_ready = 1;
+	return 0;
+}
+
+// vpp_blit: один VPP-проход src[src_rect] → target[dst_rect]. Между
+// vaBeginPicture/vaEndPicture их можно звать несколько раз (композиция слоёв).
+static VAStatus vpp_blit(VASurfaceID src, const VARectangle *sr, const VARectangle *dr)
+{
+	VAProcPipelineParameterBuffer pp;
+	memset(&pp, 0, sizeof(pp));
+	pp.surface = src;
+	pp.surface_region = sr;
+	pp.output_region = dr;
+	pp.filter_flags = VA_FILTER_SCALING_FAST;
+	VABufferID buf;
+	VAStatus st = vaCreateBuffer(S.va_dpy, S.vpp_ctx,
+		VAProcPipelineParameterBufferType, sizeof(pp), 1, &pp, &buf);
+	if (st != VA_STATUS_SUCCESS)
+		return st;
+	st = vaRenderPicture(S.va_dpy, S.vpp_ctx, &buf, 1);
+	vaDestroyBuffer(S.va_dpy, buf);
+	return st;
+}
+
+// vpp_accumulate: ПЕРСИСТЕНТНЫЙ аккумулятор (одна поверхность S.acc[0]). Точный
+// порт CPU-логики на GPU: пишем в него ТОЛЬКО damage-прямоугольники из свежего
+// буфера, неизменяемые зоны НЕ трогаем — они хранят прошлый кадр. Первый кадр
+// (или нет damage-меты) — заливаем целиком. НИКАКОЙ перекопии всего кадра каждый
+// такт (это давало накопление ошибок VPP → «двоение»). После — vaSyncSurface,
+// чтобы GPU дочитал входной dmabuf ДО возврата буфера KWin.
+static int vpp_accumulate(AVFrame *in_va, struct spa_meta *dm)
+{
+	VASurfaceID src = (VASurfaceID)(uintptr_t)in_va->data[3];
+	VASurfaceID dst = (VASurfaceID)(uintptr_t)S.acc[0]->data[3];
+	VARectangle full = {0, 0, S.w, S.h};
+
+	// Собираем валидные (отсечённые по кадру) прямоугольники. Первый кадр / нет
+	// меты → один прямоугольник во весь кадр.
+	VARectangle rects[16];
+	int nr = 0;
+	if (!S.acc_have || !dm) {
+		rects[nr++] = full;
+	} else {
+		struct spa_meta_region *r;
+		spa_meta_for_each(r, dm) {
+			if (!spa_meta_region_is_valid(r))
+				break;
+			int rx = r->region.position.x, ry = r->region.position.y;
+			int rw = r->region.size.width, rh = r->region.size.height;
+			if (rx < 0) { rw += rx; rx = 0; }
+			if (ry < 0) { rh += ry; ry = 0; }
+			if (rx + rw > S.w) rw = S.w - rx;
+			if (ry + rh > S.h) rh = S.h - ry;
+			if (rw <= 0 || rh <= 0)
+				continue;
+			if (nr >= (int)(sizeof(rects) / sizeof(rects[0])))
+				break;
+			rects[nr++] = (VARectangle){rx, ry, rw, rh};
+		}
+		if (nr == 0)
+			return 0; // damage пуст (статика) — аккумулятор без изменений
+	}
+
+	VAStatus st = vaBeginPicture(S.va_dpy, S.vpp_ctx, dst);
+	if (st != VA_STATUS_SUCCESS) {
+		nlog("vaBeginPicture: %s", vaErrorStr(st));
+		return -1;
+	}
+	for (int i = 0; i < nr; i++) {
+		// src_rect == dst_rect, одинаковый размер → без скейла (копия 1:1).
+		VAStatus rs = vpp_blit(src, &rects[i], &rects[i]);
+		if (rs != VA_STATUS_SUCCESS)
+			st = rs;
+	}
+	VAStatus es = vaEndPicture(S.va_dpy, S.vpp_ctx);
+	if (st != VA_STATUS_SUCCESS || es != VA_STATUS_SUCCESS) {
+		nlog("vpp render: blit=%s end=%s", vaErrorStr(st), vaErrorStr(es));
+		return -1;
+	}
+	vaSyncSurface(S.va_dpy, dst); // дожидаемся GPU → входной dmabuf можно вернуть
+	S.acc_have = 1;
+	return 0;
+}
+
+// init_encoder_dmabuf: DRM-устройство + DRM_PRIME frames ctx для входа; VPP-
+// аккумулятор damage (vpp_setup) → scale_vaapi nv12 из аккумулятора-поверхности.
 static int init_encoder_dmabuf(int in_w, int in_h)
 {
 	int ret;
@@ -353,23 +513,29 @@ static int init_encoder_dmabuf(int in_w, int in_h)
 		return -1;
 	}
 
+	// VPP-аккумулятор: своё VAAPI-устройство, hwmap-цель и две RGB-поверхности.
+	if (vpp_setup(in_w, in_h) < 0)
+		return -1;
+
+	// Граф теперь принимает ГОТОВЫЙ VAAPI-кадр (аккумулятор, исходный RGB) и лишь
+	// делает CSC/скейл в nv12. hwmap+damage-сборка — до графа, в vpp_accumulate.
 	S.graph = avfilter_graph_alloc();
 	char args[512];
 	snprintf(args, sizeof(args),
 		"video_size=%dx%d:pix_fmt=%d:time_base=1/%d:pixel_aspect=1/1",
-		in_w, in_h, AV_PIX_FMT_DRM_PRIME, S.cfg_fps);
+		in_w, in_h, AV_PIX_FMT_VAAPI, S.cfg_fps);
 	if ((ret = avfilter_graph_create_filter(&S.src, avfilter_get_by_name("buffer"),
 			"in", args, NULL, S.graph)) < 0) {
 		log_averr("buffersrc", ret);
 		return -1;
 	}
-	// Привязываем DRM frames ctx к buffersrc (иначе он не примет hw-кадры).
+	// Привязываем VAAPI frames ctx аккумулятора к buffersrc (иначе не примет hw-кадры).
 	AVBufferSrcParameters *p = av_buffersrc_parameters_alloc();
-	p->format = AV_PIX_FMT_DRM_PRIME;
+	p->format = AV_PIX_FMT_VAAPI;
 	p->width = in_w;
 	p->height = in_h;
 	p->time_base = (AVRational){1, S.cfg_fps};
-	p->hw_frames_ctx = av_buffer_ref(S.drm_frames);
+	p->hw_frames_ctx = av_buffer_ref(S.acc_frames);
 	ret = av_buffersrc_parameters_set(S.src, p);
 	av_buffer_unref(&p->hw_frames_ctx);
 	av_free(p);
@@ -394,11 +560,10 @@ static int init_encoder_dmabuf(int in_w, int in_h)
 	ins->pad_idx = 0;
 	ins->next = NULL;
 
-	// hwmap импортирует PRIME-кадр в VAAPI-поверхность (drm-устройство деривит
-	// vaapi, общий fd — zero-copy). Дальше scale_vaapi делает CSC/скейл в nv12.
+	// Вход уже VAAPI (аккумулятор) — только scale_vaapi CSC/скейл в nv12.
 	char desc[256];
 	snprintf(desc, sizeof(desc),
-		"hwmap=derive_device=vaapi,scale_vaapi=w=%d:h=%d:format=nv12", out_w, out_h);
+		"scale_vaapi=w=%d:h=%d:format=nv12", out_w, out_h);
 	if ((ret = avfilter_graph_parse_ptr(S.graph, desc, &ins, &outs, NULL)) < 0) {
 		log_averr("graph_parse", ret);
 		avfilter_inout_free(&ins);
@@ -777,72 +942,6 @@ static void on_process(void *userdata)
 		return;
 	struct spa_buffer *buf = last->buffer;
 
-	// ДИАГНОСТИКА ПОРЯДКА (ChatGPT #1): seq/pts из SPA_META_Header + указатель
-	// буфера. Ловим аномалии: seq не растёт (повтор/откат) или тот же буфер снова.
-	{
-		struct spa_meta_header *hdr = spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(*hdr));
-		static int64_t dbg_last_seq = -1;
-		static void *dbg_last_buf;
-		static int dbg_seq_logged;
-		if (hdr) {
-			if (!dbg_seq_logged) {
-				dbg_seq_logged = 1;
-				nlog("SEQ: header present, seq=%u pts=%lld flags=0x%x", hdr->seq,
-					(long long)hdr->pts, hdr->flags);
-			}
-			if (dbg_last_seq >= 0 && (int64_t)hdr->seq <= dbg_last_seq)
-				nlog("SEQ ANOMALY: seq=%u <= prev=%lld  pts=%lld  buf=%p (prevbuf=%p)",
-					hdr->seq, (long long)dbg_last_seq, (long long)hdr->pts,
-					(void *)buf, dbg_last_buf);
-			dbg_last_seq = (int64_t)hdr->seq;
-		}
-		// Damage-меты: сколько прямоугольников и покрывают ли они весь кадр.
-		struct spa_meta *dm = spa_buffer_find_meta(buf, SPA_META_VideoDamage);
-		static int dmg_log_n;
-		if (dm && dmg_log_n < 8) {
-			dmg_log_n++;
-			int nreg = 0;
-			struct spa_meta_region *r;
-			spa_meta_for_each(r, dm) {
-				if (!spa_meta_region_is_valid(r))
-					break;
-				if (nreg < 4)
-					nlog("DAMAGE reg[%d]: %dx%d @%d,%d", nreg, r->region.size.width,
-						r->region.size.height, r->region.position.x, r->region.position.y);
-				nreg++;
-			}
-			nlog("DAMAGE: %d region(s) this frame (кадр %dx%d)", nreg, S.w, S.h);
-		} else if (!dm) {
-			static int nodmg_logged;
-			if (!nodmg_logged) { nodmg_logged = 1; nlog("DAMAGE: no meta"); }
-		} else {
-			static int nohdr_logged;
-			if (!nohdr_logged) { nohdr_logged = 1; nlog("SEQ: NO header meta"); }
-		}
-		dbg_last_buf = (void *)buf;
-	}
-
-	static int dbg_once = 0;
-	if (!dbg_once) {
-		dbg_once = 1;
-		nlog("on_process first: n_datas=%d type=%d fd=%d inited=%d use_dmabuf=%d",
-			buf->n_datas, buf->n_datas > 0 ? (int)buf->datas[0].type : -1,
-			buf->n_datas > 0 ? (int)buf->datas[0].fd : -1, S.inited, S.use_dmabuf);
-		// Диагностика синхронизации: типы всех мет и данных (ищем SyncTimeline=9 /
-		// SyncObj-данные), чтобы понять implicit vs explicit sync. Плюс: заблокировал
-		// ли poll (implicit fence был бы виден).
-		for (uint32_t i = 0; i < buf->n_metas; i++)
-			nlog("  meta[%u]: type=%u size=%u", i, buf->metas[i].type, buf->metas[i].size);
-		for (uint32_t i = 0; i < buf->n_datas; i++)
-			nlog("  data[%u]: type=%u fd=%ld", i, buf->datas[i].type, (long)buf->datas[i].fd);
-		if (buf->n_datas > 0 && buf->datas[0].fd >= 0) {
-			struct pollfd pfd = {.fd = (int)buf->datas[0].fd, .events = POLLIN};
-			long long t0 = now_ns();
-			int pr = poll(&pfd, 1, 20);
-			nlog("  poll(dmabuf): ret=%d revents=0x%x waited=%lldus", pr, pfd.revents, (now_ns() - t0) / 1000);
-		}
-	}
-
 	// Диагностика каденции прихода кадров от KWin: интервалы между on_process.
 	static long long dbg_last_arr, dbg_arr_log;
 	static long long dbg_min = 1LL << 60, dbg_max, dbg_sum;
@@ -867,33 +966,37 @@ static void on_process(void *userdata)
 	if (S.use_dmabuf) {
 		if (S.inited && buf->n_datas > 0 && buf->datas[0].type == SPA_DATA_DmaBuf &&
 				buf->datas[0].fd >= 0) {
-			// FENCE: KWin (implicit sync) может отдать буфер ДО завершения GPU-записи.
-			// Без ожидания scale_vaapi читает ПРЕДЫДУЩЕЕ содержимое этого слота пула
-			// (кадр 3 назад при пуле в 3) → «прыжок назад, потом вперёд» на статике.
-			// poll(POLLIN) на dmabuf-fd блокирует до сигнала write-fence (кадр готов).
-			// Таймаут 12мс страхует от зависания (пропустим — возьмём как есть).
-			struct pollfd pfd = {.fd = buf->datas[0].fd, .events = POLLIN};
-			poll(&pfd, 1, 12);
-			// Конвертим dmabuf → СВОЯ nv12-поверхность ПОКА буфер KWin валиден.
+			// 1) Импортируем dmabuf в VAAPI-поверхность (zero-copy hwmap).
 			AVFrame *drm = wrap_dmabuf(buf);
-			if (drm) {
-				AVFrame *nv12 = filter_to_nv12(drm);
-				av_frame_free(&drm);
-				if (nv12) {
-					pthread_mutex_lock(&S.mtx);
-					if (S.latest_frame)
-						av_frame_free(&S.latest_frame); // держим только самый свежий
-					S.latest_frame = nv12;
-					pthread_mutex_unlock(&S.mtx);
-				}
+			AVFrame *in_va = drm ? av_frame_alloc() : NULL;
+			if (in_va) {
+				in_va->format = AV_PIX_FMT_VAAPI;
+				in_va->hw_frames_ctx = av_buffer_ref(S.map_frames);
+				if (av_hwframe_map(in_va, drm, AV_HWFRAME_MAP_READ) < 0)
+					av_frame_free(&in_va);
 			}
+			if (in_va) {
+				// 2) Собираем полный когерентный кадр: база (прошлый аккумулятор) +
+				//    damage-прямоугольники из свежего буфера. vaSyncSurface внутри
+				//    гарантирует, что GPU дочитал dmabuf ДО его возврата KWin.
+				struct spa_meta *dm = spa_buffer_find_meta(buf, SPA_META_VideoDamage);
+				if (vpp_accumulate(in_va, dm) == 0) {
+					// 3) Аккумулятор → nv12 (CSC/скейл) → отдаём таймеру-энкодеру.
+					AVFrame *nv12 = filter_to_nv12(S.acc[0]);
+					if (nv12) {
+						pthread_mutex_lock(&S.mtx);
+						if (S.latest_frame)
+							av_frame_free(&S.latest_frame);
+						S.latest_frame = nv12;
+						pthread_mutex_unlock(&S.mtx);
+					}
+				}
+				av_frame_free(&in_va);
+			}
+			av_frame_free(&drm);
 		}
-		// Отложенный возврат: держим текущий буфер, возвращаем предыдущий (его
-		// асинхронный scale уже завершён) → KWin не перезапишет буфер под нашим
-		// чтением. Устраняет «кадр из прошлого».
-		if (S.prev_dmabuf)
-			pw_stream_queue_buffer(S.stream, S.prev_dmabuf);
-		S.prev_dmabuf = last;
+		// dmabuf уже дочитан (vaSyncSurface) — возвращаем буфер KWin сразу.
+		pw_stream_queue_buffer(S.stream, last);
 		return;
 	}
 
@@ -1192,6 +1295,20 @@ int katana_native_start(katana_native_cfg cfg)
 		avfilter_graph_free(&S.graph);
 	if (S.latest_frame)
 		av_frame_free(&S.latest_frame);
+	// VPP-аккумулятор (dmabuf-путь).
+	if (S.vpp_ready) {
+		vaDestroyContext(S.va_dpy, S.vpp_ctx);
+		vaDestroyConfig(S.va_dpy, S.vpp_cfg);
+	}
+	for (int i = 0; i < 2; i++)
+		if (S.acc[i])
+			av_frame_free(&S.acc[i]);
+	if (S.acc_frames)
+		av_buffer_unref(&S.acc_frames);
+	if (S.map_frames)
+		av_buffer_unref(&S.map_frames);
+	if (S.va_device)
+		av_buffer_unref(&S.va_device);
 	if (S.drm_frames)
 		av_buffer_unref(&S.drm_frames);
 	if (S.drm_device)
