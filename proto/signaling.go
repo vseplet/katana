@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1462,17 +1463,108 @@ func (p *peer) applyKbState(codes []byte) {
 	if p.kbState == nil {
 		p.kbState = map[uint8]bool{}
 	}
+	var ups, downs []uint8
 	for c := range p.kbState {
 		if !next[c] {
 			keyUpHID(c)
+			ups = append(ups, c)
 		}
 	}
 	for c := range next {
 		if !p.kbState[c] {
 			keyDownHID(c)
+			downs = append(downs, c)
 		}
 	}
 	p.kbState = next
+	// Отладка состояния клавиатуры (--kbd-debug): полный набор зажатых + лента
+	// событий со стрелками — в TUI (uiKbd) и в лог-файл. Помогает ловить «залипшие»
+	// модификаторы (keyup потерян браузером на системном шорткате) и расхождения
+	// кода/символа.
+	if kbdDebug {
+		sort.Slice(downs, func(i, j int) bool { return downs[i] < downs[j] })
+		sort.Slice(ups, func(i, j int) bool { return ups[i] < ups[j] })
+		events := make([]string, 0, len(downs)+len(ups))
+		for _, c := range downs {
+			events = append(events, "↓"+hidName(c))
+		}
+		for _, c := range ups {
+			events = append(events, "↑"+hidName(c))
+		}
+		held := fmtHIDSet(next)
+		log.Printf("kbd: held=%s %s", held, strings.Join(events, " "))
+		uiKbd(held, events)
+	}
+}
+
+// kbdDebug включает подробный лог состояния клавиатуры (флаг --kbd-debug).
+var kbdDebug bool
+
+// hidNames — HID Usage ID → человекочитаемое имя/символ (для отладочного лога;
+// платформо-нейтрально, отдельно от инъекции ввода в input_*.go).
+var hidNames = map[uint8]string{
+	0x04: "a", 0x05: "b", 0x06: "c", 0x07: "d", 0x08: "e", 0x09: "f",
+	0x0A: "g", 0x0B: "h", 0x0C: "i", 0x0D: "j", 0x0E: "k", 0x0F: "l",
+	0x10: "m", 0x11: "n", 0x12: "o", 0x13: "p", 0x14: "q", 0x15: "r",
+	0x16: "s", 0x17: "t", 0x18: "u", 0x19: "v", 0x1A: "w", 0x1B: "x",
+	0x1C: "y", 0x1D: "z",
+	0x1E: "1", 0x1F: "2", 0x20: "3", 0x21: "4", 0x22: "5",
+	0x23: "6", 0x24: "7", 0x25: "8", 0x26: "9", 0x27: "0",
+	0x28: "enter", 0x29: "esc", 0x2A: "bksp", 0x2B: "tab", 0x2C: "space",
+	0x2D: "-", 0x2E: "=", 0x2F: "[", 0x30: "]", 0x31: "\\",
+	0x33: ";", 0x34: "'", 0x35: "`", 0x36: ",", 0x37: ".", 0x38: "/",
+	0x39: "caps",
+	0x3A: "f1", 0x3B: "f2", 0x3C: "f3", 0x3D: "f4", 0x3E: "f5", 0x3F: "f6",
+	0x40: "f7", 0x41: "f8", 0x42: "f9", 0x43: "f10", 0x44: "f11", 0x45: "f12",
+	0x49: "ins", 0x4A: "home", 0x4B: "pgup",
+	0x4C: "del", 0x4D: "end", 0x4E: "pgdn",
+	0x4F: "→", 0x50: "←", 0x51: "↓", 0x52: "↑",
+	0xE0: "ctrl", 0xE1: "shift", 0xE2: "alt", 0xE3: "cmd",
+	0xE4: "rctrl", 0xE5: "rshift", 0xE6: "ralt", 0xE7: "rcmd",
+}
+
+func hidName(c uint8) string {
+	if n, ok := hidNames[c]; ok {
+		return n
+	}
+	return "?"
+}
+
+// fmtHIDSet форматирует набор зажатых кодов как "[0x09:f 0xE3:cmd]" (по возрастанию).
+func fmtHIDSet(set map[uint8]bool) string {
+	codes := make([]int, 0, len(set))
+	for c := range set {
+		codes = append(codes, int(c))
+	}
+	sort.Ints(codes)
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, c := range codes {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "0x%02X:%s", c, hidName(uint8(c)))
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+// fmtHIDList форматирует дельту (нажатые/отпущенные) с префиксом; "" если пусто.
+func fmtHIDList(prefix string, codes []uint8) string {
+	if len(codes) == 0 {
+		return ""
+	}
+	sort.Slice(codes, func(i, j int) bool { return codes[i] < codes[j] })
+	var b strings.Builder
+	for i, c := range codes {
+		if i == 0 {
+			b.WriteString(prefix)
+		} else {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "0x%02X:%s", c, hidName(c))
+	}
+	return b.String()
 }
 
 // releaseKbState отпускает все зажатые клавиши зрителя (при дисконнекте).

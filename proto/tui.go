@@ -41,6 +41,20 @@ type ownerMsg struct {
 }
 type viewerListMsg []viewerCount
 
+// kbdMsg — обновление состояния клавиатуры для отладочного блока TUI (только при
+// --kbd-debug). held — текущий набор зажатых («[0x09:f 0xE3:cmd]»); events —
+// новые события со стрелками («↓f», «↑cmd») для ленты истории.
+type kbdMsg struct {
+	held   string
+	events []string
+}
+
+func uiKbd(held string, events []string) {
+	if uiProg != nil {
+		uiProg.Send(kbdMsg{held: held, events: events})
+	}
+}
+
 // uiOwner — владелец сессии + уровень подписки (из брокера). uiViewerList —
 // список зрителей с числом вкладок (из брокера, presence).
 func uiOwner(owner, plan string) {
@@ -69,6 +83,8 @@ type hostModel struct {
 	machine string // hostname
 	osName  string // ОС (runtime.GOOS)
 	showQR  bool   // QR большой — по умолчанию скрыт, по кнопке c (выводится снизу)
+	kbdHeld string   // текущее зажатое состояние клавиатуры (--kbd-debug)
+	kbdLog  []string // лента последних событий клавиш (--kbd-debug)
 	sp      spinner.Model
 	cancel  context.CancelFunc
 }
@@ -125,6 +141,12 @@ func (m hostModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case viewerListMsg:
 		m.list = []viewerCount(msg)
 		m.viewers = len(m.list)
+	case kbdMsg:
+		m.kbdHeld = msg.held
+		m.kbdLog = append(m.kbdLog, msg.events...)
+		if len(m.kbdLog) > 16 { // держим только хвост ленты
+			m.kbdLog = m.kbdLog[len(m.kbdLog)-16:]
+		}
 	default:
 		var cmd tea.Cmd
 		m.sp, cmd = m.sp.Update(msg)
@@ -184,7 +206,22 @@ func (m hostModel) View() string {
 		}
 		b.WriteString(strings.Join(parts, sep))
 	}
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+	// Отладка клавиатуры (--kbd-debug): текущее зажатое состояние + лента событий.
+	// Видно расхождения кода/символа и «залипшие» модификаторы прямо в TUI.
+	if kbdDebug {
+		held := m.kbdHeld
+		if held == "" || held == "[]" {
+			held = dim.Render("[]")
+		} else {
+			held = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(held)
+		}
+		b.WriteString("\n" + lbl.Render("keys     ") + held + "\n")
+		if len(m.kbdLog) > 0 {
+			b.WriteString(lbl.Render("history  ") + dim.Render(strings.Join(m.kbdLog, " ")) + "\n")
+		}
+	}
+	b.WriteString("\n")
 	// QR со ссылкой зрителя — большой, поэтому только по кнопке c, и выводится снизу.
 	if m.showQR {
 		b.WriteString(m.qr + "\n" + cyan.Render("scan to watch") + "\n\n")

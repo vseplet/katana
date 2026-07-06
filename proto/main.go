@@ -44,7 +44,9 @@ func main() {
 	codec := flag.String("codec", "h264", "кодек: h264 (VideoToolbox) | vp8")
 	audio := flag.Bool("audio", false, "передавать звук (SCK → Opus)")
 	test := flag.Bool("test", false, "синтетический testsrc вместо экрана (отладка без TCC)")
+	kbdDbg := flag.Bool("kbd-debug", false, "подробный лог состояния клавиатуры (коды+символы)")
 	flag.Parse()
+	kbdDebug = *kbdDbg
 
 	if *showVersion {
 		fmt.Println(version)
