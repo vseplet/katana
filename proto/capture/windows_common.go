@@ -6,8 +6,8 @@ package capture
 // источников (мониторы + top-level окна для per-window WGC), выбор энкодера.
 // Видео — Windows.Graphics.Capture (WGC) → Media Foundation H264 Encoder MFT,
 // нативно, без ffmpeg и без cgo (wgc_windows.go, mf_h264_windows.go, com_windows.go,
-// d3d11_windows.go). Звук пока не поддержан (нет системного loopback без внешних
-// зависимостей) — деградируем до без-аудио, как Linux headless.
+// d3d11_windows.go). Звук — системный loopback через WASAPI → ffmpeg → Opus
+// (audio_wasapi_windows.go); если ffmpeg нет — деградируем до без-аудио, как Linux.
 //
 // Все COM/WinRT-вызовы идут через syscall (LazyDLL + vtable). Если рантайм не
 // поднимает нужный стек (нет WGC/энкодера — напр. урезанный ARM-образ или VM без

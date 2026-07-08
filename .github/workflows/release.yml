@@ -10,7 +10,9 @@ name: release
 #   linux   — обычный Linux / сервер: CGO_ENABLED=0, без нативных либ, запускается
 #             где угодно. Терминал по WebRTC + захват через внешний ffmpeg/gst
 #             (x11grab / wayland-gst), ввод uinput/портал. amd64 + arm64.
-#   windows — TODO (появится отдельной джобой).
+#   windows — amd64 + arm64: CGO_ENABLED=0, нативный захват (WGC + Media Foundation
+#             H264) и ввод (SendInput) через syscall — без cgo, кросс-компилится
+#             одной джобой. ffmpeg нужен только для звука (WASAPI→ffmpeg→Opus).
 on:
   push:
     tags: ["v*"]
@@ -78,4 +80,31 @@ jobs:
           files: |
             katana-linux-amd64
             katana-linux-arm64
+          fail_on_unmatched_files: true
+
+  # Windows: нативный захват (WGC + Media Foundation) и ввод (SendInput) через
+  # syscall — без cgo, поэтому обе арки кросс-компилятся одной джобой. Собираем на
+  # ubuntu (быстрее/дешевле); smoke не гоняем (нечем запустить .exe).
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proto/go.mod
+      - name: Build (windows amd64 + arm64, CGO_ENABLED=0, native WGC/MFT/WASAPI)
+        working-directory: proto
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-windows-amd64.exe .
+          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-windows-arm64.exe .
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            katana-windows-amd64.exe
+            katana-windows-arm64.exe
           fail_on_unmatched_files: true
