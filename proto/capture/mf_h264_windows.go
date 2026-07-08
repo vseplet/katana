@@ -289,8 +289,10 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 		// Баланс качество/скорость: 100 давал encode ~30мс (не влезает в 16мс на
 		// 60fps → overload), 0 — грязно. 25 — умеренное качество в рамках бюджета.
 		qs := e.codecSet(&codecQualityVsSpeed, variantU32(25))
-		log.Printf("mf/codec: ICodecAPI (до SetOutputType) — RateControl=%#x MeanBitRate=%#x GOP=%#x LowLat=%#x BPic=%#x Quality=%#x",
-			uint32(rc), uint32(br), uint32(gop), uint32(ll), uint32(bp), uint32(qs))
+		if debugCapture() {
+			log.Printf("mf/codec: ICodecAPI (до SetOutputType) — RateControl=%#x MeanBitRate=%#x GOP=%#x LowLat=%#x BPic=%#x Quality=%#x",
+				uint32(rc), uint32(br), uint32(gop), uint32(ll), uint32(bp), uint32(qs))
+		}
 	} else {
 		log.Printf("mf/codec: ICodecAPI НЕ получен (%v) — CBR/GOP/качество НЕ настроены, энкодер в дефолте", err)
 	}
@@ -389,7 +391,9 @@ func (e *h264Encoder) encode(nv12 []byte) ([][]byte, error) {
 	e.mu.Unlock()
 	if force {
 		e.codecSet(&codecForceKeyFrame, variantU32(1))
-		log.Printf("mf/codec: force keyframe (PLI от зрителя)")
+		if debugCapture() {
+			log.Printf("mf/codec: force keyframe (PLI от зрителя)")
+		}
 	}
 
 	sample, err := e.makeInputSample(nv12)
@@ -402,12 +406,14 @@ func (e *h264Encoder) encode(nv12 []byte) ([][]byte, error) {
 		return nil, hrError(hr, "ProcessInput")
 	}
 	aus, derr := e.drainOutput()
-	for _, au := range aus {
-		if auHasKeyframe(au) {
-			log.Printf("mf/codec: keyframe @ кадр %d (интервал %d кадров ~%.1fs, размер %d Б)",
-				e.frame, e.frame-e.lastKey, float64(e.frame-e.lastKey)/float64(e.fps), len(au))
-			e.lastKey = e.frame
-			break
+	if debugCapture() {
+		for _, au := range aus {
+			if auHasKeyframe(au) {
+				log.Printf("mf/codec: keyframe @ кадр %d (интервал %d кадров ~%.1fs, размер %d Б)",
+					e.frame, e.frame-e.lastKey, float64(e.frame-e.lastKey)/float64(e.fps), len(au))
+				e.lastKey = e.frame
+				break
+			}
 		}
 	}
 	return aus, derr

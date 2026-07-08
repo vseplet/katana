@@ -24,6 +24,11 @@ var (
 	dumpDir     string
 )
 
+// debugCapture — включены ли подробные диагностические логи Windows-захвата
+// (перечень энкодеров, указатели COM, интервал кейфреймов, конфиг ICodecAPI).
+// Гейт по env KATANA_DEBUG — в обычном режиме лог чистый.
+func debugCapture() bool { return os.Getenv("KATANA_DEBUG") != "" }
+
 const (
 	dumpEveryN = 6  // сохраняем каждый N-й новый кадр
 	dumpRing   = 16 // кольцо файлов frame-00..frame-15
