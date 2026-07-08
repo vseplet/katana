@@ -107,9 +107,10 @@ func ActivateApp(id int) error {
 // InjectScroll на Windows не нужен — скролл идёт через ввод (SendInput, input_windows.go).
 func InjectScroll(_, _ int) {}
 
-// AudioAvailable — системный звук на Windows пока не поддержан (нужен WASAPI
-// loopback → Opus, вне рамок первого порта). Всегда false → без-аудио.
-func AudioAvailable() bool { return false }
+// AudioAvailable — доступен ли системный звук: WASAPI loopback есть всегда
+// (Win10+), но Opus кодирует ffmpeg (нативного Opus-энкодера на Windows нет),
+// поэтому гейтим по наличию ffmpeg. Нет ffmpeg → без-аудио.
+func AudioAvailable() bool { return FFmpegPath() != "" }
 
 // VideoAvailable — доступен ли нативный видео-путь (WGC + H264 MFT). Проверяем
 // рантайм-пробой: поднимается ли D3D11-девайс и создаётся ли H264-энкодер MFT.
@@ -142,6 +143,15 @@ func (c *captureWindows) Start(ctx context.Context, opts Options) (*Stream, erro
 		st.ForceKeyframe = ctl.forceKeyframe
 		st.SetBitrate = ctl.setBitrate
 		st.SetCursor = ctl.setCursor
+	}
+	// Звук (WASAPI loopback → ffmpeg → Opus), если есть ffmpeg. Ошибка — не
+	// фатально: продолжаем без аудио (как раньше).
+	if AudioAvailable() {
+		if audio, aerr := startAudioWindows(ctx); aerr != nil {
+			log.Printf("capture: audio (wasapi/ffmpeg): %v (continuing without audio)", aerr)
+		} else {
+			st.Audio = audio
+		}
 	}
 	return st, nil
 }
