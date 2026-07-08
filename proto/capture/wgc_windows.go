@@ -267,11 +267,20 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 				if s.enc != nil {
 					tc := time.Now()
 					if data, rowPitch, unmap, merr := mapStaging(devCtx, staging, tex); merr == nil {
-						bgraToNV12(data, rowPitch, srcW, srcH, dstW, dstH, nv12)
+						// Кадр валиден только при ненулевых pitch/размерах и достаточном
+						// приёмнике. Иначе (первый кадр / resize / флейк маппинга на amd64)
+						// пропускаем — иначе bgraToNV12 паникует на пустом срезе.
+						if data != 0 && rowPitch > 0 && srcW > 0 && srcH > 0 &&
+							dstW > 0 && dstH > 0 && len(nv12) >= dstW*dstH*3/2 {
+							bgraToNV12(data, rowPitch, srcW, srcH, dstW, dstH, nv12)
+							haveNV12 = true
+							gotNew = true
+							convDur = time.Since(tc)
+						} else if debugCapture() {
+							log.Printf("wgc: skip invalid frame (pitch=%d src=%dx%d dst=%dx%d nv12=%d)",
+								rowPitch, srcW, srcH, dstW, dstH, len(nv12))
+						}
 						unmap()
-						haveNV12 = true
-						gotNew = true
-						convDur = time.Since(tc)
 					}
 				}
 				comRelease(tex)
@@ -551,6 +560,11 @@ func scaleDims(srcW, srcH, targetW int) (int, int) {
 // range) с одновременным даунскейлом src→dst (nearest-neighbor). Хрома — 2×2
 // субдискретизацией. Таблица столбцов sxTab предвычислена (без деления в hot-loop).
 func bgraToNV12(src uintptr, rowPitch, srcW, srcH, dstW, dstH int, dst []byte) {
+	// Защита от невалидного кадра (нулевые pitch/размеры или маленький приёмник):
+	// молча пропускаем, иначе обращение к px[0] паникует на пустом срезе.
+	if src == 0 || rowPitch <= 0 || srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0 || len(dst) < dstW*dstH*3/2 {
+		return
+	}
 	px := unsafe.Slice((*byte)(unsafe.Pointer(src)), rowPitch*srcH)
 	sxTab := make([]int, dstW)
 	for x := 0; x < dstW; x++ {
