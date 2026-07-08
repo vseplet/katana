@@ -56,8 +56,8 @@ type mftRegisterTypeInfo struct {
 func logEncoders() {
 	cat := catVideoEncoder
 	pcat := unsafe.Pointer(&cat)
-	lo := *(*uint64)(pcat)                                    // GUID передаётся по значению
-	hi := *(*uint64)(unsafe.Pointer(uintptr(pcat) + 8))      // (16 байт → X0,X1 на arm64)
+	lo := *(*uint64)(pcat)                              // GUID передаётся по значению
+	hi := *(*uint64)(unsafe.Pointer(uintptr(pcat) + 8)) // (16 байт → X0,X1 на arm64)
 	out := &mftRegisterTypeInfo{major: mfMediaTypeVideo, sub: mfVideoFormatH264}
 
 	for _, f := range []struct {
@@ -107,17 +107,18 @@ func activateFriendlyName(act uintptr) string {
 
 // MF GUID-ы (форматы, атрибуты медиатипа, параметры ICodecAPI).
 var (
-	mfMediaTypeVideo   = mustGUID("{73646976-0000-0010-8000-00AA00389B71}")
-	mfVideoFormatH264  = mustGUID("{34363248-0000-0010-8000-00AA00389B71}")
-	mfVideoFormatNV12  = mustGUID("{3231564E-0000-0010-8000-00AA00389B71}")
-	mfMTMajorType      = mustGUID("{48EBA18E-F8C9-4687-BF11-0A74C9F96A8F}")
-	mfMTSubtype        = mustGUID("{F7E34C9A-42E8-4714-B74B-CB29D72C35E5}")
-	mfMTAvgBitrate     = mustGUID("{20332624-FB0D-4D9E-BD0D-CBF6786C102E}")
-	mfMTFrameSize      = mustGUID("{1652C33D-D6B2-4012-B834-72030849A37D}")
-	mfMTFrameRate      = mustGUID("{C459A2E8-3D2C-4E44-B132-FEE5156C7BB0}")
-	mfMTPixelAspect    = mustGUID("{C6376A1E-8D0A-4027-BE45-6D9A0AD39BB6}")
-	mfMTInterlaceMode  = mustGUID("{E2724BB8-E676-4806-B4B2-A8D6EFB44CCD}")
-	mfMTMPEG2Profile   = mustGUID("{AD76A80B-2D5C-4E0B-B375-64E520137036}")
+	mfMediaTypeVideo       = mustGUID("{73646976-0000-0010-8000-00AA00389B71}")
+	mfVideoFormatH264      = mustGUID("{34363248-0000-0010-8000-00AA00389B71}")
+	mfVideoFormatNV12      = mustGUID("{3231564E-0000-0010-8000-00AA00389B71}")
+	mfMTMajorType          = mustGUID("{48EBA18E-F8C9-4687-BF11-0A74C9F96A8F}")
+	mfMTSubtype            = mustGUID("{F7E34C9A-42E8-4714-B74B-CB29D72C35E5}")
+	mfMTAvgBitrate         = mustGUID("{20332624-FB0D-4D9E-BD0D-CBF6786C102E}")
+	mfMTFrameSize          = mustGUID("{1652C33D-D6B2-4012-B834-72030849A37D}")
+	mfMTFrameRate          = mustGUID("{C459A2E8-3D2C-4E44-B132-FEE5156C7BB0}")
+	mfMTPixelAspect        = mustGUID("{C6376A1E-8D0A-4027-BE45-6D9A0AD39BB6}")
+	mfMTInterlaceMode      = mustGUID("{E2724BB8-E676-4806-B4B2-A8D6EFB44CCD}")
+	mfMTMPEG2Profile       = mustGUID("{AD76A80B-2D5C-4E0B-B375-64E520137036}")
+	mfMTMaxKeyframeSpacing = mustGUID("{C16EB52B-73A1-476F-8D62-839D6A020652}") // MF_MT_MAX_KEYFRAME_SPACING
 
 	codecRateControlMode = mustGUID("{1C0608E9-370C-4710-8A58-CB6181C42423}")
 	codecMeanBitRate     = mustGUID("{F7222374-2144-4815-B550-A37F8E12EE52}")
@@ -133,9 +134,9 @@ const (
 	avEncH264ProfileHigh        = 100 // eAVEncH264VProfile_High
 	avEncRateControlCBR         = 0   // eAVEncCommonRateControlMode_CBR
 
-	mfVersion       = 0x00020070 // MF_VERSION (MF_SDK_VERSION<<16 | MF_API_VERSION)
-	mfStartupLite   = 1
-	clsctxInProc    = 1 // CLSCTX_INPROC_SERVER
+	mfVersion     = 0x00020070 // MF_VERSION (MF_SDK_VERSION<<16 | MF_API_VERSION)
+	mfStartupLite = 1
+	clsctxInProc  = 1 // CLSCTX_INPROC_SERVER
 
 	// HRESULT-ы MFT.
 	mfeTransformNeedMoreInput = 0xC00D6D72
@@ -150,24 +151,24 @@ const (
 	mftOutputCanProvide      = 0x200
 
 	// Индексы vtable.
-	idxMTSetUINT32       = 21 // IMFMediaType(IMFAttributes)::SetUINT32
-	idxMTSetUINT64       = 22 // SetUINT64
-	idxMTSetGUID         = 24 // SetGUID
-	idxSampleSetTime     = 36 // IMFSample::SetSampleTime
-	idxSampleSetDuration = 38 // SetSampleDuration
-	idxSampleConvertCont = 41 // ConvertToContiguousBuffer
-	idxSampleAddBuffer   = 42 // AddBuffer
-	idxBufLock           = 3  // IMFMediaBuffer::Lock
-	idxBufUnlock         = 4  // Unlock
-	idxBufGetCurLen      = 5  // GetCurrentLength
-	idxBufSetCurLen      = 6  // SetCurrentLength
+	idxMTSetUINT32         = 21 // IMFMediaType(IMFAttributes)::SetUINT32
+	idxMTSetUINT64         = 22 // SetUINT64
+	idxMTSetGUID           = 24 // SetGUID
+	idxSampleSetTime       = 36 // IMFSample::SetSampleTime
+	idxSampleSetDuration   = 38 // SetSampleDuration
+	idxSampleConvertCont   = 41 // ConvertToContiguousBuffer
+	idxSampleAddBuffer     = 42 // AddBuffer
+	idxBufLock             = 3  // IMFMediaBuffer::Lock
+	idxBufUnlock           = 4  // Unlock
+	idxBufGetCurLen        = 5  // GetCurrentLength
+	idxBufSetCurLen        = 6  // SetCurrentLength
 	idxMFTGetOutStreamInfo = 7  // IMFTransform::GetOutputStreamInfo
-	idxMFTSetInputType   = 15 // SetInputType
-	idxMFTSetOutputType  = 16 // SetOutputType
-	idxMFTProcessMessage = 23 // ProcessMessage
-	idxMFTProcessInput   = 24 // ProcessInput
-	idxMFTProcessOutput  = 25 // ProcessOutput
-	idxCodecSetValue     = 9  // ICodecAPI::SetValue
+	idxMFTSetInputType     = 15 // SetInputType
+	idxMFTSetOutputType    = 16 // SetOutputType
+	idxMFTProcessMessage   = 23 // ProcessMessage
+	idxMFTProcessInput     = 24 // ProcessInput
+	idxMFTProcessOutput    = 25 // ProcessOutput
+	idxCodecSetValue       = 9  // ICodecAPI::SetValue
 )
 
 // variant — усечённый VARIANT (24 байта на 64-бит), достаточно для VT_UI4/VT_BOOL.
@@ -178,7 +179,7 @@ type variant struct {
 	_          uint64
 }
 
-func variantU32(v uint32) variant  { return variant{vt: 19, val: uint64(v)} } // VT_UI4
+func variantU32(v uint32) variant { return variant{vt: 19, val: uint64(v)} } // VT_UI4
 func variantBool(b bool) variant {
 	if b {
 		return variant{vt: 11, val: 0xFFFF} // VT_BOOL, VARIANT_TRUE
@@ -208,15 +209,41 @@ type h264Encoder struct {
 	mft   uintptr
 	codec uintptr // ICodecAPI (может быть 0, если не поддержан)
 
-	w, h    int
-	fps     int
-	outSize uint32 // размер выходного буфера (cbSize из GetOutputStreamInfo)
-	selfAlloc bool // MFT сам аллоцирует выходные сэмплы
+	w, h      int
+	fps       int
+	outSize   uint32 // размер выходного буфера (cbSize из GetOutputStreamInfo)
+	selfAlloc bool   // MFT сам аллоцирует выходные сэмплы
 
-	frame int64 // счётчик кадров (для таймстампов)
+	frame   int64 // счётчик кадров (для таймстампов)
+	lastKey int64 // номер кадра последнего кейфрейма (для замера GOP)
 
 	mu       sync.Mutex
 	forceKey bool
+}
+
+// auHasKeyframe — есть ли в Annex-B access unit'е NAL типа IDR(5) или SPS(7),
+// т.е. является ли кадр кейфреймом. Для замера реального интервала кейфреймов.
+func auHasKeyframe(au []byte) bool {
+	for i := 0; i+3 < len(au); i++ {
+		if au[i] != 0 || au[i+1] != 0 {
+			continue
+		}
+		var nalStart int
+		switch {
+		case au[i+2] == 1:
+			nalStart = i + 3
+		case au[i+2] == 0 && au[i+3] == 1:
+			nalStart = i + 4
+		default:
+			continue
+		}
+		if nalStart < len(au) {
+			if t := au[nalStart] & 0x1f; t == 5 || t == 7 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func setGUID(mt uintptr, key *windows.GUID, val *windows.GUID) uintptr {
@@ -248,6 +275,26 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	e := &h264Encoder{mft: mft, w: w, h: h, fps: fps}
 	bitrate := uint32(kbps * 1000)
 
+	// ICodecAPI задаём ДО SetOutputType — иначе CMSH264EncoderMFT возвращает S_OK,
+	// но игнорирует часть свойств (проверено: GOP через ICodecAPI и через media-type
+	// после SetOutputType не применялись → кейфрейм каждую 1с). Best-effort, логируем.
+	if codec, err := comQueryInterface(mft, &iidICodecAPI); err == nil {
+		e.codec = codec
+		rc := e.codecSet(&codecRateControlMode, variantU32(avEncRateControlCBR))
+		br := e.codecSet(&codecMeanBitRate, variantU32(bitrate))
+		// Длинный GOP: кейфреймы по запросу (PLI → ForceKeyframe), а не раз в секунду.
+		gop := e.codecSet(&codecGOPSize, variantU32(uint32(fps*10)))
+		ll := e.codecSet(&codecLowLatency, variantBool(true))
+		bp := e.codecSet(&codecBPictureCount, variantU32(0))
+		// Баланс качество/скорость: 100 давал encode ~30мс (не влезает в 16мс на
+		// 60fps → overload), 0 — грязно. 25 — умеренное качество в рамках бюджета.
+		qs := e.codecSet(&codecQualityVsSpeed, variantU32(25))
+		log.Printf("mf/codec: ICodecAPI (до SetOutputType) — RateControl=%#x MeanBitRate=%#x GOP=%#x LowLat=%#x BPic=%#x Quality=%#x",
+			uint32(rc), uint32(br), uint32(gop), uint32(ll), uint32(bp), uint32(qs))
+	} else {
+		log.Printf("mf/codec: ICodecAPI НЕ получен (%v) — CBR/GOP/качество НЕ настроены, энкодер в дефолте", err)
+	}
+
 	// Выходной тип (H264) задаём ПЕРВЫМ — так требует MS-энкодер.
 	hrOut, outType := procCallOut(procMFCreateMediaType)
 	if hrOut != sOK {
@@ -262,6 +309,10 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	setU64(outType, &mfMTFrameRate, packU64(uint32(fps), 1))
 	setU64(outType, &mfMTPixelAspect, packU64(1, 1))
 	setU32(outType, &mfMTMPEG2Profile, avEncH264ProfileHigh)
+	// Интервал кейфреймов через атрибут медиатипа (ICodecAPI GOPSize этот MFT
+	// игнорирует). Длинный GOP: I-кадр только по PLI + safety-net раз в ~10с,
+	// иначе секундные I-кадры при CBR выжирают бюджет → дыхание качества.
+	setU32(outType, &mfMTMaxKeyframeSpacing, uint32(fps*10))
 	if hr := comCall(mft, idxMFTSetOutputType, 0, outType, 0); hr != sOK {
 		comRelease(outType)
 		e.Close()
@@ -288,17 +339,6 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	}
 	comRelease(inType)
 
-	// ICodecAPI: CBR + средний битрейт + GOP (1с) + низкая задержка. Best-effort.
-	if codec, err := comQueryInterface(mft, &iidICodecAPI); err == nil {
-		e.codec = codec
-		e.codecSet(&codecRateControlMode, variantU32(avEncRateControlCBR))
-		e.codecSet(&codecMeanBitRate, variantU32(bitrate))
-		e.codecSet(&codecGOPSize, variantU32(uint32(fps)))
-		e.codecSet(&codecLowLatency, variantBool(true))
-		e.codecSet(&codecBPictureCount, variantU32(0)) // без B-кадров — меньше задержка/реордер
-		e.codecSet(&codecQualityVsSpeed, variantU32(0)) // приоритет скорости кодирования
-	}
-
 	// Узнаём размер выходного буфера и кто его аллоцирует.
 	info := new(mftOutputStreamInfo)
 	comCall(mft, idxMFTGetOutStreamInfo, 0, uintptr(unsafe.Pointer(info)))
@@ -314,15 +354,16 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	return e, nil
 }
 
-func (e *h264Encoder) codecSet(api *windows.GUID, v variant) {
+func (e *h264Encoder) codecSet(api *windows.GUID, v variant) uintptr {
 	if e.codec == 0 {
-		return
+		return 0x80004005 // E_FAIL
 	}
 	pv := new(variant) // входная структура на куче — адрес стабилен на время вызова
 	*pv = v
-	comCall(e.codec, idxCodecSetValue, uintptr(unsafe.Pointer(api)), uintptr(unsafe.Pointer(pv)))
+	hr := comCall(e.codec, idxCodecSetValue, uintptr(unsafe.Pointer(api)), uintptr(unsafe.Pointer(pv)))
 	runtime.KeepAlive(api)
 	runtime.KeepAlive(pv)
+	return hr
 }
 
 // forceKeyframe помечает следующий кадр как принудительный IDR.
@@ -348,6 +389,7 @@ func (e *h264Encoder) encode(nv12 []byte) ([][]byte, error) {
 	e.mu.Unlock()
 	if force {
 		e.codecSet(&codecForceKeyFrame, variantU32(1))
+		log.Printf("mf/codec: force keyframe (PLI от зрителя)")
 	}
 
 	sample, err := e.makeInputSample(nv12)
@@ -359,7 +401,16 @@ func (e *h264Encoder) encode(nv12 []byte) ([][]byte, error) {
 	if hr != sOK {
 		return nil, hrError(hr, "ProcessInput")
 	}
-	return e.drainOutput()
+	aus, derr := e.drainOutput()
+	for _, au := range aus {
+		if auHasKeyframe(au) {
+			log.Printf("mf/codec: keyframe @ кадр %d (интервал %d кадров ~%.1fs, размер %d Б)",
+				e.frame, e.frame-e.lastKey, float64(e.frame-e.lastKey)/float64(e.fps), len(au))
+			e.lastKey = e.frame
+			break
+		}
+	}
+	return aus, derr
 }
 
 // makeInputSample оборачивает NV12-байты в IMFSample с таймстампом/длительностью.

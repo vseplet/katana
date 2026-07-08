@@ -15,9 +15,9 @@ import (
 )
 
 var (
-	d3d11                          = windows.NewLazySystemDLL("d3d11.dll")
-	procD3D11CreateDevice          = d3d11.NewProc("D3D11CreateDevice")
-	procCreateDirect3D11FromDXGI   = d3d11.NewProc("CreateDirect3D11DeviceFromDXGIDevice")
+	d3d11                        = windows.NewLazySystemDLL("d3d11.dll")
+	procD3D11CreateDevice        = d3d11.NewProc("D3D11CreateDevice")
+	procCreateDirect3D11FromDXGI = d3d11.NewProc("CreateDirect3D11DeviceFromDXGIDevice")
 )
 
 const (
@@ -40,7 +40,22 @@ const (
 	idxCtxCopyResource       = 47 // ID3D11DeviceContext::CopyResource
 	idxTex2DGetDesc          = 10 // ID3D11Texture2D::GetDesc
 	idxDxgiIfaceAccessGet    = 3  // IDirect3DDxgiInterfaceAccess::GetInterface
+	idxMultithreadSetProt    = 5  // ID3D11Multithread::SetMultithreadProtected
 )
+
+// enableMultithreadProtection включает потокобезопасность immediate context'а.
+// КРИТИЧНО: free-threaded framepool WGC рендерит кадры в свои текстуры на своём
+// внутреннем потоке через ТОТ ЖЕ девайс/контекст, что и наш CopyResource+Map.
+// Immediate context один на девайс и не потокобезопасен → без этого при потоке
+// кадров (перетаскивание окна) два потока рвут контекст и мы читаем полукадры.
+func enableMultithreadProtection(ctx uintptr) {
+	mt, err := comQueryInterface(ctx, &iidID3D11Multithread)
+	if err != nil {
+		return
+	}
+	comCall(mt, idxMultithreadSetProt, 1) // TRUE
+	comRelease(mt)
+}
 
 // d3d11Texture2DDesc — раскладка D3D11_TEXTURE2D_DESC (11×uint32 = 44 байта).
 type d3d11Texture2DDesc struct {
@@ -70,11 +85,11 @@ func createD3D11Device() (dev, ctx uintptr, err error) {
 	try := func(driver uintptr) uintptr {
 		pd, pc := new(uintptr), new(uintptr) // out-слоты в куче
 		hr, _, _ := procD3D11CreateDevice.Call(
-			0,       // pAdapter
-			driver,  // DriverType
-			0,       // Software
+			0,      // pAdapter
+			driver, // DriverType
+			0,      // Software
 			d3d11CreateDeviceBGRASupport,
-			0, 0,    // pFeatureLevels, FeatureLevels
+			0, 0, // pFeatureLevels, FeatureLevels
 			d3d11SDKVersion,
 			uintptr(unsafe.Pointer(pd)),
 			0, // pFeatureLevel
@@ -88,13 +103,15 @@ func createD3D11Device() (dev, ctx uintptr, err error) {
 		return hr
 	}
 	if hr := try(driverHardware); hr == sOK {
-		log.Printf("capture: D3D11 device = HARDWARE (аппаратный GPU)")
+		enableMultithreadProtection(ctx)
+		log.Printf("capture: D3D11 device = HARDWARE (аппаратный GPU), MT-protection ON")
 		return dev, ctx, nil
 	}
 	if hr := try(driverWARP); hr != sOK {
 		return 0, 0, hrError(hr, "D3D11CreateDevice")
 	}
-	log.Printf("capture: D3D11 device = WARP (софтовый растеризатор — GPU-энкод бессмыслен)")
+	enableMultithreadProtection(ctx)
+	log.Printf("capture: D3D11 device = WARP (софтовый растеризатор), MT-protection ON")
 	return dev, ctx, nil
 }
 

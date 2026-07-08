@@ -22,8 +22,8 @@ import (
 const ptrSize = unsafe.Sizeof(uintptr(0))
 
 var (
-	kernel32          = windows.NewLazySystemDLL("kernel32.dll")
-	procIsBadReadPtr  = kernel32.NewProc("IsBadReadPtr")
+	kernel32         = windows.NewLazySystemDLL("kernel32.dll")
+	procIsBadReadPtr = kernel32.NewProc("IsBadReadPtr")
 
 	combase                    = windows.NewLazySystemDLL("combase.dll")
 	procRoInitialize           = combase.NewProc("RoInitialize")
@@ -106,7 +106,7 @@ func ptrReadable(p uintptr) bool {
 
 // --- IUnknown ------------------------------------------------------------------
 
-func comAddRef(this uintptr) uint32  { return uint32(comCall(this, 1)) }
+func comAddRef(this uintptr) uint32 { return uint32(comCall(this, 1)) }
 func comRelease(this uintptr) uint32 {
 	if this == 0 {
 		return 0
@@ -206,28 +206,29 @@ func mustGUID(s string) windows.GUID {
 
 var (
 	// Windows.Graphics.Capture
-	iidIGraphicsCaptureItem              = mustGUID("{79C3F95B-31F7-4EC2-A464-632EF5D30760}")
-	iidIGraphicsCaptureItemInterop       = mustGUID("{3628E81B-3CAC-4C60-B7F4-23CE0E0C3356}")
-	iidIDirect3D11CaptureFramePool       = mustGUID("{24EB6D22-1975-422E-82E7-780DBD8DDF24}")
-	iidIDirect3D11CaptureFramePoolStat2  = mustGUID("{589B103F-6BBC-5DF5-A991-02E28B3B66D5}")
-	iidIDirect3D11CaptureFrame           = mustGUID("{FA50C623-38DA-4B32-ACF3-FA9734AD800E}")
-	iidIGraphicsCaptureSession           = mustGUID("{814E42A9-F70F-4AD7-939B-FDDCC6EB880D}")
-	iidIDirect3DDevice                   = mustGUID("{A37624AB-8D5F-4650-9D3E-9EAE3D9BC670}")
-	iidIClosable                         = mustGUID("{30D5A829-7FA4-4026-83BB-D75BAE4EA99E}")
-	iidIDirect3DDxgiInterfaceAccess      = mustGUID("{A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1}")
+	iidIGraphicsCaptureItem             = mustGUID("{79C3F95B-31F7-4EC2-A464-632EF5D30760}")
+	iidIGraphicsCaptureItemInterop      = mustGUID("{3628E81B-3CAC-4C60-B7F4-23CE0E0C3356}")
+	iidIDirect3D11CaptureFramePool      = mustGUID("{24EB6D22-1975-422E-82E7-780DBD8DDF24}")
+	iidIDirect3D11CaptureFramePoolStat2 = mustGUID("{589B103F-6BBC-5DF5-A991-02E28B3B66D5}")
+	iidIDirect3D11CaptureFrame          = mustGUID("{FA50C623-38DA-4B32-ACF3-FA9734AD800E}")
+	iidIGraphicsCaptureSession          = mustGUID("{814E42A9-F70F-4AD7-939B-FDDCC6EB880D}")
+	iidIDirect3DDevice                  = mustGUID("{A37624AB-8D5F-4650-9D3E-9EAE3D9BC670}")
+	iidIClosable                        = mustGUID("{30D5A829-7FA4-4026-83BB-D75BAE4EA99E}")
+	iidIDirect3DDxgiInterfaceAccess     = mustGUID("{A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1}")
 
 	// Direct3D / DXGI
-	iidIDXGIDevice    = mustGUID("{54EC77FA-1377-44E6-8C32-88FD5F44C84C}")
-	iidID3D11Texture2D = mustGUID("{6F15AAF2-D208-4E89-9AB4-489535D34F9C}")
+	iidIDXGIDevice       = mustGUID("{54EC77FA-1377-44E6-8C32-88FD5F44C84C}")
+	iidID3D11Texture2D   = mustGUID("{6F15AAF2-D208-4E89-9AB4-489535D34F9C}")
+	iidID3D11Multithread = mustGUID("{9B7E4E00-342C-4106-A19F-4F2704F689F0}")
 
 	// Media Foundation
-	iidIMFTransform = mustGUID("{BF94C121-5B05-4E6F-8000-BA598961414D}")
-	iidICodecAPI    = mustGUID("{901DB4C7-31CE-41A2-85DC-8FA0BF41B8DA}")
+	iidIMFTransform  = mustGUID("{BF94C121-5B05-4E6F-8000-BA598961414D}")
+	iidICodecAPI     = mustGUID("{901DB4C7-31CE-41A2-85DC-8FA0BF41B8DA}")
 	clsidH264Encoder = mustGUID("{6CA50344-051A-4DED-9779-A43305165E35}") // CLSID_CMSH264EncoderMFT
 )
 
 // Активационные строки WinRT-классов.
 const (
-	classGraphicsCaptureItem     = "Windows.Graphics.Capture.GraphicsCaptureItem"
+	classGraphicsCaptureItem        = "Windows.Graphics.Capture.GraphicsCaptureItem"
 	classDirect3D11CaptureFramePool = "Windows.Graphics.Capture.Direct3D11CaptureFramePool"
 )

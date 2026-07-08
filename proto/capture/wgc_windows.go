@@ -187,28 +187,55 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		}
 	}()
 
-	ticker := time.NewTicker(time.Second / time.Duration(fps))
-	defer ticker.Stop()
+	frameDur := time.Second / time.Duration(fps)
 
-	// Тайминги: раз в ~2с логируем реальный fps и разбивку convert/encode.
-	var nFrames int
+	// Event-driven + CFR-заполнение простоя. Ключ к отсутствию дрожания на движении:
+	// эмитить РЕАЛЬНЫЙ кадр WGC сразу, как он пришёл (1:1 с источником, как на
+	// mac/Linux) — НЕ по своей 60fps-сетке. Отдельный тикер, не синхронный с подачей
+	// WGC, давал биения (дубль на паузе / дроп при двух кадрах в интервале) = тряска.
+	// Поэтому поллим быстрее fps (ловим кадр с малой задержкой), а простой (WGC даёт
+	// ~10fps, когда экран статичен) добиваем повторами до fps — чтобы клиент видел
+	// ровный CFR и RTP-часы шли в ногу с реальным временем.
+	pollTicker := time.NewTicker(time.Second / time.Duration(fps*4))
+	defer pollTicker.Stop()
+
+	// Тайминги: раз в ~2с логируем fps, долю реальных/заполняющих кадров и convert/encode.
+	var nFrames, nFill, nReal int
 	var sumConv, sumEnc time.Duration
 	statT := time.Now()
 
 	var haveNV12 bool // получен хотя бы один кадр (есть что кодировать/повторять)
 	var convDur time.Duration
+	var nextFill time.Time // дедлайн следующего CFR-повтора при простое
+
+	// emit кодирует текущий nv12 и шлёт access unit'ы. false → ctx отменён, выходим.
+	emit := func() bool {
+		te := time.Now()
+		aus, encErr := s.enc.encode(nv12)
+		sumEnc += time.Since(te)
+		if encErr != nil {
+			log.Printf("capture: encode: %v", encErr)
+			return true
+		}
+		for _, au := range aus {
+			if !pushFrame(ctx, frames, au, opts.DropLate) {
+				return false
+			}
+		}
+		nFrames++
+		return true
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-pollTicker.C:
 		}
 
-		// Захват (best-effort): если WGC отдал новый кадр — конвертируем его в nv12,
-		// обновляя «последний кадр». Нет нового — оставляем прошлый (повтор для CFR).
-		// WGC отдаёт кадр только при изменении экрана, поэтому энкод к нему НЕ привязан.
+		// Забираем самый свежий кадр WGC (если есть) и конвертируем в nv12.
 		convDur = 0
+		gotNew := false
 		if frame := latestFrame(pool); frame != 0 {
 			_, surface := comCallOut(frame, idxFrameGetSurface)
 			if tex, terr := surfaceToTexture(surface); terr == nil {
@@ -221,6 +248,7 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 						bgraToNV12(data, rowPitch, srcW, srcH, dstW, dstH, nv12)
 						unmap()
 						haveNV12 = true
+						gotNew = true
 						convDur = time.Since(tc)
 					}
 				}
@@ -235,32 +263,38 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 			continue // первого кадра ещё не было — кодировать нечего
 		}
 
-		// CFR: кодируем «последний кадр» на КАЖДОМ тике (новый или повтор) — ровно
-		// opts.FPS кадров/с. Это совпадает с Duration=1/FPS у writer'а (webrtc.go);
-		// иначе RTP-часы расходятся с реальным временем → jitter/overload у зрителя.
-		te := time.Now()
-		aus, encErr := s.enc.encode(nv12)
-		encDur := time.Since(te)
-		if encErr != nil {
-			log.Printf("capture: encode: %v", encErr)
-			continue
-		}
-		for _, au := range aus {
-			if !pushFrame(ctx, frames, au, opts.DropLate) {
+		now := time.Now()
+		switch {
+		case gotNew:
+			// Реальный кадр — эмитим немедленно (без сетки → нет биений на движении).
+			nReal++
+			sumConv += convDur
+			if !emit() {
 				return
+			}
+			nextFill = now.Add(frameDur) // реальный кадр сдвигает дедлайн заполнения
+		case now.After(nextFill):
+			// Простой/сталл — держим fps повтором (RTP идёт в ногу с реальным временем).
+			nFill++
+			if !emit() {
+				return
+			}
+			nextFill = nextFill.Add(frameDur)
+			if now.Sub(nextFill) > frameDur {
+				nextFill = now.Add(frameDur) // не копим долг после долгой паузы
 			}
 		}
 
-		nFrames++
-		sumConv += convDur
-		sumEnc += encDur
 		if el := time.Since(statT); el >= 2*time.Second {
-			log.Printf("capture/perf: %.1ffps convert=%.1fms/кадр encode=%.1fms (n=%d/%.1fs)",
-				float64(nFrames)/el.Seconds(),
-				float64(sumConv.Microseconds())/float64(nFrames)/1000,
-				float64(sumEnc.Microseconds())/float64(nFrames)/1000,
+			cv := 0.0
+			if nReal > 0 {
+				cv = float64(sumConv.Microseconds()) / float64(nReal) / 1000
+			}
+			log.Printf("capture/perf: %.1ffps (real=%d fill=%d) convert=%.1fms/кадр encode=%.1fms (n=%d/%.1fs)",
+				float64(nFrames)/el.Seconds(), nReal, nFill, cv,
+				float64(sumEnc.Microseconds())/float64(nFrames+1)/1000,
 				nFrames, el.Seconds())
-			nFrames, sumConv, sumEnc, statT = 0, 0, 0, time.Now()
+			nFrames, nFill, nReal, sumConv, sumEnc, statT = 0, 0, 0, 0, 0, time.Now()
 		}
 	}
 }
