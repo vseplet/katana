@@ -71,7 +71,9 @@ func videoProbe() bool {
 			log.Printf("capture: %v (video disabled)", err)
 			return
 		}
-		logEncoders() // диагностика: какие H264-энкодеры доступны (hardware/software)
+		if debugCapture() {
+			logEncoders() // диагностика: какие H264-энкодеры доступны (hardware/software)
+		}
 		probeOK = true
 		log.Printf("capture: windows native video available (WGC + H264 MFT)")
 	})
@@ -149,7 +151,27 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 	}
 	defer roUninitialize()
 
-	dev, devCtx, item, pool, statics2, session, err := s.setup(opts)
+	// Инициализация WGC в VM (Parallels) бывает флейки: RoGetActivationFactory
+	// изредка отдаёт E_INVALIDARG на ровном месте, хотя предыдущий запуск поднимался.
+	// Повторяем настройку несколько раз с паузой — обычно следующая попытка проходит.
+	// Частично созданные COM-объекты неудачной попытки освобождаем, чтобы не течь.
+	var dev, devCtx, item, pool, statics2, session uintptr
+	var err error
+	for attempt := 1; attempt <= 4; attempt++ {
+		dev, devCtx, item, pool, statics2, session, err = s.setup(opts)
+		if err == nil {
+			break
+		}
+		log.Printf("capture: wgc setup попытка %d/4: %v", attempt, err)
+		s.releasePartial(dev, devCtx, item, pool, statics2, session)
+		dev, devCtx, item, pool, statics2, session = 0, 0, 0, 0, 0, 0
+		select {
+		case <-ctx.Done():
+			ready <- ctx.Err()
+			return
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
 	if err != nil {
 		ready <- err
 		return
@@ -286,14 +308,16 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		}
 
 		if el := time.Since(statT); el >= 2*time.Second {
-			cv := 0.0
-			if nReal > 0 {
-				cv = float64(sumConv.Microseconds()) / float64(nReal) / 1000
+			if debugCapture() {
+				cv := 0.0
+				if nReal > 0 {
+					cv = float64(sumConv.Microseconds()) / float64(nReal) / 1000
+				}
+				log.Printf("capture/perf: %.1ffps (real=%d fill=%d) convert=%.1fms/кадр encode=%.1fms (n=%d/%.1fs)",
+					float64(nFrames)/el.Seconds(), nReal, nFill, cv,
+					float64(sumEnc.Microseconds())/float64(nFrames+1)/1000,
+					nFrames, el.Seconds())
 			}
-			log.Printf("capture/perf: %.1ffps (real=%d fill=%d) convert=%.1fms/кадр encode=%.1fms (n=%d/%.1fs)",
-				float64(nFrames)/el.Seconds(), nReal, nFill, cv,
-				float64(sumEnc.Microseconds())/float64(nFrames+1)/1000,
-				nFrames, el.Seconds())
 			nFrames, nFill, nReal, sumConv, sumEnc, statT = 0, 0, 0, 0, 0, time.Now()
 		}
 	}
@@ -332,6 +356,12 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 
 // setup создаёт D3D-устройство, capture item, framepool и сессию, стартует захват.
 func (s *wgcSession) setup(opts Options) (dev, devCtx, item, pool, statics2, session uintptr, err error) {
+	// diag — подробные логи настройки только под KATANA_DEBUG (в обычном режиме тихо).
+	diag := func(format string, args ...any) {
+		if debugCapture() {
+			log.Printf(format, args...)
+		}
+	}
 	dev, devCtx, err = createD3D11Device()
 	if err != nil {
 		return
@@ -343,19 +373,19 @@ func (s *wgcSession) setup(opts Options) (dev, devCtx, item, pool, statics2, ses
 	}
 	defer comRelease(winrtDev)
 
-	log.Printf("wgc/diag: dev=%#x devCtx=%#x winrtDev=%#x", dev, devCtx, winrtDev)
+	diag("wgc/diag: dev=%#x devCtx=%#x winrtDev=%#x", dev, devCtx, winrtDev)
 
 	item, err = s.captureItem(opts)
 	if err != nil {
 		return
 	}
-	log.Printf("wgc/diag: item=%#x", item)
+	diag("wgc/diag: item=%#x", item)
 	// Пробинг item: get_Size (индекс 7). Валидный item вернёт hr=0 и разумные WxH.
 	{
 		sz := new(struct{ w, h int32 })
 		hrSz := comCall(item, 7, uintptr(unsafe.Pointer(sz)))
 		runtime.KeepAlive(sz)
-		log.Printf("wgc/diag: item.Size hr=%#x %dx%d", uint32(hrSz), sz.w, sz.h)
+		diag("wgc/diag: item.Size hr=%#x %dx%d", uint32(hrSz), sz.w, sz.h)
 	}
 
 	// Размер framepool — из прямоугольника источника (монитор или окно).
@@ -369,12 +399,12 @@ func (s *wgcSession) setup(opts Options) (dev, devCtx, item, pool, statics2, ses
 	if err != nil {
 		return
 	}
-	log.Printf("wgc/diag: statics2=%#x size=%dx%d", statics2, pw, ph)
+	diag("wgc/diag: statics2=%#x size=%dx%d", statics2, pw, ph)
 	size := uintptr(uint32(pw)) | uintptr(uint32(ph))<<32 // SizeInt32 by value
 	hr, poolOut := comCallOut(statics2, idxStatics2CreateFree,
 		winrtDev, uintptr(dxgiFormatB8G8R8A8Unorm), uintptr(wgcNumBuffers), size)
 	pool = poolOut
-	log.Printf("wgc/diag: CreateFreeThreaded hr=%#x pool=%#x", uint32(hr), pool)
+	diag("wgc/diag: CreateFreeThreaded hr=%#x pool=%#x", uint32(hr), pool)
 	if err = hrError(hr, "CreateFreeThreaded"); err != nil {
 		return
 	}
@@ -382,7 +412,7 @@ func (s *wgcSession) setup(opts Options) (dev, devCtx, item, pool, statics2, ses
 	// Если vtable pool «съехала» — увидим мусор/ошибку тут.
 	if ptrReadable(pool) {
 		hrTf, f := comCallOut(pool, idxFramePoolTryGetNext)
-		log.Printf("wgc/diag: pool.TryGetNextFrame hr=%#x frame=%#x", uint32(hrTf), f)
+		diag("wgc/diag: pool.TryGetNextFrame hr=%#x frame=%#x", uint32(hrTf), f)
 		if f != 0 {
 			winrtClose(f)
 			comRelease(f)
@@ -400,11 +430,11 @@ func (s *wgcSession) setup(opts Options) (dev, devCtx, item, pool, statics2, ses
 	// и отсеется; getDispatcherQueue(11) не трогаем, у него другая раскладка arg'ов).
 	for _, idx := range []int{10, 8, 9} {
 		hrC, cand := comCallOut(pool, idx, item)
-		log.Printf("wgc/diag: CreateCaptureSession probe idx=%d hr=%#x ptr=%#x readable=%v",
+		diag("wgc/diag: CreateCaptureSession probe idx=%d hr=%#x ptr=%#x readable=%v",
 			idx, uint32(hrC), cand, ptrReadable(cand))
 		if hrC == sOK && ptrReadable(cand) {
 			session = cand
-			log.Printf("wgc/diag: CreateCaptureSession найден на индексе %d", idx)
+			diag("wgc/diag: CreateCaptureSession найден на индексе %d", idx)
 			break
 		}
 	}
@@ -428,6 +458,35 @@ func (s *wgcSession) setup(opts Options) (dev, devCtx, item, pool, statics2, ses
 		return
 	}
 	return
+}
+
+// releasePartial освобождает COM-объекты частично удавшейся setup (для ретрая).
+// Порядок обратный созданию; s.session2 (курсорный QI) тоже сбрасываем.
+func (s *wgcSession) releasePartial(dev, devCtx, item, pool, statics2, session uintptr) {
+	if session != 0 {
+		winrtClose(session)
+		comRelease(session)
+	}
+	if s.session2 != 0 {
+		comRelease(s.session2)
+		s.session2 = 0
+	}
+	if pool != 0 {
+		winrtClose(pool)
+		comRelease(pool)
+	}
+	if statics2 != 0 {
+		comRelease(statics2)
+	}
+	if item != 0 {
+		comRelease(item)
+	}
+	if devCtx != 0 {
+		comRelease(devCtx)
+	}
+	if dev != 0 {
+		comRelease(dev)
+	}
 }
 
 // captureItem создаёт GraphicsCaptureItem для окна (SourceKind=="window"/"app",
