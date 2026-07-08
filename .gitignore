@@ -6,4 +6,5 @@ proto/proto_bin
 .DS_Store
 
 /katana-host
+*.exe
 /native-libs/

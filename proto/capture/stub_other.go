@@ -1,9 +1,10 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
-// Заглушки нативной части для платформ без захвата (Windows/BSD и т.п.): захвата
-// экрана, списка источников и инъекции скролла нет. Терминал/сигналинг работают
-// без этого. macOS — ScreenCaptureKit/ffmpeg, Linux — ffmpeg x11grab/pulse
-// (ffmpeg_linux.go); тип noVideoEncoder общий (ffmpeg_common.go).
+// Заглушки нативной части для платформ без захвата (BSD и т.п.): захвата экрана,
+// списка источников и инъекции скролла нет. Терминал/сигналинг работают без этого.
+// macOS — ScreenCaptureKit/ffmpeg, Linux — ffmpeg x11grab/pulse (ffmpeg_linux.go),
+// Windows — WGC + Media Foundation (windows_common.go); тип noVideoEncoder общий
+// (ffmpeg_common.go).
 package capture
 
 // NewEncoder на платформах без захвата отдаёт энкодер без видео: хост поднимается

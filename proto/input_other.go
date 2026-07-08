@@ -1,8 +1,9 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
-// Заглушки инъекции ввода для платформ без нативного управления (Windows/BSD):
+// Заглушки инъекции ввода для платформ без нативного управления (BSD и т.п.):
 // мыши/клавиатуры нет — все операции no-op. macOS — robotgo/CGEvent
-// (input_darwin.go), Linux — uinput (input_linux.go, input_keys_linux.go).
+// (input_darwin.go), Linux — uinput (input_linux.go, input_keys_linux.go),
+// Windows — user32/SendInput (input_windows.go).
 package main
 
 func moveMouse(x, y int)                   {}
