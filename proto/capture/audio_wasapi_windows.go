@@ -40,12 +40,16 @@ var (
 )
 
 const (
-	coinitMultithreaded        = 0x0
-	clsctxAll                  = 0x17
-	audclntShareModeShared     = 0
-	audclntStreamflagsLoopback = 0x00020000
-	audclntBufferflagsSilent   = 0x2
-	loopbackBufDur100ns        = 500000 // 50 мс буфер захвата (в единицах 100 нс) — низкая латентность без overrun
+	coinitMultithreaded                 = 0x0
+	clsctxAll                           = 0x17
+	audclntShareModeShared              = 0
+	audclntStreamflagsLoopback          = 0x00020000
+	audclntBufferflagsDataDiscontinuity = 0x1 // захват заметил разрыв (overrun/глитч)
+	audclntBufferflagsSilent            = 0x2
+	loopbackBufDur100ns                 = 2000000 // 200 мс буфер захвата (в 100нс). Крупный запас,
+	// чтобы пауза GC/планировщика (в VM бывает 50-100мс) не переполнила кольцо и не
+	// потеряла сэмплы (звук залипал раз в 2-3с). Латентность не растёт: вычитываем
+	// всё каждые 10мс, буфер — только запас на overrun.
 
 	// Индексы vtable (IUnknown-интерфейсы: методы с индекса 3).
 	idxEnumGetDefaultEndpoint   = 4  // IMMDeviceEnumerator::GetDefaultAudioEndpoint
@@ -197,6 +201,19 @@ func (l *loopback) pump(ctx context.Context, w io.Writer) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	zeros := make([]byte, 4096*l.blockAlgn) // буфер для «активной тишины» (SILENT-флаг)
+	// Боксы out-параметров COM аллоцируем ОДИН раз и переиспользуем между итерациями.
+	// new() на каждый пакет каждые 10мс подливал мусор в GC, чьи паузы приводили к
+	// периодическим overrun'ам захвата (звук залипал раз в 2-3с). Куча-боксы всё так
+	// же переживают перемещения Go-стека.
+	pf := new(uint32)
+	pData := new(uintptr)
+	pFrames := new(uint32)
+	pFlags := new(uint32)
+	pDev := new(uint64)
+	pQPC := new(uint64)
+
+	var discont int     // счётчик overrun'ов (DATA_DISCONTINUITY) за окно
+	statT := time.Now() // окно логирования разрывов
 
 	for {
 		select {
@@ -205,34 +222,34 @@ func (l *loopback) pump(ctx context.Context, w io.Writer) {
 		case <-ticker.C:
 		}
 
+		if el := time.Since(statT); el >= 5*time.Second {
+			if discont > 0 {
+				log.Printf("audio: WASAPI overrun x%d за %.0fс (потеря сэмплов → залипание)", discont, el.Seconds())
+			}
+			discont, statT = 0, time.Now()
+		}
+
 		// Сливаем все готовые пакеты WASAPI за этот тик.
 		for {
-			pf := new(uint32)
 			if hr := comCall(l.capture, idxCaptureGetNextPacketSize, uintptr(unsafe.Pointer(pf))); hr != sOK {
-				runtime.KeepAlive(pf)
 				break
 			}
-			nf := *pf
-			runtime.KeepAlive(pf)
-			if nf == 0 {
+			if *pf == 0 {
 				break
 			}
-			pData := new(uintptr)
-			pFrames := new(uint32)
-			pFlags := new(uint32)
-			pDev := new(uint64)
-			pQPC := new(uint64)
 			hr := comCall(l.capture, idxCaptureGetBuffer,
 				uintptr(unsafe.Pointer(pData)), uintptr(unsafe.Pointer(pFrames)),
 				uintptr(unsafe.Pointer(pFlags)), uintptr(unsafe.Pointer(pDev)),
 				uintptr(unsafe.Pointer(pQPC)))
 			if hr != sOK {
-				runtime.KeepAlive(pData)
 				break
 			}
 			frames := *pFrames
 			flags := *pFlags
 			data := *pData
+			if flags&audclntBufferflagsDataDiscontinuity != 0 {
+				discont++
+			}
 			var werr error
 			if frames > 0 {
 				// SILENT-флаг: буфер валиден, но это тишина — пишем нули такого же размера.
@@ -274,8 +291,8 @@ func startOpusFromPCM(ctx context.Context, sampleFmt string, rate, channels int)
 		// Поток держим непрерывным и real-time на стороне захвата (pump), поэтому
 		// ffmpeg простой, как на mac/Linux — без ресемпла/пересинхронизации.
 		"-ac", "2", "-ar", "48000",
-		"-c:a", "libopus", "-b:a", "128k", "-application", "audio",
-		"-frame_duration", "20", "-page_duration", "20000", "-flush_packets", "1",
+		"-c:a", "libopus", "-b:a", "128k", "-application", "lowdelay",
+		"-page_duration", "20000", // одна opus-страница ≈ 20 мс — как на mac
 		"-f", "ogg", "-",
 	}
 	cmd := exec.CommandContext(ctx, FFmpegPath(), args...)
