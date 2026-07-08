@@ -3,11 +3,8 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"os"
-	"os/exec"
 	"sync"
 
-	"github.com/creack/pty"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -36,10 +33,22 @@ type termClient struct {
 	cols, rows uint16
 }
 
+// ptySession — платформенный псевдотерминал. Unix — creack/pty (terminal_other.go),
+// Windows — ConPTY (terminal_windows.go). Read отдаёт вывод шелла, Write — stdin,
+// Resize меняет размер, Close убивает процесс и освобождает ресурсы.
+type ptySession interface {
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+	Resize(cols, rows uint16) error
+	Close() error
+}
+
+// startPTY поднимает login-шелл в псевдотерминале нужного размера. Реализуется
+// платформенно (terminal_other.go / terminal_windows.go).
+
 type sharedTerm struct {
 	mu      sync.Mutex
-	ptmx    *os.File
-	cmd     *exec.Cmd
+	pty     ptySession
 	ring    []byte
 	clients map[*webrtc.DataChannel]*termClient
 }
@@ -68,7 +77,7 @@ func (t *sharedTerm) onMessage(dc *webrtc.DataChannel, msg webrtc.DataChannelMes
 	}
 	// Бинарный месседж = stdin в общий шелл.
 	t.mu.Lock()
-	p := t.ptmx
+	p := t.pty
 	t.mu.Unlock()
 	if p != nil {
 		_, _ = p.Write(msg.Data)
@@ -102,36 +111,25 @@ func (t *sharedTerm) attachOrResize(dc *webrtc.DataChannel, cols, rows uint16) {
 
 // ensureStartedLocked поднимает общий PTY один раз (под mu).
 func (t *sharedTerm) ensureStartedLocked(cols, rows uint16) {
-	if t.ptmx != nil {
+	if t.pty != nil {
 		return
 	}
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/zsh"
-	}
-	c := exec.Command(shell, "-l") // login-шелл: подхватит профиль пользователя
-	c.Env = append(os.Environ(), "TERM=xterm-256color")
-	if home, err := os.UserHomeDir(); err == nil {
-		c.Dir = home
-	}
-	size := &pty.Winsize{Cols: cols, Rows: rows}
 	if cols == 0 || rows == 0 {
-		size = &pty.Winsize{Cols: 80, Rows: 24}
+		cols, rows = 80, 24
 	}
-	ptmx, err := pty.StartWithSize(c, size)
+	p, err := startPTY(cols, rows)
 	if err != nil {
 		log.Printf("term: start pty: %v", err)
 		return
 	}
-	t.ptmx = ptmx
-	t.cmd = c
-	log.Printf("term: shared pty started (%s)", shell)
-	go t.pump(ptmx)
+	t.pty = p
+	log.Printf("term: shared pty started")
+	go t.pump(p)
 }
 
 // applySizeLocked выставляет размер PTY = минимум по всем зрителям (под mu).
 func (t *sharedTerm) applySizeLocked() {
-	if t.ptmx == nil || len(t.clients) == 0 {
+	if t.pty == nil || len(t.clients) == 0 {
 		return
 	}
 	var mc, mr uint16
@@ -147,15 +145,15 @@ func (t *sharedTerm) applySizeLocked() {
 		}
 	}
 	if mc > 0 && mr > 0 {
-		_ = pty.Setsize(t.ptmx, &pty.Winsize{Cols: mc, Rows: mr})
+		_ = t.pty.Resize(mc, mr)
 	}
 }
 
 // pump читает вывод PTY, копит в кольцевой буфер и бродкастит всем зрителям.
-func (t *sharedTerm) pump(ptmx *os.File) {
+func (t *sharedTerm) pump(p ptySession) {
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := ptmx.Read(buf)
+		n, err := p.Read(buf)
 		if n > 0 {
 			t.broadcast(buf[:n])
 		}
@@ -192,22 +190,23 @@ func (t *sharedTerm) detach(dc *webrtc.DataChannel) {
 // kill завершает общий шелл по запросу зрителя.
 func (t *sharedTerm) kill() {
 	t.mu.Lock()
-	cmd, ptmx := t.cmd, t.ptmx
-	t.cmd, t.ptmx, t.ring = nil, nil, nil
+	p := t.pty
+	t.pty, t.ring = nil, nil
 	t.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
-	if ptmx != nil {
-		_ = ptmx.Close()
+	if p != nil {
+		_ = p.Close()
 	}
 }
 
 // reset сбрасывает состояние после смерти шелла; следующий resize поднимет новый.
 func (t *sharedTerm) reset() {
 	t.mu.Lock()
-	t.cmd, t.ptmx, t.ring = nil, nil, nil
+	p := t.pty
+	t.pty, t.ring = nil, nil
 	t.mu.Unlock()
+	if p != nil {
+		_ = p.Close() // освобождаем хендлы (процесс уже мог умереть)
+	}
 }
 
 // sendChunked шлёт данные кусками (лимит размера SCTP-месседжа DataChannel).
