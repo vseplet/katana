@@ -559,6 +559,11 @@ func scaleDims(srcW, srcH, targetW int) (int, int) {
 // bgraToNV12 конвертирует BGRA (mapped, с учётом rowPitch) в NV12 (BT.601, studio
 // range) с одновременным даунскейлом src→dst (nearest-neighbor). Хрома — 2×2
 // субдискретизацией. Таблица столбцов sxTab предвычислена (без деления в hot-loop).
+//
+// Распараллелено по строкам: на full-res десктопе однопоточная конвертация ~15–20мс
+// на кадр упирала захват в ~50fps (энкод уже на GPU, а это оставалось на одном ядре).
+// Делим строки на диапазоны по числу ядер; каждый воркер считает свой кусок Y+UV в
+// НЕПЕРЕСЕКАЮЩИЕСЯ области dst (границы чётные, чтобы UV-строки не делились).
 func bgraToNV12(src uintptr, rowPitch, srcW, srcH, dstW, dstH int, dst []byte) {
 	// Защита от невалидного кадра (нулевые pitch/размеры или маленький приёмник):
 	// молча пропускаем, иначе обращение к px[0] паникует на пустом срезе.
@@ -570,8 +575,37 @@ func bgraToNV12(src uintptr, rowPitch, srcW, srcH, dstW, dstH int, dst []byte) {
 	for x := 0; x < dstW; x++ {
 		sxTab[x] = (x * srcW / dstW) * 4 // байтовый сдвиг исходного пикселя (BGRA=4Б)
 	}
-	// Y-плоскость.
-	for y := 0; y < dstH; y++ {
+
+	nw := convWorkers(dstH)
+	if nw <= 1 {
+		convRows(px, rowPitch, srcH, dstW, dstH, sxTab, dst, 0, dstH)
+		return
+	}
+	chunk := (dstH + nw - 1) / nw
+	if chunk%2 == 1 {
+		chunk++ // чётная граница: UV-строка (каждая 2-я) целиком в одном воркере
+	}
+	var wg sync.WaitGroup
+	for y0 := 0; y0 < dstH; y0 += chunk {
+		y1 := y0 + chunk
+		if y1 > dstH {
+			y1 = dstH
+		}
+		wg.Add(1)
+		go func(y0, y1 int) {
+			defer wg.Done()
+			convRows(px, rowPitch, srcH, dstW, dstH, sxTab, dst, y0, y1)
+		}(y0, y1)
+	}
+	wg.Wait()
+}
+
+// convRows конвертирует диапазон строк [y0,y1) (Y-плоскость + UV для чётных строк).
+// UV-смещение считается из индекса строки (uvBase + (y/2)*dstW + x), а не бегущим
+// счётчиком — чтобы диапазоны были независимы и параллелились без гонок.
+func convRows(px []byte, rowPitch, srcH, dstW, dstH int, sxTab []int, dst []byte, y0, y1 int) {
+	uvBase := dstW * dstH
+	for y := y0; y < y1; y++ {
 		row := (y * srcH / dstH) * rowPitch
 		yo := y * dstW
 		for x := 0; x < dstW; x++ {
@@ -579,19 +613,30 @@ func bgraToNV12(src uintptr, rowPitch, srcW, srcH, dstW, dstH int, dst []byte) {
 			b, g, r := int(px[i]), int(px[i+1]), int(px[i+2])
 			dst[yo+x] = clamp8(((66*r + 129*g + 25*b + 128) >> 8) + 16)
 		}
-	}
-	// UV-плоскость (интерливинг U,V).
-	uv := dstW * dstH
-	for y := 0; y < dstH; y += 2 {
-		row := (y * srcH / dstH) * rowPitch
-		for x := 0; x < dstW; x += 2 {
-			i := row + sxTab[x]
-			b, g, r := int(px[i]), int(px[i+1]), int(px[i+2])
-			dst[uv] = clamp8(((-38*r - 74*g + 112*b + 128) >> 8) + 128)
-			dst[uv+1] = clamp8(((112*r - 94*g - 18*b + 128) >> 8) + 128)
-			uv += 2
+		if y&1 == 0 { // UV — по чётным строкам (2×2 субдискретизация)
+			uvRow := uvBase + (y/2)*dstW
+			for x := 0; x < dstW; x += 2 {
+				i := row + sxTab[x]
+				b, g, r := int(px[i]), int(px[i+1]), int(px[i+2])
+				dst[uvRow+x] = clamp8(((-38*r - 74*g + 112*b + 128) >> 8) + 128)
+				dst[uvRow+x+1] = clamp8(((112*r - 94*g - 18*b + 128) >> 8) + 128)
+			}
 		}
 	}
+}
+
+// convWorkers — сколько горутин пускать на конвертацию кадра: по числу ядер, но с
+// потолком (убывающая отдача + оставляем ядра под захват/pump/энкод), и не дробим
+// мелкие кадры (накладные расходы на горутины > выигрыш).
+func convWorkers(dstH int) int {
+	n := runtime.NumCPU()
+	if n > 8 {
+		n = 8
+	}
+	if n < 1 || dstH < 2*n {
+		return 1
+	}
+	return n
 }
 
 func clamp8(v int) byte {
