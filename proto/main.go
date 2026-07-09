@@ -73,6 +73,9 @@ func main() {
 			log.SetOutput(io.MultiWriter(os.Stdout, lf))
 		}
 	}
+	// Версия сборки первой строкой — чтобы по логу всегда было видно, какой билд
+	// крутится (иначе не отличить релизы при отладке).
+	log.Printf("katana build %s (%s/%s)", version, runtime.GOOS, runtime.GOARCH)
 
 	opts := capture.Options{
 		SourceKind:  "display", // по умолчанию весь дисплей через ScreenCaptureKit

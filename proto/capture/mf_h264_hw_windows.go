@@ -33,7 +33,10 @@ const (
 	idxEventGenGetEvent       = 3  // IMFMediaEventGenerator::GetEvent
 	idxEventGenQueueEvent     = 6  // IMFMediaEventGenerator::QueueEvent
 	idxEventGetType           = 33 // IMFMediaEvent::GetType (IMFAttributes+GetType)
+	idxDXGIDevMgrResetDevice  = 7  // IMFDXGIDeviceManager::ResetDevice
 )
+
+var procMFCreateDXGIDeviceManager = mfplat.NewProc("MFCreateDXGIDeviceManager")
 
 const (
 	mfEnumFlagHardware = 0x4        // MFT_ENUM_FLAG_HARDWARE
@@ -54,7 +57,7 @@ var (
 // newHardwareH264Encoder поднимает первый доступный аппаратный H264 MFT. MFStartup
 // уже вызван в newH264Encoder; при неудаче освобождаем COM-объекты БЕЗ MFShutdown
 // (баланс держит вызывающий), чтобы софтовый фолбэк не остался без Media Foundation.
-func newHardwareH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
+func newHardwareH264Encoder(dev uintptr, w, h, fps, kbps int) (*h264Encoder, error) {
 	act, name, err := enumHardwareH264()
 	if err != nil {
 		return nil, err
@@ -71,6 +74,9 @@ func newHardwareH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	// остался без Media Foundation. Останавливаем pump, если уже запущен.
 	fail := func(err error) (*h264Encoder, error) {
 		e.stopPump() // no-op, если pump ещё не запущен
+		if e.d3dMgr != 0 {
+			comRelease(e.d3dMgr)
+		}
 		if e.evGen != 0 {
 			comRelease(e.evGen)
 		}
@@ -87,6 +93,9 @@ func newHardwareH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	if err := e.asyncUnlock(); err != nil {
 		return fail(err)
 	}
+	// D3D-манагер ДО настройки типов/стриминга: аппаратные MFT (AMF/NVENC) часто не
+	// начинают стримить (событий нет) без привязки к D3D-девайсу. best-effort.
+	e.d3dMgr = e.setD3DManager(dev)
 	if err := e.configure(kbps); err != nil {
 		return fail(err)
 	}
@@ -188,6 +197,36 @@ func (e *h264Encoder) asyncUnlock() error {
 	}
 	runtime.KeepAlive(&mfTransformAsyncUnlock)
 	return nil
+}
+
+// setD3DManager создаёт IMFDXGIDeviceManager вокруг D3D11-девайса захвата и отдаёт
+// его MFT (MFT_MESSAGE_SET_D3D_MANAGER). Direct3D-aware аппаратные MFT (AMF/NVENC)
+// часто не начинают стримить без этого. Best-effort: при неудаче возвращаем 0 (MFT
+// пробует системную память). Возвращённый манагер держим до Close.
+func (e *h264Encoder) setD3DManager(dev uintptr) uintptr {
+	if dev == 0 {
+		log.Printf("mf: D3D manager — нет D3D-девайса, пропускаем")
+		return 0
+	}
+	pTok := new(uint32)
+	hr, mgr := procCallOut(procMFCreateDXGIDeviceManager, uintptr(unsafe.Pointer(pTok)))
+	runtime.KeepAlive(pTok)
+	if hr != sOK || mgr == 0 {
+		log.Printf("mf: MFCreateDXGIDeviceManager: 0x%08x", uint32(hr))
+		return 0
+	}
+	if hr := comCall(mgr, idxDXGIDevMgrResetDevice, dev, uintptr(*pTok)); hr != sOK {
+		log.Printf("mf: DXGIDeviceManager.ResetDevice: 0x%08x", uint32(hr))
+		comRelease(mgr)
+		return 0
+	}
+	if hr := comCall(e.mft, idxMFTProcessMessage, mftMsgSetD3DManager, mgr); hr != sOK {
+		log.Printf("mf: SET_D3D_MANAGER: 0x%08x", uint32(hr))
+		comRelease(mgr)
+		return 0
+	}
+	log.Printf("mf: D3D manager set on HW MFT")
+	return mgr
 }
 
 // startPump поднимает прокачивающую горутину и её каналы. Захват общается с

@@ -350,7 +350,7 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 		log.Printf("capture: staging texture: %v", serr)
 		return
 	}
-	enc, eerr := newH264Encoder(*dstW, *dstH, fps, kbps)
+	enc, eerr := newH264Encoder(dev, *dstW, *dstH, fps, kbps)
 	if eerr != nil {
 		log.Printf("capture: h264 encoder: %v", eerr)
 		comRelease(st)

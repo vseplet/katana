@@ -143,6 +143,8 @@ const (
 	mfeTransformStreamChange  = 0xC00D6D61
 
 	// Сообщения MFT.
+	mftMsgFlush          = 0x00000000 // MFT_MESSAGE_COMMAND_FLUSH
+	mftMsgSetD3DManager  = 0x00000002 // MFT_MESSAGE_SET_D3D_MANAGER
 	mftMsgBeginStreaming = 0x10000000
 	mftMsgStartOfStream  = 0x10000002
 
@@ -214,6 +216,7 @@ type h264Encoder struct {
 	async    bool
 	evGen    uintptr // IMFMediaEventGenerator (async)
 	activate uintptr // IMFActivate, создавший mft (async)
+	d3dMgr   uintptr // IMFDXGIDeviceManager, отданный MFT (async, D3D-aware); держим до Close
 	// Прокачка async-MFT идёт в ОТДЕЛЬНОЙ горутине (pump): захват только пишет кадры
 	// в inCh и забирает готовые AU из outCh, НИКОГДА не блокируясь на событиях
 	// энкодера. Иначе тяжёлый кадр (keyframe) стопорил бы поток захвата → микрофриз.
@@ -284,12 +287,12 @@ func packU64(hi, lo uint32) uint64 { return uint64(hi)<<32 | uint64(lo) }
 // разрешении периодически не влезал в бюджет кадра (overload на движении). Если
 // аппаратного нет / не поднялся — тихо откатываемся на софтовый (без регрессии).
 // KATANA_SW_ENCODER=1 форсит софтовый (аварийный выход, если HW капризничает).
-func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
+func newH264Encoder(dev uintptr, w, h, fps, kbps int) (*h264Encoder, error) {
 	if hr, _, _ := procMFStartup.Call(mfVersion, mfStartupLite); hr != sOK {
 		return nil, hrError(hr, "MFStartup")
 	}
 	if os.Getenv("KATANA_SW_ENCODER") == "" {
-		if e, err := newHardwareH264Encoder(w, h, fps, kbps); err == nil {
+		if e, err := newHardwareH264Encoder(dev, w, h, fps, kbps); err == nil {
 			return e, nil
 		} else {
 			log.Printf("mf: аппаратный H264 недоступен (%v) — софтовый MFT", err)
@@ -399,8 +402,16 @@ func (e *h264Encoder) configure(kbps int) error {
 	}
 	e.selfAlloc = info.dwFlags&(mftOutputProvidesSamples|mftOutputCanProvide) != 0
 
-	comCall(e.mft, idxMFTProcessMessage, mftMsgBeginStreaming, 0)
-	comCall(e.mft, idxMFTProcessMessage, mftMsgStartOfStream, 0)
+	// FLUSH → BEGIN_STREAMING → START_OF_STREAM (порядок как в рабочих примерах).
+	// HRESULT'ы логируем: если стриминг не стартовал, async-MFT не шлёт событий —
+	// раньше мы это молча проглатывали и не понимали, почему NeedInput=0.
+	hrFlush := comCall(e.mft, idxMFTProcessMessage, mftMsgFlush, 0)
+	hrBegin := comCall(e.mft, idxMFTProcessMessage, mftMsgBeginStreaming, 0)
+	hrStart := comCall(e.mft, idxMFTProcessMessage, mftMsgStartOfStream, 0)
+	if e.async || debugCapture() {
+		log.Printf("mf: stream msgs — flush=0x%08x begin=0x%08x start=0x%08x",
+			uint32(hrFlush), uint32(hrBegin), uint32(hrStart))
+	}
 	return nil
 }
 
@@ -638,6 +649,10 @@ func (e *h264Encoder) Close() {
 	// Остановить прокачивающую горутину ДО релиза COM (иначе pump дёрнет
 	// освобождённый MFT). stopPump будит блокирующий GetEvent и ждёт выхода pump.
 	e.stopPump()
+	if e.d3dMgr != 0 {
+		comRelease(e.d3dMgr)
+		e.d3dMgr = 0
+	}
 	if e.evGen != 0 {
 		comRelease(e.evGen)
 		e.evGen = 0
