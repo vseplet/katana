@@ -122,6 +122,8 @@ var (
 
 	codecRateControlMode = mustGUID("{1C0608E9-370C-4710-8A58-CB6181C42423}")
 	codecMeanBitRate     = mustGUID("{F7222374-2144-4815-B550-A37F8E12EE52}")
+	codecMaxBitRate      = mustGUID("{9651EAE4-39B9-4BE1-8CB2-7C8AF5B3B9BC}") // AVEncCommonMaxBitRate
+	codecBufferSize      = mustGUID("{0DB96574-B6A4-4C8B-8106-3773DE0310CD}") // AVEncCommonBufferSize (бит)
 	codecGOPSize         = mustGUID("{95F31B26-95A4-41AA-9303-246A7FC6EEF1}")
 	codecLowLatency      = mustGUID("{9C27891A-ED7A-40E1-88E8-B22727A024EE}")
 	codecForceKeyFrame   = mustGUID("{398C1B98-8353-475A-9EF2-8F265D260345}")
@@ -282,6 +284,15 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 		e.codec = codec
 		rc := e.codecSet(&codecRateControlMode, variantU32(avEncRateControlCBR))
 		br := e.codecSet(&codecMeanBitRate, variantU32(bitrate))
+		// VBV/HRD-потолок. Без него CBR у CMSH264EncoderMFT позволяет одному P-кадру
+		// на резком движении (перетаскивание окна = full-frame motion) распухнуть в
+		// разы выше среднего. Над WAN (RTT ~200мс) этот бёрст забивает очередь канала
+		// → bufferbloat → latency-спайк 1–2с. BufferSize (leaky-bucket, в БИТАХ)
+		// ограничивает, сколько кадр «занимает» из буфера — ставим ~0.5с, паритет с
+		// Linux (-maxrate/-bufsize). MaxBitRate — best-effort (учитывается в
+		// PeakConstrainedVBR; в CBR обычно игнор, но безвреден).
+		mx := e.codecSet(&codecMaxBitRate, variantU32(bitrate))
+		buf := e.codecSet(&codecBufferSize, variantU32(bitrate/2))
 		// Длинный GOP: кейфреймы по запросу (PLI → ForceKeyframe), а не раз в секунду.
 		gop := e.codecSet(&codecGOPSize, variantU32(uint32(fps*10)))
 		ll := e.codecSet(&codecLowLatency, variantBool(true))
@@ -290,8 +301,8 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 		// 60fps → overload), 0 — грязно. 25 — умеренное качество в рамках бюджета.
 		qs := e.codecSet(&codecQualityVsSpeed, variantU32(25))
 		if debugCapture() {
-			log.Printf("mf/codec: ICodecAPI (до SetOutputType) — RateControl=%#x MeanBitRate=%#x GOP=%#x LowLat=%#x BPic=%#x Quality=%#x",
-				uint32(rc), uint32(br), uint32(gop), uint32(ll), uint32(bp), uint32(qs))
+			log.Printf("mf/codec: ICodecAPI (до SetOutputType) — RateControl=%#x MeanBitRate=%#x MaxBitRate=%#x BufSize=%#x GOP=%#x LowLat=%#x BPic=%#x Quality=%#x",
+				uint32(rc), uint32(br), uint32(mx), uint32(buf), uint32(gop), uint32(ll), uint32(bp), uint32(qs))
 		}
 	} else {
 		log.Printf("mf/codec: ICodecAPI НЕ получен (%v) — CBR/GOP/качество НЕ настроены, энкодер в дефолте", err)
@@ -379,7 +390,12 @@ func (e *h264Encoder) forceKeyframe() {
 func (e *h264Encoder) setBitrate(kbps int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.codecSet(&codecMeanBitRate, variantU32(uint32(kbps*1000)))
+	bitrate := uint32(kbps * 1000)
+	e.codecSet(&codecMeanBitRate, variantU32(bitrate))
+	// Держим VBV-буфер пропорциональным (~0.5с), иначе на низком битрейте фиксированный
+	// буфер = большее «время» = снова допускает бёрсты.
+	e.codecSet(&codecMaxBitRate, variantU32(bitrate))
+	e.codecSet(&codecBufferSize, variantU32(bitrate/2))
 }
 
 // encode кодирует один NV12-кадр и возвращает получившиеся H264 access unit'ы
