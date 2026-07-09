@@ -222,6 +222,12 @@ type h264Encoder struct {
 	pumpStop chan struct{} // сигнал остановки pump
 	pumpGone chan struct{} // закрывается, когда pump вышел (для Close)
 
+	// Диагностика async-конвейера (atomic): сколько событий получил pump. Помогает
+	// понять, почему HW молчит: NeedInput=0 → события не поллятся; NeedInput>0,
+	// HaveOutput=0 → кормим, но выхода нет (вероятно, нужен D3D-вход).
+	dbgNeedIn  int64
+	dbgHaveOut int64
+
 	w, h      int
 	fps       int
 	outSize   uint32 // размер выходного буфера (cbSize из GetOutputStreamInfo)

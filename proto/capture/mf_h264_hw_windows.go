@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -60,8 +61,18 @@ func newHardwareH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 		return nil, e
 	}
 	e := &h264Encoder{mft: mft, activate: act, async: true, w: w, h: h, fps: fps}
-	// Освобождение частично поднятого энкодера БЕЗ MFShutdown (в отличие от Close).
+	// Освобождение частично поднятого энкодера БЕЗ MFShutdown (в отличие от Close):
+	// баланс MFStartup держит вызывающий (newH264Encoder), чтобы софтовый фолбэк не
+	// остался без Media Foundation. Останавливаем pump, если уже запущен.
 	fail := func(err error) (*h264Encoder, error) {
+		if e.pumpStop != nil {
+			close(e.pumpStop)
+			<-e.pumpGone
+			e.pumpStop = nil
+		}
+		if e.evGen != 0 {
+			comRelease(e.evGen)
+		}
 		if e.codec != 0 {
 			comRelease(e.codec)
 		}
@@ -86,8 +97,45 @@ func newHardwareH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	}
 	e.evGen = evGen
 	e.startPump()
+	// Smoke-тест: HW-MFT может принять типы, но не отдавать выход с СИСТЕМНОЙ памятью
+	// (AMF/NVENC порой требуют D3D-текстурный вход → ProcessInput = MF_E_NOTACCEPTING
+	// или молчаливо нет выхода → чёрный экран). Гоним несколько кадров и ждём первый
+	// AU; нет за таймаут — считаем HW непригодным, откат на софтовый (newH264Encoder).
+	if !e.smokeTest() {
+		return fail(fmt.Errorf("HW H264 (%s) не отдаёт выход с системной памятью (нужен D3D-вход) — откат на софт", name))
+	}
+	e.mu.Lock()
+	e.forceKey = true // smoke-выход отброшен → первый реальный кадр делаем IDR
+	e.mu.Unlock()
 	log.Printf("mf: аппаратный H264 MFT (%s) %dx%d @ %dfps %dkbps", name, w, h, fps, kbps)
 	return e, nil
+}
+
+// smokeTest прогоняет несколько чёрных кадров через async-конвейер и ждёт первый
+// выходной AU. true — HW реально отдаёт H264 (пригоден); false — за таймаут ничего
+// не вышло (принял вход, но молчит / ProcessInput=NOTACCEPTING — типично для MFT,
+// требующих D3D-вход). Крутится в потоке настройки (WGC), до первого реального кадра.
+func (e *h264Encoder) smokeTest() bool {
+	ysz := e.w * e.h
+	black := make([]byte, ysz*3/2)
+	for i := 0; i < ysz; i++ {
+		black[i] = 16 // Y = 16 (studio-range чёрный)
+	}
+	for i := ysz; i < len(black); i++ {
+		black[i] = 128 // UV = 128 (нейтральная хрома)
+	}
+	ok := false
+	for i := 0; i < 40; i++ { // ~40 кадров × 15мс ≈ 0.6с — с запасом на глубину конвейера
+		if aus, err := e.encodeAsync(black); err == nil && len(aus) > 0 {
+			ok = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	// Диагностика: по счётчикам видно, ПОЧЕМУ HW молчит (см. dbgNeedIn/dbgHaveOut).
+	log.Printf("mf: smoke HW — ok=%v NeedInput=%d HaveOutput=%d",
+		ok, atomic.LoadInt64(&e.dbgNeedIn), atomic.LoadInt64(&e.dbgHaveOut))
+	return ok
 }
 
 // enumHardwareH264 перечисляет аппаратные H264-энкодеры MFT и возвращает первый
@@ -181,7 +229,9 @@ func (e *h264Encoder) pump() {
 			switch mt {
 			case meTransformNeedInput:
 				pendingIn++
+				atomic.AddInt64(&e.dbgNeedIn, 1)
 			case meTransformHaveOutput:
+				atomic.AddInt64(&e.dbgHaveOut, 1)
 				aus, derr := e.drainOneOutput()
 				if derr != nil {
 					log.Printf("mf: async pump output: %v", derr)
