@@ -636,12 +636,8 @@ func (e *h264Encoder) Close() {
 		return
 	}
 	// Остановить прокачивающую горутину ДО релиза COM (иначе pump дёрнет
-	// освобождённый MFT). Ждём её выхода по pumpGone.
-	if e.async && e.pumpStop != nil {
-		close(e.pumpStop)
-		<-e.pumpGone
-		e.pumpStop = nil
-	}
+	// освобождённый MFT). stopPump будит блокирующий GetEvent и ждёт выхода pump.
+	e.stopPump()
 	if e.evGen != 0 {
 		comRelease(e.evGen)
 		e.evGen = 0

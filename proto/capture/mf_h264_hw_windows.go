@@ -21,6 +21,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // Индексы vtable для аппаратного пути.
@@ -29,6 +31,7 @@ const (
 	idxActivateObject         = 33 // IMFActivate::ActivateObject
 	idxActivateShutdownObject = 34 // IMFActivate::ShutdownObject
 	idxEventGenGetEvent       = 3  // IMFMediaEventGenerator::GetEvent
+	idxEventGenQueueEvent     = 6  // IMFMediaEventGenerator::QueueEvent
 	idxEventGetType           = 33 // IMFMediaEvent::GetType (IMFAttributes+GetType)
 )
 
@@ -39,11 +42,13 @@ const (
 
 	meTransformNeedInput  = 601 // METransformNeedInput
 	meTransformHaveOutput = 602 // METransformHaveOutput
+	meError               = 1   // MEError — фиктивное событие для пробуждения GetEvent
 )
 
 var (
 	iidIMFMediaEventGenerator = mustGUID("{2CD0BD52-BCD5-4B89-B62C-EADC0C031E7D}")
 	mfTransformAsyncUnlock    = mustGUID("{E5666D6B-3422-4EB6-A421-DA7DB1F8E207}") // MF_TRANSFORM_ASYNC_UNLOCK
+	guidNull                  windows.GUID                                        // GUID_NULL для QueueEvent
 )
 
 // newHardwareH264Encoder поднимает первый доступный аппаратный H264 MFT. MFStartup
@@ -65,11 +70,7 @@ func newHardwareH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	// баланс MFStartup держит вызывающий (newH264Encoder), чтобы софтовый фолбэк не
 	// остался без Media Foundation. Останавливаем pump, если уже запущен.
 	fail := func(err error) (*h264Encoder, error) {
-		if e.pumpStop != nil {
-			close(e.pumpStop)
-			<-e.pumpGone
-			e.pumpStop = nil
-		}
+		e.stopPump() // no-op, если pump ещё не запущен
 		if e.evGen != 0 {
 			comRelease(e.evGen)
 		}
@@ -199,10 +200,12 @@ func (e *h264Encoder) startPump() {
 	go e.pump()
 }
 
-// pump — событийный цикл асинхронного MFT на своём потоке (MTA). Осушает события
-// без блокировки: NeedInput копит запросы, HaveOutput тянет AU в outCh; кадры
-// подаёт из inCh, когда энкодер готов. Никогда не блокирует захват — он в другой
-// горутине. Выходит по pumpStop (закрывает pumpGone).
+// pump — событийный цикл асинхронного MFT на своём потоке (MTA). Ждёт события
+// БЛОКИРУЮЩЕ (GetEvent с ожиданием): async-MFT отдаёт события только ожидающему
+// GetEvent, а NO_WAIT-опрос их не вытягивает (проверено: NeedInput=0). На NeedInput
+// кормит свежайшим кадром из inCh (повтор last при простое — держим CFR), на
+// HaveOutput тянет AU в outCh. Захват не стопорим — он в другой горутине. Выходит по
+// pumpStop; блокирующий GetEvent будят фиктивным QueueEvent из stopPump.
 func (e *h264Encoder) pump() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -210,61 +213,69 @@ func (e *h264Encoder) pump() {
 	defer roUninitialize()
 	defer close(e.pumpGone)
 
-	pendingIn := 0
+	var last []byte // последний поданный кадр — для повтора, если NeedInput без свежего
 	for {
+		mt, ok, err := e.nextEvent(true) // блокирует до события (или буд-события из stopPump)
 		select {
 		case <-e.pumpStop:
 			return
 		default:
 		}
-
-		mt, ok, err := e.nextEvent(false) // без ожидания
 		if err != nil {
 			log.Printf("mf: async pump event: %v", err)
 			return
 		}
-		didWork := false
-		if ok {
-			didWork = true
-			switch mt {
-			case meTransformNeedInput:
-				pendingIn++
-				atomic.AddInt64(&e.dbgNeedIn, 1)
-			case meTransformHaveOutput:
-				atomic.AddInt64(&e.dbgHaveOut, 1)
-				aus, derr := e.drainOneOutput()
-				if derr != nil {
-					log.Printf("mf: async pump output: %v", derr)
-					return
-				}
-				for _, au := range aus {
-					e.pushOut(au)
-				}
-			}
+		if !ok {
+			continue
 		}
-		// Кормим энкодер, если он готов и кадр есть (неблокирующе — не держим цикл).
-		if pendingIn > 0 {
-			select {
-			case frame, open := <-e.inCh:
-				if !open {
-					return
-				}
-				if e.feed(frame) {
-					pendingIn--
-					didWork = true
-				}
-			default:
+		switch mt {
+		case meTransformNeedInput:
+			atomic.AddInt64(&e.dbgNeedIn, 1)
+			if frame := e.latestFrame(last); frame != nil {
+				last = frame
+				e.feed(frame)
 			}
-		}
-		// Простой (нет событий и/или нечего кормить) — короткая пауза, не жжём CPU.
-		if !didWork {
-			select {
-			case <-e.pumpStop:
+		case meTransformHaveOutput:
+			atomic.AddInt64(&e.dbgHaveOut, 1)
+			aus, derr := e.drainOneOutput()
+			if derr != nil {
+				log.Printf("mf: async pump output: %v", derr)
 				return
-			case <-time.After(500 * time.Microsecond):
+			}
+			for _, au := range aus {
+				e.pushOut(au)
 			}
 		}
 	}
+}
+
+// latestFrame осушает inCh до самого свежего кадра (сброс отставания — меньше
+// задержка); если новых кадров нет, возвращает last (повтор под NeedInput → CFR).
+func (e *h264Encoder) latestFrame(last []byte) []byte {
+	f := last
+	for {
+		select {
+		case nf := <-e.inCh:
+			f = nf
+		default:
+			return f
+		}
+	}
+}
+
+// stopPump останавливает прокачивающую горутину: закрывает pumpStop и будит
+// блокирующий GetEvent фиктивным событием (QueueEvent), затем ждёт выхода pump.
+func (e *h264Encoder) stopPump() {
+	if e.pumpStop == nil {
+		return
+	}
+	close(e.pumpStop)
+	// Разбудить блокирующий GetEvent — кладём фиктивное событие в очередь генератора.
+	comCall(e.evGen, idxEventGenQueueEvent, uintptr(meError),
+		uintptr(unsafe.Pointer(&guidNull)), 0, 0)
+	runtime.KeepAlive(&guidNull)
+	<-e.pumpGone
+	e.pumpStop = nil
 }
 
 // feed подаёт один NV12-кадр в MFT (ProcessInput). true — успех.
