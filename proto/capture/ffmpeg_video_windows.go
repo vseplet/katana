@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/pion/webrtc/v4/pkg/media/h264reader"
 )
 
 // ffmpegVideoEnc — аппаратный H264 на Windows через ffmpeg-подпроцесс.
@@ -135,10 +137,66 @@ func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		readH264(ctx, &countReader{r: stdout}, frames, dropLate)
+		readH264KeepHeaders(ctx, &countReader{r: stdout}, frames, dropLate)
 	}()
 
 	return &ffmpegVideoEnc{cmd: cmd, stdin: stdin, name: enc, done: done}, nil
+}
+
+// readH264KeepHeaders — как readH264, но гарантирует SPS/PPS перед каждым IDR.
+//
+// Захват (и ffmpeg) стартуют ДО подключения зрителей, поэтому любой зритель
+// заходит в середину потока: без SPS/PPS в ключевом кадре его декодер не заведётся
+// (пакеты идут, картинки нет — чёрный экран). libx264 повторяет заголовки при
+// каждом IDR сам, а h264_amf их шлёт один раз в начале — до того, как кто-либо
+// подключился. Кешируем последние SPS/PPS и подставляем их перед IDR, где их нет.
+// Если энкодер и так их включает — ветка подстановки не срабатывает (no-op).
+func readH264KeepHeaders(ctx context.Context, in io.Reader, frames chan []byte, dropLate bool) {
+	reader, err := h264reader.NewReader(in)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("capture: h264 reader: %v", err)
+		}
+		return
+	}
+	sc := []byte{0x00, 0x00, 0x00, 0x01}
+	var au []byte
+	var sps, pps []byte // закешированы в Annex-B (со start code)
+	var auHasParams bool // в текущем AU уже встретились SPS/PPS
+	for {
+		nal, err := reader.NextNAL()
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("capture: read nal: %v", err)
+			}
+			return
+		}
+		switch nal.UnitType {
+		case h264reader.NalUnitTypeSPS:
+			sps = append(append([]byte{}, sc...), nal.Data...)
+			auHasParams = true
+		case h264reader.NalUnitTypePPS:
+			pps = append(append([]byte{}, sc...), nal.Data...)
+			auHasParams = true
+		}
+		au = append(au, sc...)
+		au = append(au, nal.Data...)
+
+		isVCL := nal.UnitType == h264reader.NalUnitTypeCodedSliceNonIdr ||
+			nal.UnitType == h264reader.NalUnitTypeCodedSliceIdr
+		if !isVCL {
+			continue
+		}
+		out := au
+		if nal.UnitType == h264reader.NalUnitTypeCodedSliceIdr && !auHasParams && sps != nil && pps != nil {
+			out = append(append(append([]byte{}, sps...), pps...), au...)
+		}
+		if !pushFrame(ctx, frames, out, dropLate) {
+			return
+		}
+		au = nil
+		auHasParams = false
+	}
 }
 
 // countReader логирует первый байт вывода ffmpeg (диагностика: доходит ли
