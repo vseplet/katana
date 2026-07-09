@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -84,8 +85,13 @@ func videoProbe() bool {
 // (форс IDR / битрейт / курсор), которые дёргаются из WebRTC-контура.
 type wgcSession struct {
 	mu       sync.Mutex
-	enc      *h264Encoder
+	enc      *h264Encoder    // нативный MFT (fallback, если ffmpeg недоступен)
+	ff       *ffmpegVideoEnc // предпочтительный аппаратный путь (h264_amf/…)
 	session2 uintptr
+
+	// ctx/frames нужны firstFrameSetup, чтобы поднять читателя stdout ffmpeg.
+	ctx    context.Context
+	frames chan []byte
 }
 
 func (s *wgcSession) setEnc(e *h264Encoder) { s.mu.Lock(); s.enc = e; s.mu.Unlock() }
@@ -144,6 +150,7 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer close(frames)
+	s.ctx, s.frames = ctx, frames
 
 	if err := roInitialize(); err != nil {
 		ready <- err
@@ -177,6 +184,11 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		return
 	}
 	defer func() {
+		// ff.Close() дожидается выхода читателя stdout — обязан отработать до
+		// close(frames) (тот defer зарегистрирован раньше → выполнится позже).
+		if s.ff != nil {
+			s.ff.Close()
+		}
 		if s.enc != nil {
 			s.enc.Close()
 		}
@@ -233,6 +245,16 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 	// emit кодирует текущий nv12 и шлёт access unit'ы. false → ctx отменён, выходим.
 	emit := func() bool {
 		te := time.Now()
+		// Путь ffmpeg: кадр уходит в stdin, готовые AU шлёт читатель stdout.
+		if s.ff != nil {
+			if err := s.ff.writeFrame(nv12); err != nil {
+				log.Printf("capture: ffmpeg video write: %v", err)
+				return false // ffmpeg умер → останавливаем захват
+			}
+			sumEnc += time.Since(te)
+			nFrames++
+			return true
+		}
 		aus, encErr := s.enc.encode(nv12)
 		sumEnc += time.Since(te)
 		if encErr != nil {
@@ -261,10 +283,12 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		if frame := latestFrame(pool); frame != 0 {
 			_, surface := comCallOut(frame, idxFrameGetSurface)
 			if tex, terr := surfaceToTexture(surface); terr == nil {
-				if s.enc == nil {
+				// staging!=0 — единый признак готового энкодера (ffmpeg ИЛИ MFT):
+				// оба пути ставят его только при полном успехе setup.
+				if staging == 0 {
 					s.firstFrameSetup(tex, dev, opts, fps, kbps, &staging, &nv12, &srcW, &srcH, &dstW, &dstH)
 				}
-				if s.enc != nil {
+				if staging != 0 {
 					tc := time.Now()
 					if data, rowPitch, unmap, merr := mapStaging(devCtx, staging, tex); merr == nil {
 						// Кадр валиден только при ненулевых pitch/размерах и достаточном
@@ -350,6 +374,24 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 		log.Printf("capture: staging texture: %v", serr)
 		return
 	}
+
+	// Предпочитаем ffmpeg (аппаратный h264_amf/nvenc/qsv, вендор-нейтрально).
+	// KATANA_MFT_ENCODER форсит нативный MFT (диагностика/машины без ffmpeg).
+	if os.Getenv("KATANA_MFT_ENCODER") == "" {
+		if ff, ferr := newFFmpegVideoEnc(s.ctx, s.frames, *dstW, *dstH, fps, kbps, opts.DropLate); ferr == nil {
+			s.mu.Lock()
+			s.ff = ff
+			s.mu.Unlock()
+			*staging = st
+			*nv12 = make([]byte, (*dstW)*(*dstH)*3/2)
+			log.Printf("capture: wgc src %dx%d → enc %dx%d @ %dfps %dkbps (ffmpeg %s, CFR)",
+				*srcW, *srcH, *dstW, *dstH, fps, kbps, ff.name)
+			return
+		} else {
+			log.Printf("capture: ffmpeg video unavailable (%v) — fallback native MFT", ferr)
+		}
+	}
+
 	enc, eerr := newH264Encoder(dev, *dstW, *dstH, fps, kbps)
 	if eerr != nil {
 		log.Printf("capture: h264 encoder: %v", eerr)
