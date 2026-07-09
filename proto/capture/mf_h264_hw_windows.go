@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"time"
 	"unsafe"
 )
 
@@ -84,6 +85,7 @@ func newHardwareH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 		return fail(fmt.Errorf("не async MFT (нет IMFMediaEventGenerator): %w", err))
 	}
 	e.evGen = evGen
+	e.startPump()
 	log.Printf("mf: аппаратный H264 MFT (%s) %dx%d @ %dfps %dkbps", name, w, h, fps, kbps)
 	return e, nil
 }
@@ -142,70 +144,144 @@ func (e *h264Encoder) asyncUnlock() error {
 	return nil
 }
 
-// encodeAsync прокачивает один NV12-кадр через асинхронный MFT: ждёт запрос ввода
-// (собирая по пути готовый выход), подаёт кадр, затем без ожидания забирает готовые
-// access unit'ы. Выход отстаёт от входа на глубину конвейера энкодера (пара кадров)
-// — для low-latency без B-кадров это приемлемо. Вызывается из encode() под e.async.
-func (e *h264Encoder) encodeAsync(nv12 []byte) ([][]byte, error) {
-	var out [][]byte
-	// 1. Дожидаемся METransformNeedInput (по пути обрабатывая готовый выход).
-	for e.pendingIn == 0 {
-		mt, ok, err := e.nextEvent(true)
-		if err != nil {
-			return out, err
-		}
-		if !ok {
-			break
-		}
-		if aus, err := e.onEvent(mt); err != nil {
-			return out, err
-		} else {
-			out = append(out, aus...)
-		}
-	}
-	// 2. Подаём кадр.
-	if e.pendingIn > 0 {
-		sample, err := e.makeInputSample(nv12)
-		if err != nil {
-			return out, err
-		}
-		hr := comCall(e.mft, idxMFTProcessInput, 0, sample, 0)
-		comRelease(sample)
-		if hr != sOK {
-			return out, hrError(hr, "ProcessInput(async)")
-		}
-		e.pendingIn--
-	}
-	// 3. Забираем готовый выход без блокировки (что требует следующего кадра —
-	//    придёт на следующем вызове).
-	for {
-		mt, ok, err := e.nextEvent(false)
-		if err != nil {
-			return out, err
-		}
-		if !ok {
-			break
-		}
-		if aus, err := e.onEvent(mt); err != nil {
-			return out, err
-		} else {
-			out = append(out, aus...)
-		}
-	}
-	return out, nil
+// startPump поднимает прокачивающую горутину и её каналы. Захват общается с
+// энкодером ТОЛЬКО через inCh/outCh и никогда не заходит в событийный цикл MFT.
+func (e *h264Encoder) startPump() {
+	e.inCh = make(chan []byte, 4)
+	e.outCh = make(chan []byte, 8)
+	e.pumpStop = make(chan struct{})
+	e.pumpGone = make(chan struct{})
+	go e.pump()
 }
 
-// onEvent реагирует на тип события: NeedInput копит счётчик, HaveOutput тянет
-// готовый access unit.
-func (e *h264Encoder) onEvent(mt uint32) ([][]byte, error) {
-	switch mt {
-	case meTransformNeedInput:
-		e.pendingIn++
-		return nil, nil
-	case meTransformHaveOutput:
-		return e.drainOneOutput()
+// pump — событийный цикл асинхронного MFT на своём потоке (MTA). Осушает события
+// без блокировки: NeedInput копит запросы, HaveOutput тянет AU в outCh; кадры
+// подаёт из inCh, когда энкодер готов. Никогда не блокирует захват — он в другой
+// горутине. Выходит по pumpStop (закрывает pumpGone).
+func (e *h264Encoder) pump() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	_ = roInitialize() // присоединяемся к MTA (COM-вызовы MFT с этого потока)
+	defer roUninitialize()
+	defer close(e.pumpGone)
+
+	pendingIn := 0
+	for {
+		select {
+		case <-e.pumpStop:
+			return
+		default:
+		}
+
+		mt, ok, err := e.nextEvent(false) // без ожидания
+		if err != nil {
+			log.Printf("mf: async pump event: %v", err)
+			return
+		}
+		didWork := false
+		if ok {
+			didWork = true
+			switch mt {
+			case meTransformNeedInput:
+				pendingIn++
+			case meTransformHaveOutput:
+				aus, derr := e.drainOneOutput()
+				if derr != nil {
+					log.Printf("mf: async pump output: %v", derr)
+					return
+				}
+				for _, au := range aus {
+					e.pushOut(au)
+				}
+			}
+		}
+		// Кормим энкодер, если он готов и кадр есть (неблокирующе — не держим цикл).
+		if pendingIn > 0 {
+			select {
+			case frame, open := <-e.inCh:
+				if !open {
+					return
+				}
+				if e.feed(frame) {
+					pendingIn--
+					didWork = true
+				}
+			default:
+			}
+		}
+		// Простой (нет событий и/или нечего кормить) — короткая пауза, не жжём CPU.
+		if !didWork {
+			select {
+			case <-e.pumpStop:
+				return
+			case <-time.After(500 * time.Microsecond):
+			}
+		}
 	}
-	return nil, nil
+}
+
+// feed подаёт один NV12-кадр в MFT (ProcessInput). true — успех.
+func (e *h264Encoder) feed(nv12 []byte) bool {
+	sample, err := e.makeInputSample(nv12)
+	if err != nil {
+		log.Printf("mf: makeInputSample(async): %v", err)
+		return false
+	}
+	hr := comCall(e.mft, idxMFTProcessInput, 0, sample, 0)
+	comRelease(sample)
+	if hr != sOK {
+		log.Printf("mf: ProcessInput(async): 0x%08x", uint32(hr))
+		return false
+	}
+	return true
+}
+
+// pushOut кладёт готовый AU в outCh; при отставании потребителя выкидывает старейший
+// (свежесть кадра важнее — то же правило, что у DropLate в захвате).
+func (e *h264Encoder) pushOut(au []byte) {
+	select {
+	case e.outCh <- au:
+	default:
+		select {
+		case <-e.outCh:
+		default:
+		}
+		select {
+		case e.outCh <- au:
+		default:
+		}
+	}
+}
+
+// encodeAsync (под e.async) — сторона захвата: кладёт КОПИЮ кадра в inCh (буфер
+// захвата переиспользуется, а pump прочитает позже) и без ожидания забирает готовые
+// access unit'ы. Выход отстаёт от входа на глубину конвейера (пара кадров) — для
+// low-latency без B-кадров приемлемо.
+func (e *h264Encoder) encodeAsync(nv12 []byte) ([][]byte, error) {
+	buf := make([]byte, len(nv12))
+	copy(buf, nv12)
+	select {
+	case e.inCh <- buf:
+	default:
+		// pump не успевает — выкидываем старейший кадр, кладём свежий (drop-late).
+		select {
+		case <-e.inCh:
+		default:
+		}
+		select {
+		case e.inCh <- buf:
+		default:
+		}
+	}
+	var out [][]byte
+	for {
+		select {
+		case au := <-e.outCh:
+			out = append(out, au)
+		default:
+			return out, nil
+		}
+	}
 }
 
 // nextEvent тянет одно событие из IMFMediaEventGenerator. block=false → без

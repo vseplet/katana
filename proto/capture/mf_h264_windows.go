@@ -214,10 +214,16 @@ type h264Encoder struct {
 
 	// Аппаратный MFT — асинхронный: событийная модель (NeedInput/HaveOutput) через
 	// IMFMediaEventGenerator; activate держим ради ShutdownObject в Close.
-	async     bool
-	evGen     uintptr // IMFMediaEventGenerator (async)
-	activate  uintptr // IMFActivate, создавший mft (async)
-	pendingIn int     // сколько METransformNeedInput получено, но ещё не покормлено
+	async    bool
+	evGen    uintptr // IMFMediaEventGenerator (async)
+	activate uintptr // IMFActivate, создавший mft (async)
+	// Прокачка async-MFT идёт в ОТДЕЛЬНОЙ горутине (pump): захват только пишет кадры
+	// в inCh и забирает готовые AU из outCh, НИКОГДА не блокируясь на событиях
+	// энкодера. Иначе тяжёлый кадр (keyframe) стопорил бы поток захвата → микрофриз.
+	inCh     chan []byte   // NV12-кадры (копии) → энкодер
+	outCh    chan []byte   // готовые H264 access unit'ы ← энкодер
+	pumpStop chan struct{} // сигнал остановки pump
+	pumpGone chan struct{} // закрывается, когда pump вышел (для Close)
 
 	w, h      int
 	fps       int
@@ -625,6 +631,13 @@ func ensureAnnexB(src []byte) []byte {
 func (e *h264Encoder) Close() {
 	if e == nil {
 		return
+	}
+	// Остановить прокачивающую горутину ДО релиза COM (иначе pump дёрнет
+	// освобождённый MFT). Ждём её выхода по pumpGone.
+	if e.async && e.pumpStop != nil {
+		close(e.pumpStop)
+		<-e.pumpGone
+		e.pumpStop = nil
 	}
 	if e.evGen != 0 {
 		comRelease(e.evGen)
