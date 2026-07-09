@@ -32,6 +32,8 @@ type ffmpegVideoEnc struct {
 	stdin io.WriteCloser
 	name  string        // выбранный энкодер (h264_amf/…)
 	done  chan struct{} // закрывается, когда горутина-читатель stdout вышла
+
+	wroteFirst bool // диагностика: залогировать первую запись в stdin
 }
 
 var (
@@ -103,12 +105,15 @@ func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps 
 
 	args := []string{
 		"-hide_banner", "-loglevel", "warning",
+		"-fflags", "nobuffer",
 		"-f", "rawvideo", "-pix_fmt", "nv12",
 		"-s", fmt.Sprintf("%dx%d", w, h), "-r", strconv.Itoa(fps),
 		"-i", "pipe:0",
 	}
 	args = append(args, encoderArgs(enc, kbps, gop)...)
-	args = append(args, "-f", "h264", "pipe:1")
+	// -flush_packets 1: отдавать каждый AU в pipe немедленно, без буфера avio —
+	// иначе ffmpeg копит вывод и первые кадры к зрителю не приходят (чёрный экран).
+	args = append(args, "-flush_packets", "1", "-f", "h264", "pipe:1")
 
 	cmd := exec.CommandContext(ctx, ff, args...)
 	stdin, err := cmd.StdinPipe()
@@ -130,15 +135,35 @@ func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		readH264(ctx, stdout, frames, dropLate)
+		readH264(ctx, &countReader{r: stdout}, frames, dropLate)
 	}()
 
 	return &ffmpegVideoEnc{cmd: cmd, stdin: stdin, name: enc, done: done}, nil
 }
 
+// countReader логирует первый байт вывода ffmpeg (диагностика: доходит ли
+// закодированный поток из stdout до читателя) и молчит дальше.
+type countReader struct {
+	r     io.Reader
+	first bool
+}
+
+func (c *countReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 && !c.first {
+		c.first = true
+		log.Printf("ffmpeg: first H264 output from stdout (%d bytes)", n)
+	}
+	return n, err
+}
+
 // writeFrame отдаёт один NV12-кадр в stdin. Ошибка = ffmpeg умер → стрим мёртв.
 func (f *ffmpegVideoEnc) writeFrame(nv12 []byte) error {
-	_, err := f.stdin.Write(nv12)
+	n, err := f.stdin.Write(nv12)
+	if !f.wroteFirst {
+		f.wroteFirst = true
+		log.Printf("ffmpeg: first NV12 frame written to stdin (%d bytes, err=%v)", n, err)
+	}
 	return err
 }
 
