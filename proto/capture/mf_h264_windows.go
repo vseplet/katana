@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -206,10 +207,17 @@ type mftOutputStreamInfo struct {
 	cbAlignment uint32
 }
 
-// h264Encoder — обёртка над H264 MFT.
+// h264Encoder — обёртка над H264 MFT (софтовый sync или аппаратный async).
 type h264Encoder struct {
 	mft   uintptr
 	codec uintptr // ICodecAPI (может быть 0, если не поддержан)
+
+	// Аппаратный MFT — асинхронный: событийная модель (NeedInput/HaveOutput) через
+	// IMFMediaEventGenerator; activate держим ради ShutdownObject в Close.
+	async     bool
+	evGen     uintptr // IMFMediaEventGenerator (async)
+	activate  uintptr // IMFActivate, создавший mft (async)
+	pendingIn int     // сколько METransformNeedInput получено, но ещё не покормлено
 
 	w, h      int
 	fps       int
@@ -262,9 +270,21 @@ func setU64(mt uintptr, key *windows.GUID, v uint64) uintptr {
 func packU64(hi, lo uint32) uint64 { return uint64(hi)<<32 | uint64(lo) }
 
 // newH264Encoder создаёт и настраивает H264 MFT под кадры w×h @ fps, битрейт kbps.
+// По умолчанию пробуем АППАРАТНЫЙ энкодер (NVENC/QuickSync/AMF) — он кодирует на
+// GPU и не выжирает CPU; софтовый CMSH264EncoderMFT на физической машине в полном
+// разрешении периодически не влезал в бюджет кадра (overload на движении). Если
+// аппаратного нет / не поднялся — тихо откатываемся на софтовый (без регрессии).
+// KATANA_SW_ENCODER=1 форсит софтовый (аварийный выход, если HW капризничает).
 func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	if hr, _, _ := procMFStartup.Call(mfVersion, mfStartupLite); hr != sOK {
 		return nil, hrError(hr, "MFStartup")
+	}
+	if os.Getenv("KATANA_SW_ENCODER") == "" {
+		if e, err := newHardwareH264Encoder(w, h, fps, kbps); err == nil {
+			return e, nil
+		} else {
+			log.Printf("mf: аппаратный H264 недоступен (%v) — софтовый MFT", err)
+		}
 	}
 	hr, mft := procCallOut(procCoCreateInstance,
 		uintptr(unsafe.Pointer(&clsidH264Encoder)), 0, clsctxInProc,
@@ -273,24 +293,36 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 		procMFShutdown.Call()
 		return nil, err
 	}
-
 	e := &h264Encoder{mft: mft, w: w, h: h, fps: fps}
+	if err := e.configure(kbps); err != nil {
+		e.Close()
+		return nil, err
+	}
+	log.Printf("mf: софтовый H264 MFT (CMSH264EncoderMFT) %dx%d @ %dfps %dkbps", w, h, fps, kbps)
+	return e, nil
+}
+
+// configure навешивает на e.mft параметры кодирования (ICodecAPI: CBR/битрейт/VBV/
+// GOP/low-latency), входной/выходной медиатипы и запускает стриминг. Общая для
+// софтового (sync) и аппаратного (async) MFT — раскладка вызовов IMFTransform
+// одинакова. Ошибку возвращаем наверх; освобождение — на вызывающем (e.Close()).
+func (e *h264Encoder) configure(kbps int) error {
+	w, h, fps := e.w, e.h, e.fps
 	bitrate := uint32(kbps * 1000)
 
 	// ICodecAPI задаём ДО SetOutputType — иначе CMSH264EncoderMFT возвращает S_OK,
 	// но игнорирует часть свойств (проверено: GOP через ICodecAPI и через media-type
 	// после SetOutputType не применялись → кейфрейм каждую 1с). Best-effort, логируем.
-	if codec, err := comQueryInterface(mft, &iidICodecAPI); err == nil {
+	if codec, err := comQueryInterface(e.mft, &iidICodecAPI); err == nil {
 		e.codec = codec
 		rc := e.codecSet(&codecRateControlMode, variantU32(avEncRateControlCBR))
 		br := e.codecSet(&codecMeanBitRate, variantU32(bitrate))
-		// VBV/HRD-потолок. Без него CBR у CMSH264EncoderMFT позволяет одному P-кадру
-		// на резком движении (перетаскивание окна = full-frame motion) распухнуть в
-		// разы выше среднего. Над WAN (RTT ~200мс) этот бёрст забивает очередь канала
-		// → bufferbloat → latency-спайк 1–2с. BufferSize (leaky-bucket, в БИТАХ)
-		// ограничивает, сколько кадр «занимает» из буфера — ставим ~0.5с, паритет с
-		// Linux (-maxrate/-bufsize). MaxBitRate — best-effort (учитывается в
-		// PeakConstrainedVBR; в CBR обычно игнор, но безвреден).
+		// VBV/HRD-потолок. Без него CBR позволяет одному P-кадру на резком движении
+		// (перетаскивание окна = full-frame motion) распухнуть в разы выше среднего.
+		// Над WAN (RTT ~200мс) этот бёрст забивает очередь канала → bufferbloat →
+		// latency-спайк 1–2с. BufferSize (leaky-bucket, в БИТАХ) ограничивает, сколько
+		// кадр «занимает» из буфера — ставим ~0.5с, паритет с Linux (-maxrate/-bufsize).
+		// MaxBitRate — best-effort (учитывается в PeakConstrainedVBR; в CBR обычно игнор).
 		mx := e.codecSet(&codecMaxBitRate, variantU32(bitrate))
 		buf := e.codecSet(&codecBufferSize, variantU32(bitrate/2))
 		// Длинный GOP: кейфреймы по запросу (PLI → ForceKeyframe), а не раз в секунду.
@@ -298,10 +330,10 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 		ll := e.codecSet(&codecLowLatency, variantBool(true))
 		bp := e.codecSet(&codecBPictureCount, variantU32(0))
 		// Баланс качество/скорость: 100 давал encode ~30мс (не влезает в 16мс на
-		// 60fps → overload), 0 — грязно. 25 — умеренное качество в рамках бюджета.
+		// 60fps → overload у софта), 0 — грязно. 25 — умеренное качество в бюджете.
 		qs := e.codecSet(&codecQualityVsSpeed, variantU32(25))
 		if debugCapture() {
-			log.Printf("mf/codec: ICodecAPI (до SetOutputType) — RateControl=%#x MeanBitRate=%#x MaxBitRate=%#x BufSize=%#x GOP=%#x LowLat=%#x BPic=%#x Quality=%#x",
+			log.Printf("mf/codec: ICodecAPI — RateControl=%#x MeanBitRate=%#x MaxBitRate=%#x BufSize=%#x GOP=%#x LowLat=%#x BPic=%#x Quality=%#x",
 				uint32(rc), uint32(br), uint32(mx), uint32(buf), uint32(gop), uint32(ll), uint32(bp), uint32(qs))
 		}
 	} else {
@@ -311,8 +343,7 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	// Выходной тип (H264) задаём ПЕРВЫМ — так требует MS-энкодер.
 	hrOut, outType := procCallOut(procMFCreateMediaType)
 	if hrOut != sOK {
-		e.Close()
-		return nil, hrError(hrOut, "MFCreateMediaType(out)")
+		return hrError(hrOut, "MFCreateMediaType(out)")
 	}
 	setGUID(outType, &mfMTMajorType, &mfMediaTypeVideo)
 	setGUID(outType, &mfMTSubtype, &mfVideoFormatH264)
@@ -326,18 +357,16 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	// игнорирует). Длинный GOP: I-кадр только по PLI + safety-net раз в ~10с,
 	// иначе секундные I-кадры при CBR выжирают бюджет → дыхание качества.
 	setU32(outType, &mfMTMaxKeyframeSpacing, uint32(fps*10))
-	if hr := comCall(mft, idxMFTSetOutputType, 0, outType, 0); hr != sOK {
+	if hr := comCall(e.mft, idxMFTSetOutputType, 0, outType, 0); hr != sOK {
 		comRelease(outType)
-		e.Close()
-		return nil, hrError(hr, "SetOutputType")
+		return hrError(hr, "SetOutputType")
 	}
 	comRelease(outType)
 
 	// Входной тип (NV12).
 	hrIn, inType := procCallOut(procMFCreateMediaType)
 	if hrIn != sOK {
-		e.Close()
-		return nil, hrError(hrIn, "MFCreateMediaType(in)")
+		return hrError(hrIn, "MFCreateMediaType(in)")
 	}
 	setGUID(inType, &mfMTMajorType, &mfMediaTypeVideo)
 	setGUID(inType, &mfMTSubtype, &mfVideoFormatNV12)
@@ -345,16 +374,15 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	setU64(inType, &mfMTFrameSize, packU64(uint32(w), uint32(h)))
 	setU64(inType, &mfMTFrameRate, packU64(uint32(fps), 1))
 	setU64(inType, &mfMTPixelAspect, packU64(1, 1))
-	if hr := comCall(mft, idxMFTSetInputType, 0, inType, 0); hr != sOK {
+	if hr := comCall(e.mft, idxMFTSetInputType, 0, inType, 0); hr != sOK {
 		comRelease(inType)
-		e.Close()
-		return nil, hrError(hr, "SetInputType")
+		return hrError(hr, "SetInputType")
 	}
 	comRelease(inType)
 
 	// Узнаём размер выходного буфера и кто его аллоцирует.
 	info := new(mftOutputStreamInfo)
-	comCall(mft, idxMFTGetOutStreamInfo, 0, uintptr(unsafe.Pointer(info)))
+	comCall(e.mft, idxMFTGetOutStreamInfo, 0, uintptr(unsafe.Pointer(info)))
 	runtime.KeepAlive(info)
 	e.outSize = info.cbSize
 	if e.outSize == 0 {
@@ -362,9 +390,9 @@ func newH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 	}
 	e.selfAlloc = info.dwFlags&(mftOutputProvidesSamples|mftOutputCanProvide) != 0
 
-	comCall(mft, idxMFTProcessMessage, mftMsgBeginStreaming, 0)
-	comCall(mft, idxMFTProcessMessage, mftMsgStartOfStream, 0)
-	return e, nil
+	comCall(e.mft, idxMFTProcessMessage, mftMsgBeginStreaming, 0)
+	comCall(e.mft, idxMFTProcessMessage, mftMsgStartOfStream, 0)
+	return nil
 }
 
 func (e *h264Encoder) codecSet(api *windows.GUID, v variant) uintptr {
@@ -410,6 +438,10 @@ func (e *h264Encoder) encode(nv12 []byte) ([][]byte, error) {
 		if debugCapture() {
 			log.Printf("mf/codec: force keyframe (PLI от зрителя)")
 		}
+	}
+
+	if e.async {
+		return e.encodeAsync(nv12)
 	}
 
 	sample, err := e.makeInputSample(nv12)
@@ -594,6 +626,10 @@ func (e *h264Encoder) Close() {
 	if e == nil {
 		return
 	}
+	if e.evGen != 0 {
+		comRelease(e.evGen)
+		e.evGen = 0
+	}
 	if e.codec != 0 {
 		comRelease(e.codec)
 		e.codec = 0
@@ -601,6 +637,12 @@ func (e *h264Encoder) Close() {
 	if e.mft != 0 {
 		comRelease(e.mft)
 		e.mft = 0
+	}
+	// Аппаратный объект: гасим через IMFActivate::ShutdownObject, затем освобождаем.
+	if e.activate != 0 {
+		comCall(e.activate, idxActivateShutdownObject)
+		comRelease(e.activate)
+		e.activate = 0
 	}
 	procMFShutdown.Call()
 }
