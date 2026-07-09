@@ -55,10 +55,6 @@ type mftRegisterTypeInfo struct {
 // HARDWARE) и все. Показывает, есть ли на этом (в т.ч. виртуальном) GPU аппаратный
 // путь, который позволил бы кодировать прямо из WGC-текстуры без CPU-конвертации.
 func logEncoders() {
-	cat := catVideoEncoder
-	pcat := unsafe.Pointer(&cat)
-	lo := *(*uint64)(pcat)                              // GUID передаётся по значению
-	hi := *(*uint64)(unsafe.Pointer(uintptr(pcat) + 8)) // (16 байт → X0,X1 на arm64)
 	out := &mftRegisterTypeInfo{major: mfMediaTypeVideo, sub: mfVideoFormatH264}
 
 	for _, f := range []struct {
@@ -67,7 +63,8 @@ func logEncoders() {
 	}{{"hardware", 0x4}, {"all", 0x77}} { // HARDWARE ; SYNC|ASYNC|HW|LOCAL|TRANSCODE|SORT
 		ppBase := new(uintptr)
 		pCount := new(uint32)
-		hr, _, _ := procMFTEnumEx.Call(uintptr(lo), uintptr(hi), f.flag, 0,
+		// GUID категории — по значению; ABI-раскладка в callMFTEnumEx (x64 vs arm64).
+		hr := callMFTEnumEx(&catVideoEncoder, f.flag, 0,
 			uintptr(unsafe.Pointer(out)), uintptr(unsafe.Pointer(ppBase)), uintptr(unsafe.Pointer(pCount)))
 		runtime.KeepAlive(out)
 		runtime.KeepAlive(ppBase)

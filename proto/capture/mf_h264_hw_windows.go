@@ -93,16 +93,13 @@ func newHardwareH264Encoder(w, h, fps, kbps int) (*h264Encoder, error) {
 // enumHardwareH264 перечисляет аппаратные H264-энкодеры MFT и возвращает первый
 // (IMFActivate) + его дружественное имя. Остальные освобождает.
 func enumHardwareH264() (act uintptr, name string, err error) {
-	cat := catVideoEncoder
-	pcat := unsafe.Pointer(&cat)
-	lo := *(*uint64)(pcat)                              // GUID категории по значению
-	hi := *(*uint64)(unsafe.Pointer(uintptr(pcat) + 8)) // (16 байт → два uint64)
 	out := &mftRegisterTypeInfo{major: mfMediaTypeVideo, sub: mfVideoFormatH264}
 	ppBase := new(uintptr)
 	pCount := new(uint32)
-	// input=NULL: не фильтруем по входному формату (часть HW-энкодеров не
-	// регистрируют NV12 статически) — валидируем позже через SetInputType.
-	hr, _, _ := procMFTEnumEx.Call(uintptr(lo), uintptr(hi), mfEnumFlagHardware, 0,
+	// GUID категории — по значению; ABI-раскладка в callMFTEnumEx (x64: указатель,
+	// arm64: два регистра). input=NULL: не фильтруем по входному формату (часть
+	// HW-энкодеров не регистрируют NV12 статически) — валидируем через SetInputType.
+	hr := callMFTEnumEx(&catVideoEncoder, mfEnumFlagHardware, 0,
 		uintptr(unsafe.Pointer(out)), uintptr(unsafe.Pointer(ppBase)), uintptr(unsafe.Pointer(pCount)))
 	runtime.KeepAlive(out)
 	runtime.KeepAlive(ppBase)
