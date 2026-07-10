@@ -9,7 +9,7 @@ package capture
 
 /*
 #cgo CFLAGS: -D_WIN32_WINNT=0x0A00 -DCOBJMACROS
-#cgo LDFLAGS: -lmfplat -lmfuuid -lmf -lmfreadwrite -lstrmiids -lwmcodecdspuuid -ld3d11 -ldxgi -lole32 -loleaut32 -luuid
+#cgo LDFLAGS: -lmfplat -lmfuuid -lmf -lmfreadwrite -lstrmiids -lwmcodecdspuuid -ld3d11 -ldxgi -ldxguid -lole32 -loleaut32 -luuid
 
 #include <stdlib.h>
 #include "mf_encoder_windows.h"
@@ -179,6 +179,52 @@ func forEachNAL(b []byte, fn func(t byte, nal []byte)) {
 			fn(b[ns]&0x1f, b[ns:ne])
 		}
 	}
+}
+
+// initVProc поднимает zero-copy конвейер под размер кадра захвата. ok=false → нет
+// GPU-конверта, работаем байтовым путём (submit с CPU-конвертированным NV12).
+func (e *nativeEncoder) initVProc(srcW, srcH int) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.h == nil {
+		return false
+	}
+	var hr C.int32_t
+	rc := C.katana_enc_init_vproc(e.h, C.int(srcW), C.int(srcH), &hr)
+	if rc != 0 {
+		log.Printf("capture: zero-copy VP unavailable (hr=0x%08x) — CPU NV12 path", uint32(hr))
+		return false
+	}
+	log.Printf("capture: zero-copy active — GPU BGRA→NV12 (VideoProcessor, no CPU copy)")
+	return true
+}
+
+// captureTexture копирует BGRA-кадр WGC в свою текстуру (пока tex жива, без CPU-копии).
+func (e *nativeEncoder) captureTexture(bgraTex uintptr) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.h == nil {
+		return errors.New("native encoder closed")
+	}
+	rc := C.katana_enc_capture_texture(e.h, unsafe.Pointer(bgraTex))
+	if rc < 0 {
+		return fmt.Errorf("native encoder capture_texture: %d", int(rc))
+	}
+	return nil
+}
+
+// encodeCaptured конвертит последний захваченный кадр на GPU и шлёт энкодеру.
+func (e *nativeEncoder) encodeCaptured() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.h == nil {
+		return errors.New("native encoder closed")
+	}
+	rc := C.katana_enc_encode_captured(e.h)
+	if rc < 0 {
+		return fmt.Errorf("native encoder encode_captured: %d", int(rc))
+	}
+	return nil
 }
 
 // submit кладёт NV12-кадр в энкодер (неблокирующе).

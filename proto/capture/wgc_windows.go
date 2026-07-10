@@ -88,6 +88,7 @@ type wgcSession struct {
 	enc       *h264Encoder    // нативный MFT-fallback (старый syscall-путь)
 	ff        *ffmpegVideoEnc // ffmpeg-путь (h264_amf/…, обычная сборка)
 	nativeEnc winVideoEncoder // in-process аппаратный энкодер (сборка winnative)
+	zeroCopy  bool            // nativeEnc принимает кадр текстурой (GPU-конверт, без CPU)
 	session2  uintptr
 
 	// ctx/frames нужны firstFrameSetup, чтобы поднять читателя stdout ffmpeg.
@@ -99,7 +100,10 @@ type wgcSession struct {
 // зависит от сборки: cgo+Media Foundation под тегом winnative, иначе — нет).
 // submit кладёт NV12-кадр; готовые Annex-B AU энкодер сам гонит в frames.
 type winVideoEncoder interface {
-	submit(nv12 []byte) error
+	submit(nv12 []byte) error       // байтовый путь (CPU NV12)
+	initVProc(srcW, srcH int) bool  // поднять zero-copy GPU-конверт; false → байтовый
+	captureTexture(tex uintptr) error // zero-copy: забрать кадр (пока tex жива)
+	encodeCaptured() error          // zero-copy: сконвертить+закодировать последний кадр
 	forceKeyframe()
 	setBitrate(kbps int)
 	Close()
@@ -269,8 +273,15 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		te := time.Now()
 		// Нативный in-process энкодер (winnative): submit NV12, забираем готовые AU.
 		if s.nativeEnc != nil {
-			// Энкодер сам гонит готовые AU в frames (poll-горутина → readH264KeepHeaders).
-			if err := s.nativeEnc.submit(nv12); err != nil {
+			// Энкодер сам гонит готовые AU в frames (poll-горутина). Zero-copy: кодируем
+			// уже захваченный кадр на GPU; иначе — байтовый путь (CPU NV12).
+			var err error
+			if s.zeroCopy {
+				err = s.nativeEnc.encodeCaptured()
+			} else {
+				err = s.nativeEnc.submit(nv12)
+			}
+			if err != nil {
 				log.Printf("capture: native encoder submit: %v", err)
 				return false
 			}
@@ -321,7 +332,18 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 				if staging == 0 {
 					s.firstFrameSetup(tex, dev, opts, fps, kbps, &staging, &nv12, &srcW, &srcH, &dstW, &dstH)
 				}
-				if staging != 0 {
+				if staging != 0 && s.zeroCopy {
+					// Zero-copy: забираем кадр в текстуру энкодера (GPU-to-GPU, без CPU).
+					// Кодируем позже в emit — поэтому copy делаем, пока tex ещё жива.
+					tc := time.Now()
+					if err := s.nativeEnc.captureTexture(tex); err == nil {
+						haveNV12 = true
+						gotNew = true
+						convDur = time.Since(tc)
+					} else if debugCapture() {
+						log.Printf("wgc: zero-copy capture: %v", err)
+					}
+				} else if staging != 0 {
 					tc := time.Now()
 					if data, rowPitch, unmap, merr := mapStaging(devCtx, staging, tex); merr == nil {
 						// Кадр валиден только при ненулевых pitch/размерах и достаточном
@@ -415,8 +437,12 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 	// принудительные кейфреймы для low-latency экрана не нужны. Кейфреймы строго по
 	// требованию через PLI (forceKeyframe) при заходе зрителя/потере пакетов.
 	if ne, ok := newNativePreferredEncoder(s.ctx, s.frames, dev, *dstW, *dstH, fps, kbps, fps*300, opts.DropLate); ok {
+		// Zero-copy: GPU-конверт BGRA→NV12 (VideoProcessor) под размер кадра захвата.
+		// Не вышло — откатимся на CPU-конвертацию (bgraToNV12 + submit байтами).
+		zc := ne.initVProc(*srcW, *srcH)
 		s.mu.Lock()
 		s.nativeEnc = ne
+		s.zeroCopy = zc
 		s.mu.Unlock()
 		*staging = st
 		*nv12 = make([]byte, (*dstW)*(*dstH)*3/2)

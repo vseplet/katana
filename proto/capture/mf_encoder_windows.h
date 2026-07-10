@@ -40,6 +40,20 @@ int katana_enc_submit(katana_enc *e, const uint8_t *nv12, int len);
 // Возвращает число записанных байт, 0 — пока нечего, <0 — ошибка/переполнение буфера.
 int katana_enc_poll(katana_enc *e, uint8_t *buf, int buflen);
 
+// katana_enc_init_vproc поднимает zero-copy конвейер (GPU-конверт BGRA→NV12 через
+// ID3D11VideoProcessor) под размер кадра захвата src_w×src_h. 0 — ок (дальше можно
+// слать текстуры через katana_enc_submit_texture), <0 — не вышло (в *out_hr HRESULT;
+// откатывайся на байтовый katana_enc_submit).
+int katana_enc_init_vproc(katana_enc *e, int src_w, int src_h, int32_t *out_hr);
+
+// katana_enc_capture_texture копирует BGRA-кадр WGC (ID3D11Texture2D*) в свою текстуру,
+// пока она жива (GPU-to-GPU, без CPU). 0 — ок, <0 — ошибка.
+int katana_enc_capture_texture(katana_enc *e, void *bgra_tex);
+
+// katana_enc_encode_captured конвертит последний захваченный кадр на GPU (BGRA→NV12,
+// +scale) и скармливает энкодеру. Можно звать повторно (CFR-повтор при простое).
+int katana_enc_encode_captured(katana_enc *e);
+
 // katana_enc_force_keyframe просит IDR на следующем кадре (ответ на PLI зрителя).
 void katana_enc_force_keyframe(katana_enc *e);
 

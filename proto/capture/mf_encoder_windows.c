@@ -27,11 +27,18 @@
 #define METransformHaveOutput 602
 #endif
 
-// --- очередь кадров (односвязный список копий буферов) ---
+// Пул NV12-текстур для zero-copy: энкодер держит входной сэмпл до обработки, поэтому
+// нельзя перезаписывать текстуру сразу — крутим по кругу (in_len дропается до 2).
+#define KATANA_NV12_POOL 4
+
+// --- очередь кадров (односвязный список) ---
+// Вход: либо копия NV12-байтов (data, байтовый путь), либо готовый D3D-сэмпл
+// (sample, zero-copy путь). Выход: всегда data (Annex-B).
 typedef struct frame_node {
     struct frame_node *next;
     uint8_t *data;
     int len;
+    IMFSample *sample; // zero-copy: готовый входной сэмпл (иначе NULL)
 } frame_node;
 
 typedef struct {
@@ -59,15 +66,48 @@ struct katana_enc {
     int width, height, fps;
     UINT reset_token;
     volatile LONG dead;
+
+    // --- zero-copy: GPU-конверт BGRA→NV12 через ID3D11VideoProcessor на общем девайсе ---
+    // Девайс с MT-protection (ID3D11Multithread) сам сериализует контекст, поэтому
+    // LockDevice не нужен. Кадр WGC копируем в свою BGRA-текстуру (CopyResource), VP
+    // конвертит+масштабирует в NV12-текстуру из пула, оборачиваем в IMFSample.
+    ID3D11Device *d3d;
+    ID3D11DeviceContext *d3dctx;
+    ID3D11VideoDevice *vdev;
+    ID3D11VideoContext *vctx;
+    ID3D11VideoProcessorEnumerator *vpenum;
+    ID3D11VideoProcessor *vp;
+    ID3D11Texture2D *bgra_in;                 // владеемая копия кадра (вход VP)
+    ID3D11VideoProcessorInputView *bgra_view; // input view на bgra_in (создаётся раз)
+    ID3D11Texture2D *nv12tex[KATANA_NV12_POOL];
+    ID3D11VideoProcessorOutputView *nv12view[KATANA_NV12_POOL];
+    int nv12_idx;   // round-robin по пулу
+    int src_w, src_h;
+    int vp_ready;   // 1 = video processor поднят, zero-copy активен
 };
 
 // ---- очередь: push/pop под внешним локом ----
 static void q_push(frame_node **head, frame_node **tail, uint8_t *data, int len) {
     frame_node *n = (frame_node *)malloc(sizeof(frame_node));
     if (!n) { free(data); return; }
-    n->next = NULL; n->data = data; n->len = len;
+    n->next = NULL; n->data = data; n->len = len; n->sample = NULL;
     if (*tail) (*tail)->next = n; else *head = n;
     *tail = n;
+}
+// q_push_sample — вариант для zero-copy: кладём готовый входной IMFSample.
+static void q_push_sample(frame_node **head, frame_node **tail, IMFSample *s) {
+    frame_node *n = (frame_node *)malloc(sizeof(frame_node));
+    if (!n) { if (s) IMFSample_Release(s); return; }
+    n->next = NULL; n->data = NULL; n->len = 0; n->sample = s;
+    if (*tail) (*tail)->next = n; else *head = n;
+    *tail = n;
+}
+// node_free освобождает узел входной очереди (байты ИЛИ D3D-сэмпл).
+static void node_free(frame_node *n) {
+    if (!n) return;
+    if (n->data) free(n->data);
+    if (n->sample) IMFSample_Release(n->sample);
+    free(n);
 }
 static frame_node *q_pop(frame_node **head, frame_node **tail) {
     frame_node *n = *head;
@@ -151,27 +191,41 @@ static void enc_feed_locked(katana_enc *e) {
         if (!n) break;
         e->in_len--;
 
-        IMFSample *sample = NULL;
+        IMFSample *sample = n->sample; // zero-copy: готовый D3D-сэмпл
         IMFMediaBuffer *buf = NULL;
-        if (SUCCEEDED(MFCreateSample(&sample)) &&
-            SUCCEEDED(MFCreateMemoryBuffer(n->len, &buf))) {
-            BYTE *dst = NULL; DWORD maxlen = 0;
-            if (SUCCEEDED(IMFMediaBuffer_Lock(buf, &dst, &maxlen, NULL))) {
-                memcpy(dst, n->data, n->len);
-                IMFMediaBuffer_Unlock(buf);
-                IMFMediaBuffer_SetCurrentLength(buf, n->len);
-                IMFSample_AddBuffer(sample, buf);
-                IMFSample_SetSampleTime(sample, e->sample_time);
-                IMFSample_SetSampleDuration(sample, e->frame_dur);
-                e->sample_time += e->frame_dur;
-                if (SUCCEEDED(IMFTransform_ProcessInput(e->mft, 0, sample, 0)))
-                    e->need_input--; // квоту тратим только при принятом кадре
+        int owns_sample = 0; // sample создан здесь (байтовый путь) → релизим сами
+        if (!sample) {
+            // Байтовый путь (фолбэк): строим сэмпл из NV12-копии.
+            if (SUCCEEDED(MFCreateSample(&sample)) &&
+                SUCCEEDED(MFCreateMemoryBuffer(n->len, &buf))) {
+                owns_sample = 1;
+                BYTE *dst = NULL; DWORD maxlen = 0;
+                if (SUCCEEDED(IMFMediaBuffer_Lock(buf, &dst, &maxlen, NULL))) {
+                    memcpy(dst, n->data, n->len);
+                    IMFMediaBuffer_Unlock(buf);
+                    IMFMediaBuffer_SetCurrentLength(buf, n->len);
+                    IMFSample_AddBuffer(sample, buf);
+                } else {
+                    if (buf) { IMFMediaBuffer_Release(buf); buf = NULL; }
+                    IMFSample_Release(sample); sample = NULL;
+                }
+            } else {
+                if (sample) { IMFSample_Release(sample); sample = NULL; }
             }
+        } else {
+            owns_sample = 1; // забрали владение из очереди — освободим ниже
+            n->sample = NULL;
+        }
+        if (sample) {
+            IMFSample_SetSampleTime(sample, e->sample_time);
+            IMFSample_SetSampleDuration(sample, e->frame_dur);
+            e->sample_time += e->frame_dur;
+            if (SUCCEEDED(IMFTransform_ProcessInput(e->mft, 0, sample, 0)))
+                e->need_input--; // квоту тратим только при принятом кадре
         }
         if (buf) IMFMediaBuffer_Release(buf);
-        if (sample) IMFSample_Release(sample);
-        free(n->data);
-        free(n);
+        if (sample && owns_sample) IMFSample_Release(sample);
+        node_free(n);
     }
 }
 
@@ -382,6 +436,11 @@ katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
 
     // Делим D3D11-устройство с захватом.
     if (d3d_device) {
+        // Держим сам девайс и его immediate context для zero-copy VP-конверта.
+        e->d3d = (ID3D11Device *)d3d_device;
+        ID3D11Device_AddRef(e->d3d);
+        ID3D11Device_GetImmediateContext(e->d3d, &e->d3dctx);
+
         hr = MFCreateDXGIDeviceManager(&e->reset_token, &e->devmgr);
         if (SUCCEEDED(hr)) {
             hr = IMFDXGIDeviceManager_ResetDevice(e->devmgr, (IUnknown *)d3d_device, e->reset_token);
@@ -424,6 +483,17 @@ fail:
     return NULL;
 }
 
+// drop_input_overflow_locked дропает самые старые входные кадры при отставании
+// энкодера (низкая задержка важнее полноты). Вызывать под e->lock.
+static void drop_input_overflow_locked(katana_enc *e) {
+    while (e->in_len > KATANA_IN_QUEUE_MAX) {
+        frame_node *old = q_pop(&e->in_head, &e->in_tail);
+        if (!old) break;
+        e->in_len--;
+        node_free(old);
+    }
+}
+
 int katana_enc_submit(katana_enc *e, const uint8_t *nv12, int len) {
     if (!e || e->dead) return -1;
     uint8_t *copy = (uint8_t *)malloc(len);
@@ -432,14 +502,153 @@ int katana_enc_submit(katana_enc *e, const uint8_t *nv12, int len) {
     EnterCriticalSection(&e->lock);
     q_push(&e->in_head, &e->in_tail, copy, len);
     e->in_len++;
-    // Дропаем самые старые кадры, если энкодер не успевает (низкая задержка).
-    while (e->in_len > KATANA_IN_QUEUE_MAX) {
-        frame_node *old = q_pop(&e->in_head, &e->in_tail);
-        if (!old) break;
-        e->in_len--;
-        free(old->data);
-        free(old);
+    drop_input_overflow_locked(e);
+    enc_feed_locked(e);
+    LeaveCriticalSection(&e->lock);
+    return 0;
+}
+
+// ---- zero-copy: GPU-конверт BGRA→NV12 через ID3D11VideoProcessor ----
+
+// vproc_init поднимает video processor под размеры src→dst (dst = e->width×height).
+// Девайс с MT-protection сериализует контекст сам — LockDevice не нужен.
+static HRESULT vproc_init(katana_enc *e, int src_w, int src_h) {
+    if (!e->d3d || !e->d3dctx) return E_FAIL;
+    HRESULT hr;
+
+    hr = ID3D11Device_QueryInterface(e->d3d, &IID_ID3D11VideoDevice, (void **)&e->vdev);
+    if (FAILED(hr)) return hr;
+    hr = ID3D11DeviceContext_QueryInterface(e->d3dctx, &IID_ID3D11VideoContext, (void **)&e->vctx);
+    if (FAILED(hr)) return hr;
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd;
+    memset(&cd, 0, sizeof(cd));
+    cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    cd.InputWidth = src_w;      cd.InputHeight = src_h;
+    cd.OutputWidth = e->width;  cd.OutputHeight = e->height;
+    cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    hr = ID3D11VideoDevice_CreateVideoProcessorEnumerator(e->vdev, &cd, &e->vpenum);
+    if (FAILED(hr)) return hr;
+    hr = ID3D11VideoDevice_CreateVideoProcessor(e->vdev, e->vpenum, 0, &e->vp);
+    if (FAILED(hr)) return hr;
+
+    // Владеемая BGRA-текстура (вход VP) + её input view (создаётся один раз).
+    D3D11_TEXTURE2D_DESC td;
+    memset(&td, 0, sizeof(td));
+    td.Width = src_w; td.Height = src_h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device_CreateTexture2D(e->d3d, &td, NULL, &e->bgra_in);
+    if (FAILED(hr)) return hr;
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd;
+    memset(&ivd, 0, sizeof(ivd));
+    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    ivd.Texture2D.MipSlice = 0;
+    hr = ID3D11VideoDevice_CreateVideoProcessorInputView(e->vdev, (ID3D11Resource *)e->bgra_in, e->vpenum, &ivd, &e->bgra_view);
+    if (FAILED(hr)) return hr;
+
+    // Пул NV12-текстур (выход VP + вход энкодера) + output views.
+    for (int i = 0; i < KATANA_NV12_POOL; i++) {
+        D3D11_TEXTURE2D_DESC nd;
+        memset(&nd, 0, sizeof(nd));
+        nd.Width = e->width; nd.Height = e->height; nd.MipLevels = 1; nd.ArraySize = 1;
+        nd.Format = DXGI_FORMAT_NV12;
+        nd.SampleDesc.Count = 1;
+        nd.Usage = D3D11_USAGE_DEFAULT;
+        nd.BindFlags = D3D11_BIND_RENDER_TARGET;
+        hr = ID3D11Device_CreateTexture2D(e->d3d, &nd, NULL, &e->nv12tex[i]);
+        if (FAILED(hr)) return hr;
+
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd;
+        memset(&ovd, 0, sizeof(ovd));
+        ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        ovd.Texture2D.MipSlice = 0;
+        hr = ID3D11VideoDevice_CreateVideoProcessorOutputView(e->vdev, (ID3D11Resource *)e->nv12tex[i], e->vpenum, &ovd, &e->nv12view[i]);
+        if (FAILED(hr)) return hr;
     }
+
+    // Цветовое пространство: вход RGB full-range, выход YCbCr BT.601 studio (16-235) —
+    // как у CPU-конвертера, чтобы не поехали цвета у зрителя.
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.Usage = 0;        // playback
+    cs.RGB_Range = 0;    // 0 = full
+    cs.YCbCr_Matrix = 0; // 0 = BT.601
+    cs.YCbCr_xvYCC = 0;
+    cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+    ID3D11VideoContext_VideoProcessorSetOutputColorSpace(e->vctx, e->vp, &cs);
+    ID3D11VideoContext_VideoProcessorSetStreamColorSpace(e->vctx, e->vp, 0, &cs);
+
+    e->src_w = src_w; e->src_h = src_h;
+    e->vp_ready = 1;
+    return S_OK;
+}
+
+// katana_enc_init_vproc поднимает zero-copy конвейер под размер кадра захвата.
+int katana_enc_init_vproc(katana_enc *e, int src_w, int src_h, int32_t *out_hr) {
+    if (!e) return -1;
+    EnterCriticalSection(&e->lock);
+    HRESULT hr = vproc_init(e, src_w, src_h);
+    LeaveCriticalSection(&e->lock);
+    if (out_hr) *out_hr = hr;
+    return SUCCEEDED(hr) ? 0 : -1;
+}
+
+// katana_enc_capture_texture копирует BGRA-кадр WGC в свою текстуру (пока tex жива).
+// GPU-to-GPU, без CPU. Кодирование — отдельно (encode_captured), чтобы CFR-повтор при
+// простое мог переиспользовать последний захваченный кадр без живого tex.
+int katana_enc_capture_texture(katana_enc *e, void *bgra_tex) {
+    if (!e || e->dead) return -1;
+    if (!e->vp_ready) return -2;
+    EnterCriticalSection(&e->lock);
+    ID3D11DeviceContext_CopyResource(e->d3dctx, (ID3D11Resource *)e->bgra_in, (ID3D11Resource *)bgra_tex);
+    LeaveCriticalSection(&e->lock);
+    return 0;
+}
+
+// katana_enc_encode_captured конвертит последний захваченный кадр BGRA→NV12(+scale) на
+// GPU, оборачивает NV12-текстуру в IMFSample и скармливает энкодеру. Без CPU-копий.
+int katana_enc_encode_captured(katana_enc *e) {
+    if (!e || e->dead) return -1;
+    if (!e->vp_ready) return -2;
+    EnterCriticalSection(&e->lock);
+
+    int i = e->nv12_idx;
+    e->nv12_idx = (e->nv12_idx + 1) % KATANA_NV12_POOL;
+
+    D3D11_VIDEO_PROCESSOR_STREAM stream;
+    memset(&stream, 0, sizeof(stream));
+    stream.Enable = TRUE;
+    stream.pInputSurface = e->bgra_view;
+    HRESULT hr = ID3D11VideoContext_VideoProcessorBlt(e->vctx, e->vp, e->nv12view[i], 0, 1, &stream);
+    if (FAILED(hr)) { LeaveCriticalSection(&e->lock); return -3; }
+
+    // Оборачиваем NV12-текстуру в IMFSample (без копий).
+    IMFMediaBuffer *buf = NULL;
+    hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)e->nv12tex[i], 0, FALSE, &buf);
+    if (FAILED(hr) || !buf) { LeaveCriticalSection(&e->lock); return -4; }
+    IMF2DBuffer *b2d = NULL;
+    if (SUCCEEDED(IMFMediaBuffer_QueryInterface(buf, &IID_IMF2DBuffer, (void **)&b2d)) && b2d) {
+        DWORD cbLen = 0;
+        if (SUCCEEDED(IMF2DBuffer_GetContiguousLength(b2d, &cbLen)))
+            IMFMediaBuffer_SetCurrentLength(buf, cbLen);
+        IMF2DBuffer_Release(b2d);
+    }
+    IMFSample *sample = NULL;
+    if (FAILED(MFCreateSample(&sample)) || !sample) {
+        IMFMediaBuffer_Release(buf);
+        LeaveCriticalSection(&e->lock);
+        return -5;
+    }
+    IMFSample_AddBuffer(sample, buf);
+    IMFMediaBuffer_Release(buf);
+
+    q_push_sample(&e->in_head, &e->in_tail, sample);
+    e->in_len++;
+    drop_input_overflow_locked(e);
     enc_feed_locked(e);
     LeaveCriticalSection(&e->lock);
     return 0;
@@ -497,10 +706,23 @@ void katana_enc_destroy(katana_enc *e) {
     if (e->evgen) IMFMediaEventGenerator_Release(e->evgen);
     if (e->mft) IMFTransform_Release(e->mft);
     if (e->devmgr) IMFDXGIDeviceManager_Release(e->devmgr);
+    // zero-copy ресурсы.
+    for (int i = 0; i < KATANA_NV12_POOL; i++) {
+        if (e->nv12view[i]) ID3D11VideoProcessorOutputView_Release(e->nv12view[i]);
+        if (e->nv12tex[i]) ID3D11Texture2D_Release(e->nv12tex[i]);
+    }
+    if (e->bgra_view) ID3D11VideoProcessorInputView_Release(e->bgra_view);
+    if (e->bgra_in) ID3D11Texture2D_Release(e->bgra_in);
+    if (e->vp) ID3D11VideoProcessor_Release(e->vp);
+    if (e->vpenum) ID3D11VideoProcessorEnumerator_Release(e->vpenum);
+    if (e->vctx) ID3D11VideoContext_Release(e->vctx);
+    if (e->vdev) ID3D11VideoDevice_Release(e->vdev);
+    if (e->d3dctx) ID3D11DeviceContext_Release(e->d3dctx);
+    if (e->d3d) ID3D11Device_Release(e->d3d);
     // Чистим очереди.
     EnterCriticalSection(&e->lock);
-    for (frame_node *n = e->in_head; n;) { frame_node *nx = n->next; free(n->data); free(n); n = nx; }
-    for (frame_node *n = e->out_head; n;) { frame_node *nx = n->next; free(n->data); free(n); n = nx; }
+    for (frame_node *n = e->in_head; n;) { frame_node *nx = n->next; node_free(n); n = nx; }
+    for (frame_node *n = e->out_head; n;) { frame_node *nx = n->next; node_free(n); n = nx; }
     LeaveCriticalSection(&e->lock);
     DeleteCriticalSection(&e->lock);
     free(e);
