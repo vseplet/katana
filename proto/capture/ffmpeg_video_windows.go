@@ -192,6 +192,7 @@ func startFFmpegEnc(ctx context.Context, ff string, frames chan []byte, enc stri
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	assignToKillJob(cmd) // умрёт вместе с katana даже при жёстком выходе (не утечёт AMF-сессия)
 	log.Printf("ffmpeg: video %s %dx%d @ %dfps %dkbps gop=%d(%ds)", enc, w, h, fps, kbps, gop, gopSec)
 	go logStderr(stderr)
 

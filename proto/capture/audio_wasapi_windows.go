@@ -312,6 +312,7 @@ func startOpusFromPCM(ctx context.Context, sampleFmt string, rate, channels int)
 	if err := cmd.Start(); err != nil {
 		return nil, nil, err
 	}
+	assignToKillJob(cmd) // умрёт вместе с katana даже при жёстком выходе
 
 	out := make(chan []byte, 16)
 	go func() {
