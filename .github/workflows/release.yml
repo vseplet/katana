@@ -10,9 +10,11 @@ name: release
 #   linux   — обычный Linux / сервер: CGO_ENABLED=0, без нативных либ, запускается
 #             где угодно. Терминал по WebRTC + захват через внешний ffmpeg/gst
 #             (x11grab / wayland-gst), ввод uinput/портал. amd64 + arm64.
-#   windows — amd64 + arm64: CGO_ENABLED=0, нативный захват (WGC + Media Foundation
-#             H264) и ввод (SendInput) через syscall — без cgo, кросс-компилится
-#             одной джобой. ffmpeg нужен только для звука (WASAPI→ffmpeg→Opus).
+#   windows — amd64: НАТИВНЫЙ in-process аппаратный H264-энкодер (winnative, cgo),
+#             делящий D3D11-девайс с WGC-захватом (как OBS/Sunshine), GPU zero-copy
+#             BGRA→NV12. Собирается на настоящем windows-раннере (cgo к D3D11/DXGI/
+#             Media Foundation). ffmpeg нужен только для звука (WASAPI→ffmpeg→Opus).
+#             arm64 пока не собираем (нужен arm64-раннер для cgo).
 on:
   push:
     tags: ["v*"]
@@ -82,29 +84,35 @@ jobs:
             katana-linux-arm64
           fail_on_unmatched_files: true
 
-  # Windows: нативный захват (WGC + Media Foundation) и ввод (SendInput) через
-  # syscall — без cgo, поэтому обе арки кросс-компилятся одной джобой. Собираем на
-  # ubuntu (быстрее/дешевле); smoke не гоняем (нечем запустить .exe).
+  # Windows amd64: НАТИВНЫЙ in-process аппаратный H264-энкодер (winnative, cgo) —
+  # делит D3D11-девайс с WGC-захватом (как OBS/Sunshine), GPU zero-copy BGRA→NV12,
+  # без ffmpeg-подпроцесса для видео. cgo к системным D3D11/DXGI/Media Foundation
+  # требует виндового тулчейна (mingw из preinstalled), поэтому собираем на настоящем
+  # windows-раннере, не кроссом. ffmpeg остаётся только для звука (WASAPI→Opus).
   windows:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: proto/go.mod
-      - name: Build (windows amd64 + arm64, CGO_ENABLED=0, native WGC/MFT/WASAPI)
+      - name: gcc version (mingw, для cgo)
+        shell: bash
+        run: gcc --version
+      - name: Build (windows amd64, cgo, winnative — in-process HW encoder)
         working-directory: proto
+        shell: bash
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          CGO_ENABLED: "1"
+          GOARCH: amd64
         run: |
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-windows-amd64.exe .
-          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 \
-            go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o ../katana-windows-arm64.exe .
+          go build -trimpath -tags winnative \
+            -ldflags "-s -w -X main.version=$TAG" \
+            -o ../katana-windows-amd64.exe .
+          ls -la ../katana-windows-amd64.exe
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
-            katana-windows-amd64.exe
-            katana-windows-arm64.exe
+          files: katana-windows-amd64.exe
           fail_on_unmatched_files: true
