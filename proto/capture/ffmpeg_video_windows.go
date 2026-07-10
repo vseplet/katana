@@ -86,11 +86,15 @@ func encoderArgs(enc string, kbps, gop int) []string {
 	}
 	switch enc {
 	case "h264_amf":
-		// enforce_hrd=1 — строгое соблюдение HRD/VBV: аппаратный AMF иначе «жульничает»
-		// и выдаёт IDR толще битрейта, из-за чего каждые GOP секунд по WAN идёт всплеск
-		// и стрим залипает. С enforce_hrd ключевой кадр ужимается в буфер, всплеска нет.
-		return common("h264_amf", "-usage", "lowlatency", "-rc", "cbr", "-quality", "speed",
-			"-enforce_hrd", "1", "-filler_data", "0", "-frame_skipping", "0")
+		a := []string{"-usage", "lowlatency", "-rc", "cbr", "-quality", "speed"}
+		// enforce_hrd строго держит CBR на ключевом кадре (кандидат на лечение
+		// периодического всплеска). НЕ включаем по умолчанию: на части сборок
+		// ffmpeg/драйверов AMF эти опции роняют энкодер — держим за env-флагом,
+		// чтобы дефолт всегда стартовал.
+		if os.Getenv("KATANA_AMF_HRD") == "1" {
+			a = append(a, "-enforce_hrd", "1", "-filler_data", "0", "-frame_skipping", "0")
+		}
+		return common("h264_amf", a...)
 	case "h264_nvenc":
 		return common("h264_nvenc", "-preset", "p1", "-tune", "ll", "-rc", "cbr")
 	case "h264_qsv":
