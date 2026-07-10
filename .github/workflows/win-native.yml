@@ -1,0 +1,52 @@
+name: win-native
+
+# Нативный Windows-хост: аппаратный H264-энкодер IN-PROCESS, делящий D3D11-устройство
+# с захватом WGC (как OBS/Sunshine), через cgo — без ffmpeg-подпроцесса и без второго
+# GPU-контекста. Собирается ТОЛЬКО вручную (кнопка Run workflow), чтобы не триггерить
+# основной релиз и не гонять остальные таргеты. Публикуется в ОТДЕЛЬНЫЙ prerelease-тег
+# `win-native` (перезаписывается каждым прогоном) — install-скрипт с ?native=1 берёт
+# бинарь именно оттуда. Основной канал (release.yml, тег v*) не затрагивается.
+#
+# Собираем на НАСТОЯЩЕМ windows-раннере (не кросс из Linux): cgo к системным
+# D3D11/DXGI/Media Foundation требует виндового тулчейна (gcc из preinstalled mingw).
+on:
+  workflow_dispatch:
+    inputs:
+      goarch:
+        description: "Архитектура (amd64 по умолчанию)"
+        required: false
+        default: "amd64"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: proto/go.mod
+      - name: gcc version (mingw, для cgo)
+        shell: bash
+        run: gcc --version
+      - name: Build native (cgo, in-process HW encoder)
+        working-directory: proto
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOARCH: ${{ github.event.inputs.goarch || 'amd64' }}
+        run: |
+          go build -trimpath -tags winnative \
+            -ldflags "-s -w -X main.version=win-native-${GITHUB_SHA::7}" \
+            -o ../katana-windows-${GOARCH}-native.exe .
+          ls -la ../katana-windows-*-native.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-native
+          name: "Windows native (dev, ручная сборка)"
+          prerelease: true
+          make_latest: false
+          files: katana-windows-*-native.exe
+          fail_on_unmatched_files: true
