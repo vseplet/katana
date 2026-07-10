@@ -582,6 +582,11 @@ func (h *hub) readLoop() {
 			}
 		case "config":
 			h.onConfig(msg)
+		case "keyframe":
+			// Зритель просит свежий IDR (рассыпалась картинка / зашёл в середину).
+			// При почти бесконечном GOP это, наряду с RTCP PLI, главный источник
+			// кейфреймов — раньше сообщение роняли в default как unknown.
+			h.requestKeyframe()
 		case "mouse", "scroll", "cursor", "key", "type":
 			if p := h.peer(pid); p != nil {
 				p.dispatchInput(&msg) // фолбэк, если DataChannel ещё не открыт
