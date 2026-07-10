@@ -12,6 +12,7 @@
 #include <mftransform.h>
 #include <mferror.h>
 #include <codecapi.h>
+#include <strmif.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -48,6 +49,7 @@ struct katana_enc {
     CRITICAL_SECTION lock;
     frame_node *in_head, *in_tail;
     frame_node *out_head, *out_tail;
+    int in_len;     // длина входной очереди (для дропа при отставании энкодера)
     int need_input; // сколько NeedInput пришло, пока очередь входа была пуста
 
     LONGLONG sample_time; // 100-нс тики
@@ -133,11 +135,16 @@ static IMFAsyncCallbackVtbl g_cb_vtbl = {
     cb_QueryInterface, cb_AddRef, cb_Release, cb_GetParameters, cb_Invoke,
 };
 
+// Порог входной очереди: при отставании энкодера дропаем самые старые кадры, чтобы
+// латенси не раздувалось (низкая задержка важнее полноты — как dropLate у ffmpeg).
+#define KATANA_IN_QUEUE_MAX 2
+
 // ---- скармливание входа: под e->lock, пока есть и запросы, и кадры ----
 static void enc_feed_locked(katana_enc *e) {
     while (e->need_input > 0 && e->in_head) {
         frame_node *n = q_pop(&e->in_head, &e->in_tail);
         if (!n) break;
+        e->in_len--;
 
         IMFSample *sample = NULL;
         IMFMediaBuffer *buf = NULL;
@@ -247,11 +254,37 @@ static HRESULT set_input_type(katana_enc *e) {
     return hr;
 }
 
-// TODO: CBR + размер GOP + low-latency через ICodecAPI. В mingw заголовки ICodecAPI
-// капризничают (нужен отдельный заход), пока полагаемся на дефолтный rate-control
-// энкодера и битрейт из MF_MT_AVG_BITRATE. gop прокидываем, но пока не применяем.
-static void configure_codecapi(katana_enc *e, int gop) {
-    (void)e; (void)gop;
+// GUID'ы ICodecAPI задаём вручную — codecapi.h в mingw уводит их в C++-ветку
+// (__uuidof), поэтому в C они не объявлены. Значения стандартные (Windows SDK).
+static const GUID k_IID_ICodecAPI     = {0x901db4c7,0x31ce,0x41a2,{0x85,0xdc,0x8f,0xa0,0xbf,0x41,0xb8,0xda}};
+static const GUID k_RateControlMode   = {0x1c0608e9,0x370c,0x4710,{0x8a,0x58,0xcb,0x61,0x81,0xc4,0x24,0x23}};
+static const GUID k_MaxBitRate        = {0x9651eae4,0x39b9,0x4be1,{0x8c,0xb2,0x7c,0x8a,0xf5,0xb3,0xb9,0xbc}};
+static const GUID k_BufferSize        = {0x0db96574,0xb6a4,0x4c8b,{0x81,0x06,0x37,0x73,0xde,0x03,0x10,0xcd}};
+static const GUID k_GOPSize           = {0x95f31b26,0x95a4,0x41aa,{0x93,0x03,0x24,0x6a,0x7f,0xc6,0xee,0xf1}};
+static const GUID k_LowLatency        = {0x9d3ecd55,0x89e8,0x490a,{0x97,0x0a,0x0c,0x95,0x48,0xd5,0xa5,0x6e}};
+
+// CBR + VBV (буфер ~0.5с) + GOP + low-latency — гасит всплески битрейта на движении
+// и ключевых кадрах (иначе на WAN подскакивает латенси). Best-effort: не все
+// энкодеры поддерживают всё; неуспех отдельного SetValue не критичен.
+static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
+    ICodecAPI *api = NULL;
+    if (FAILED(IMFTransform_QueryInterface(e->mft, &k_IID_ICodecAPI, (void **)&api)) || !api)
+        return;
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_UI4; v.ulVal = 0; // eAVEncCommonRateControlMode_CBR
+    ICodecAPI_SetValue(api, &k_RateControlMode, &v);
+    v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000;
+    ICodecAPI_SetValue(api, &k_MaxBitRate, &v);
+    v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000 / 2; // ~0.5с буфер
+    ICodecAPI_SetValue(api, &k_BufferSize, &v);
+    if (gop > 0) {
+        v.vt = VT_UI4; v.ulVal = (ULONG)gop;
+        ICodecAPI_SetValue(api, &k_GOPSize, &v);
+    }
+    v.vt = VT_BOOL; v.boolVal = VARIANT_TRUE;
+    ICodecAPI_SetValue(api, &k_LowLatency, &v);
+    ICodecAPI_Release(api);
 }
 
 katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
@@ -340,7 +373,7 @@ katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
     stage = 6;
     hr = set_input_type(e);
     if (FAILED(hr)) goto fail;
-    configure_codecapi(e, gop);
+    configure_codecapi(e, gop, bitrate_kbps);
 
     stage = 7;
     hr = IMFTransform_QueryInterface(e->mft, &IID_IMFMediaEventGenerator, (void **)&e->evgen);
@@ -372,6 +405,15 @@ int katana_enc_submit(katana_enc *e, const uint8_t *nv12, int len) {
     memcpy(copy, nv12, len);
     EnterCriticalSection(&e->lock);
     q_push(&e->in_head, &e->in_tail, copy, len);
+    e->in_len++;
+    // Дропаем самые старые кадры, если энкодер не успевает (низкая задержка).
+    while (e->in_len > KATANA_IN_QUEUE_MAX) {
+        frame_node *old = q_pop(&e->in_head, &e->in_tail);
+        if (!old) break;
+        e->in_len--;
+        free(old->data);
+        free(old);
+    }
     enc_feed_locked(e);
     LeaveCriticalSection(&e->lock);
     return 0;

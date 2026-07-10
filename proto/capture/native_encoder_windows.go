@@ -9,7 +9,7 @@ package capture
 
 /*
 #cgo CFLAGS: -D_WIN32_WINNT=0x0A00 -DCOBJMACROS
-#cgo LDFLAGS: -lmfplat -lmfuuid -lmf -lmfreadwrite -lstrmiids -lwmcodecdspuuid -ld3d11 -ldxgi -lole32 -luuid
+#cgo LDFLAGS: -lmfplat -lmfuuid -lmf -lmfreadwrite -lstrmiids -lwmcodecdspuuid -ld3d11 -ldxgi -lole32 -loleaut32 -luuid
 
 #include <stdlib.h>
 #include "mf_encoder_windows.h"
@@ -18,6 +18,7 @@ import "C"
 
 import (
 	"fmt"
+	"log"
 	"unsafe"
 )
 
@@ -39,6 +40,7 @@ func newNativeEncoder(dev uintptr, w, h, fps, kbps, gop int) (*nativeEncoder, er
 		return nil, fmt.Errorf("native H264 MFT create: stage=%d hr=0x%08x [%s]",
 			int(stage), uint32(hr), C.GoString(&info[0]))
 	}
+	log.Printf("capture: native MFT active — %s", C.GoString(&info[0]))
 	// Один AU H264 заведомо меньше несжатого кадра — берём его как потолок буфера.
 	return &nativeEncoder{h: handle, out: make([]byte, w*h*3/2)}, nil
 }
