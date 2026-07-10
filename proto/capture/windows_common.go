@@ -131,6 +131,10 @@ type captureWindows struct{}
 
 // Start поднимает захват+энкод и возвращает каналы кадров (H264 access unit'ы).
 func (c *captureWindows) Start(ctx context.Context, opts Options) (*Stream, error) {
+	// Осиротевшие ffmpeg от прошлых запусков держат AMF-сессию AMD → аппаратный
+	// энкодер падает на инициализации. Чистим ДО старта своих ffmpeg (видео/звук
+	// поднимаются ниже), иначе убили бы свои же.
+	killStrayFFmpeg()
 	video, ctl, err := startVideoWGC(ctx, opts)
 	if err != nil {
 		log.Printf("capture: video (wgc/mf): %v (continuing without video)", err)

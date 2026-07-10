@@ -55,6 +55,17 @@ type ffmpegVideoEnc struct {
 	gotOutput  int32 // atomic: ffmpeg выдал хоть один байт H264 (энкодер жив)
 }
 
+// killStrayFFmpeg добивает осиротевшие ffmpeg от прошлых запусков katana. На Windows
+// дочерний процесс переживает жёсткую смерть родителя и продолжает держать AMF-сессию
+// AMD — из-за этого новый h264_amf падает на инициализации, и мы валимся в софт.
+// Вызывать ДО старта наших ffmpeg (в самом начале захвата), иначе убьём свои же.
+func killStrayFFmpeg() {
+	out, err := exec.Command("taskkill", "/F", "/IM", "ffmpeg.exe").CombinedOutput()
+	if err == nil {
+		log.Printf("capture: подчистил осиротевшие ffmpeg перед стартом: %s", strings.TrimSpace(string(out)))
+	}
+}
+
 // ffmpegEncoderCandidates — порядок кандидатов: аппаратные (если сборка ffmpeg их
 // содержит) → libx264. Наличие проверяем по СПИСКУ `ffmpeg -encoders`, который НЕ
 // открывает GPU-сессию — в отличие от старой пробы-через-кодирование, которая сама
@@ -99,7 +110,9 @@ func encoderArgs(enc string, kbps, gop int) []string {
 	case "h264_qsv":
 		return common("h264_qsv", "-preset", "veryfast", "-low_delay_brc", "1")
 	default:
-		return common("libx264", "-preset", "ultrafast", "-tune", "zerolatency")
+		// libx264 — софт-фолбэк. В 1080p60 он не тянет реалтайм (оверлоад), поэтому
+		// даунскейлим до 720p: программный H264 в 720p спокойно идёт в такт.
+		return common("libx264", "-vf", "scale=-2:720", "-preset", "ultrafast", "-tune", "zerolatency")
 	}
 }
 
