@@ -196,11 +196,12 @@ static void enc_drain_output(katana_enc *e) {
     odb.dwStreamID = 0;
     odb.pSample = osample; // NULL, если MFT сам аллоцирует
     DWORD status = 0;
-    // ProcessOutput под тем же локом, что и ProcessInput (enc_feed_locked) —
-    // сериализуем вызовы MFT между потоком захвата и потоком callback'а.
-    EnterCriticalSection(&e->lock);
+    // ProcessOutput НЕ под локом: async MFT гарантирует потокобезопасность одновременных
+    // ProcessInput (поток захвата) и ProcessOutput (этот callback-поток). Держать их под
+    // одним локом = head-of-line blocking: если ProcessOutput ждёт GPU (общий D3D-девайс
+    // с захватом), submit виснет на локе → захват встаёт. ProcessOutput и так сериализован
+    // сам с собой — событий HaveOutput всегда одно в полёте (один BeginGetEvent).
     HRESULT hr = IMFTransform_ProcessOutput(e->mft, 0, 1, &odb, &status);
-    LeaveCriticalSection(&e->lock);
     if (SUCCEEDED(hr) && odb.pSample) {
         IMFMediaBuffer *cbuf = NULL;
         if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(odb.pSample, &cbuf))) {
@@ -297,7 +298,10 @@ static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
     v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000;
     ICodecAPI_SetValue(api, &k_MeanBitRate, &v); // часть AMF-драйверов таргетит именно его
     ICodecAPI_SetValue(api, &k_MaxBitRate, &v);
-    v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000 / 2; // ~0.5с буфер
+    // Малый VBV (~2 кадра): большой буфер разрешает жирный кейфрейм-спайк раз в GOP —
+    // именно он даёт периодический overload. Держим стоимость кадра близко к средней.
+    int fps = e->fps > 0 ? e->fps : 30;
+    v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000 * 2 / fps;
     ICodecAPI_SetValue(api, &k_BufferSize, &v);
     if (gop > 0) {
         v.vt = VT_UI4; v.ulVal = (ULONG)gop;

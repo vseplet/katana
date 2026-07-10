@@ -20,27 +20,30 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"sync"
 	"time"
 	"unsafe"
 )
 
-// nativeEncoder — обёртка над katana_enc (C). Выход MFT (Annex-B AU) льём в io.Pipe
-// как непрерывный поток и гоним через тот же readH264KeepHeaders, что и ffmpeg-путь:
-// он повторяет SPS/PPS перед каждым IDR (иначе зритель, зашедший в середину потока
-// или потерявший пакет, разваливается — стрим «пропадает») и держит backpressure.
+// nativeEncoder — обёртка над katana_enc (C). C-энкодер отдаёт уже готовые целые
+// Annex-B access unit'ы (по одному на poll), поэтому потоковый h264reader не нужен:
+// повтор SPS/PPS перед IDR делаем по-AU прямо здесь (без пайпа и лишней латенси),
+// затем кладём кадр в frames напрямую с дропом устаревших (realtime-экран).
 type nativeEncoder struct {
-	h    *C.katana_enc
-	pw   *io.PipeWriter
-	mu   sync.Mutex    // сериализует доступ к h между poll-горутиной, submit и Close
-	done chan struct{} // закрывается в Close, чтобы остановить poll-горутину
+	h      *C.katana_enc
+	mu     sync.Mutex // сериализует доступ к h между poll-горутиной, submit и Close
+	done   chan struct{}
+	ctx    context.Context
+	frames chan []byte
+	sps    []byte // закешированы с 4-байтовым старт-кодом
+	pps    []byte
 }
 
 // newNativeEncoder поднимает аппаратный H264-MFT на D3D11-устройстве WGC-захвата и
-// запускает конвейер вывода: poll-горутина → io.Pipe → readH264KeepHeaders → frames.
+// запускает poll-горутину, которая гонит готовые AU в frames.
 func newNativeEncoder(ctx context.Context, frames chan []byte, dev uintptr, w, h, fps, kbps, gop int, dropLate bool) (*nativeEncoder, error) {
+	_ = dropLate // realtime-экран: всегда дропаем устаревшие кадры (см. pollLoop)
 	var hr C.int32_t
 	var stage C.int
 	var info [256]C.char
@@ -52,31 +55,23 @@ func newNativeEncoder(ctx context.Context, frames chan []byte, dev uintptr, w, h
 	}
 	log.Printf("capture: native MFT active — %s", C.GoString(&info[0]))
 
-	pr, pw := io.Pipe()
-	e := &nativeEncoder{h: handle, pw: pw, done: make(chan struct{})}
-	// Читатель: тот же путь, что у ffmpeg — парсит NAL, повторяет SPS/PPS, кладёт в frames.
-	// dropLate=true форсим всегда: realtime-экран, устаревший кадр бесполезен — свежесть
-	// важнее полноты, а иначе pushFrame блокирует пайп при заторе сети/зрителя.
-	_ = dropLate
-	go func() {
-		readH264KeepHeaders(ctx, pr, frames, true)
-		pr.Close()
-	}()
-	// Писатель: тянет готовые AU из C и льёт в pipe.
+	e := &nativeEncoder{h: handle, done: make(chan struct{}), ctx: ctx, frames: frames}
 	go e.pollLoop()
 	return e, nil
 }
 
-// pollLoop опрашивает C-энкодер и пишет готовые Annex-B AU в pipe непрерывным потоком.
+// pollLoop тянет готовые AU из C, чинит заголовки и кладёт в frames.
 func (e *nativeEncoder) pollLoop() {
 	buf := make([]byte, 1<<20) // 1 MiB под один AU; растёт при -2
 	logged := false
-	// Диагностика реального битрейта/частоты вывода — чтобы видеть, держит ли MFT CBR.
+	// Диагностика реального битрейта/частоты вывода — держит ли MFT CBR.
 	var winBytes, winAUs int
 	winStart := time.Now()
 	for {
 		select {
 		case <-e.done:
+			return
+		case <-e.ctx.Done():
 			return
 		default:
 		}
@@ -111,8 +106,77 @@ func (e *nativeEncoder) pollLoop() {
 				winBytes/(winAUs+1))
 			winBytes, winAUs, winStart = 0, 0, time.Now()
 		}
-		if _, err := e.pw.Write(buf[:n]); err != nil {
+		au := e.withHeaders(buf[:n]) // свежий срез, безопасно отдавать в канал
+		if !pushFrame(e.ctx, e.frames, au, true) {
 			return
+		}
+	}
+}
+
+// withHeaders кеширует SPS/PPS и подставляет их перед IDR, где энкодер их не включил
+// (зритель заходит в середину потока / потерял пакет — без заголовков декодер не
+// заведётся). Всегда возвращает свежевыделенный срез: buf переиспользуется poll-циклом.
+func (e *nativeEncoder) withHeaders(au []byte) []byte {
+	var hasSPS, hasPPS, hasIDR bool
+	forEachNAL(au, func(t byte, nal []byte) {
+		switch t {
+		case 7: // SPS
+			e.sps = prependStartCode(nal)
+			hasSPS = true
+		case 8: // PPS
+			e.pps = prependStartCode(nal)
+			hasPPS = true
+		case 5: // IDR slice
+			hasIDR = true
+		}
+	})
+	if hasIDR && !(hasSPS && hasPPS) && e.sps != nil && e.pps != nil {
+		out := make([]byte, 0, len(e.sps)+len(e.pps)+len(au))
+		out = append(out, e.sps...)
+		out = append(out, e.pps...)
+		out = append(out, au...)
+		return out
+	}
+	return append([]byte(nil), au...)
+}
+
+// prependStartCode копирует NAL со свежим 4-байтовым старт-кодом (для кеша SPS/PPS).
+func prependStartCode(nal []byte) []byte {
+	out := make([]byte, 4+len(nal))
+	out[3] = 1
+	copy(out[4:], nal)
+	return out
+}
+
+// forEachNAL разбирает Annex-B (старт-коды 00 00 01 или 00 00 00 01) и вызывает fn на
+// каждый NAL: тип (nal[0]&0x1f) и тело NAL без старт-кода.
+func forEachNAL(b []byte, fn func(t byte, nal []byte)) {
+	type mark struct{ pos, length int }
+	var starts []mark
+	i := 0
+	for i+3 <= len(b) {
+		if b[i] == 0 && b[i+1] == 0 {
+			if b[i+2] == 1 {
+				starts = append(starts, mark{i, 3})
+				i += 3
+				continue
+			}
+			if i+4 <= len(b) && b[i+2] == 0 && b[i+3] == 1 {
+				starts = append(starts, mark{i, 4})
+				i += 4
+				continue
+			}
+		}
+		i++
+	}
+	for k, s := range starts {
+		ns := s.pos + s.length
+		ne := len(b)
+		if k+1 < len(starts) {
+			ne = starts[k+1].pos
+		}
+		if ns < ne {
+			fn(b[ns]&0x1f, b[ns:ne])
 		}
 	}
 }
@@ -159,7 +223,6 @@ func (e *nativeEncoder) Close() {
 	default:
 		close(e.done)
 	}
-	e.pw.Close() // разблокирует pollLoop, если он завис в pw.Write
 	e.mu.Lock()
 	if e.h != nil {
 		C.katana_enc_destroy(e.h)
