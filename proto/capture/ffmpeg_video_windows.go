@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"strconv"
 	"sync"
@@ -85,7 +86,11 @@ func encoderArgs(enc string, kbps, gop int) []string {
 	}
 	switch enc {
 	case "h264_amf":
-		return common("h264_amf", "-usage", "lowlatency", "-rc", "cbr", "-quality", "speed")
+		// enforce_hrd=1 — строгое соблюдение HRD/VBV: аппаратный AMF иначе «жульничает»
+		// и выдаёт IDR толще битрейта, из-за чего каждые GOP секунд по WAN идёт всплеск
+		// и стрим залипает. С enforce_hrd ключевой кадр ужимается в буфер, всплеска нет.
+		return common("h264_amf", "-usage", "lowlatency", "-rc", "cbr", "-quality", "speed",
+			"-enforce_hrd", "1", "-filler_data", "0", "-frame_skipping", "0")
 	case "h264_nvenc":
 		return common("h264_nvenc", "-preset", "p1", "-tune", "ll", "-rc", "cbr")
 	case "h264_qsv":
@@ -103,7 +108,15 @@ func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps 
 		return nil, fmt.Errorf("ffmpeg not found")
 	}
 	enc := pickWindowsH264Encoder(ff)
-	gop := fps * 2
+	// GOP (интервал ключевых кадров) настраиваем через env без пересборки: короче —
+	// быстрее заход зрителя, длиннее — реже IDR-всплески. По умолчанию 2с.
+	gopSec := 2
+	if v := os.Getenv("KATANA_GOP_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 60 {
+			gopSec = n
+		}
+	}
+	gop := fps * gopSec
 
 	args := []string{
 		"-hide_banner", "-loglevel", "warning",
@@ -133,6 +146,7 @@ func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps 
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	log.Printf("ffmpeg: video %s %dx%d @ %dfps %dkbps gop=%d(%ds) enforce_hrd", enc, w, h, fps, kbps, gop, gopSec)
 	go logStderr(stderr)
 	done := make(chan struct{})
 	go func() {
