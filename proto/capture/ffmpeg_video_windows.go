@@ -119,44 +119,6 @@ func encoderArgs(enc string, kbps, gop int) []string {
 	}
 }
 
-// chooseFFmpegEncoder выбирает энкодер с фолбэком: аппаратный (если быстрая проба
-// его нашла) → libx264. Каждого кандидата гоняем на РЕАЛЬНОМ разрешении реальными
-// аргументами; первый прошедший берём. libx264 в конце — гарантированно рабочий
-// софт, чтобы флейк/краш h264_amf на инициализации не давал чёрный экран.
-func chooseFFmpegEncoder(ff string, w, h, fps, kbps, gop int) string {
-	hw := pickWindowsH264Encoder(ff) // быстрая проба 256×256: какой аппаратный присутствует
-	var candidates []string
-	if hw != "libx264" {
-		candidates = append(candidates, hw)
-	}
-	candidates = append(candidates, "libx264")
-	for _, c := range candidates {
-		if validateEncoderFull(ff, c, w, h, fps, kbps, gop) {
-			return c
-		}
-		log.Printf("ffmpeg: энкодер %s не прошёл проверку на %dx%d — беру следующий", c, w, h)
-	}
-	return "libx264"
-}
-
-// validateEncoderFull прогоняет энкодер на реальном разрешении реальными аргументами
-// (десяток чёрных кадров). h264_amf на части драйверов AMD крашится на инициализации
-// именно при 1080p — быстрая проба 256×256 это не ловит, а эта ловит.
-func validateEncoderFull(ff, enc string, w, h, fps, kbps, gop int) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:r=%d", w, h, fps),
-		"-frames:v", "12",
-	}
-	args = append(args, encoderArgs(enc, kbps, gop)...)
-	args = append(args, "-f", "null", "-")
-	ok := exec.CommandContext(ctx, ff, args...).Run() == nil
-	log.Printf("ffmpeg: validate %s @ %dx%d → %v", enc, w, h, ok)
-	return ok
-}
-
 // newFFmpegVideoEnc поднимает ffmpeg (rawvideo NV12 в stdin → Annex-B H264 в
 // stdout) и стартует читателя stdout в общий канал кадров.
 func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps int, dropLate bool) (*ffmpegVideoEnc, error) {
@@ -174,12 +136,10 @@ func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps 
 	}
 	gop := fps * gopSec
 
-	// Выбор энкодера с фолбэком: сначала аппаратный (если быстрая проба его нашла),
-	// затем libx264. Каждого кандидата проверяем на РЕАЛЬНОМ разрешении реальными
-	// аргументами — h264_amf на части драйверов AMD крашится на инициализации именно
-	// при 1080p (проба 256×256 это не ловит). Первый прошедший и берём; libx264 в
-	// конце как гарантированно рабочий софт — чтобы флейк AMF не давал чёрный экран.
-	enc := chooseFFmpegEncoder(ff, w, h, fps, kbps, gop)
+	// ВАЖНО: не запускаем отдельную валидацию-энкодер — h264_amf держит AMF-сессию,
+	// а у AMD жёсткий лимит; второй h264_amf (валидация → сразу реальный) конфликтует
+	// и реальный падает на инициализации. Поэтому просто берём результат быстрой пробы.
+	enc := pickWindowsH264Encoder(ff)
 
 	args := []string{
 		"-hide_banner", "-loglevel", "warning",
