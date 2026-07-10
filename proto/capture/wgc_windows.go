@@ -84,14 +84,24 @@ func videoProbe() bool {
 // wgcSession держит энкодер и сессию, обеспечивая потокобезопасные хуки контроля
 // (форс IDR / битрейт / курсор), которые дёргаются из WebRTC-контура.
 type wgcSession struct {
-	mu       sync.Mutex
-	enc      *h264Encoder    // нативный MFT (fallback, если ffmpeg недоступен)
-	ff       *ffmpegVideoEnc // предпочтительный аппаратный путь (h264_amf/…)
-	session2 uintptr
+	mu        sync.Mutex
+	enc       *h264Encoder    // нативный MFT-fallback (старый syscall-путь)
+	ff        *ffmpegVideoEnc // ffmpeg-путь (h264_amf/…, обычная сборка)
+	nativeEnc winVideoEncoder // in-process аппаратный энкодер (сборка winnative)
+	session2  uintptr
 
 	// ctx/frames нужны firstFrameSetup, чтобы поднять читателя stdout ffmpeg.
 	ctx    context.Context
 	frames chan []byte
+}
+
+// winVideoEncoder — общий интерфейс для in-process нативного энкодера (реализация
+// зависит от сборки: cgo+Media Foundation под тегом winnative, иначе — нет).
+// submit кладёт NV12-кадр, drain забирает готовые Annex-B access unit'ы.
+type winVideoEncoder interface {
+	submit(nv12 []byte) error
+	drain() [][]byte
+	Close()
 }
 
 func (s *wgcSession) setEnc(e *h264Encoder) { s.mu.Lock(); s.enc = e; s.mu.Unlock() }
@@ -189,6 +199,9 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		if s.ff != nil {
 			s.ff.Close()
 		}
+		if s.nativeEnc != nil {
+			s.nativeEnc.Close()
+		}
 		if s.enc != nil {
 			s.enc.Close()
 		}
@@ -245,6 +258,21 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 	// emit кодирует текущий nv12 и шлёт access unit'ы. false → ctx отменён, выходим.
 	emit := func() bool {
 		te := time.Now()
+		// Нативный in-process энкодер (winnative): submit NV12, забираем готовые AU.
+		if s.nativeEnc != nil {
+			if err := s.nativeEnc.submit(nv12); err != nil {
+				log.Printf("capture: native encoder submit: %v", err)
+				return false
+			}
+			for _, au := range s.nativeEnc.drain() {
+				if !pushFrame(ctx, frames, au, opts.DropLate) {
+					return false
+				}
+			}
+			sumEnc += time.Since(te)
+			nFrames++
+			return true
+		}
 		// Путь ffmpeg: кадр уходит в stdin, готовые AU шлёт читатель stdout.
 		if s.ff != nil {
 			if err := s.ff.writeFrame(nv12); err != nil {
@@ -372,6 +400,20 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 	st, serr := createStagingTexture(dev, uint32(*srcW), uint32(*srcH))
 	if serr != nil {
 		log.Printf("capture: staging texture: %v", serr)
+		return
+	}
+
+	// In-process нативный энкодер (сборка winnative): аппаратный H264 MFT на ТОМ ЖЕ
+	// D3D11-устройстве, что и захват — общий GPU-контекст, без ffmpeg-подпроцесса и
+	// второго девайса. В обычной сборке newNativePreferredEncoder возвращает ok=false.
+	if ne, ok := newNativePreferredEncoder(dev, *dstW, *dstH, fps, kbps, fps*2); ok {
+		s.mu.Lock()
+		s.nativeEnc = ne
+		s.mu.Unlock()
+		*staging = st
+		*nv12 = make([]byte, (*dstW)*(*dstH)*3/2)
+		log.Printf("capture: wgc src %dx%d → enc %dx%d @ %dfps %dkbps (native MF, shared D3D)",
+			*srcW, *srcH, *dstW, *dstH, fps, kbps)
 		return
 	}
 
