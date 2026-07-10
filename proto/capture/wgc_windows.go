@@ -97,10 +97,9 @@ type wgcSession struct {
 
 // winVideoEncoder — общий интерфейс для in-process нативного энкодера (реализация
 // зависит от сборки: cgo+Media Foundation под тегом winnative, иначе — нет).
-// submit кладёт NV12-кадр, drain забирает готовые Annex-B access unit'ы.
+// submit кладёт NV12-кадр; готовые Annex-B AU энкодер сам гонит в frames.
 type winVideoEncoder interface {
 	submit(nv12 []byte) error
-	drain() [][]byte
 	Close()
 }
 
@@ -260,14 +259,10 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		te := time.Now()
 		// Нативный in-process энкодер (winnative): submit NV12, забираем готовые AU.
 		if s.nativeEnc != nil {
+			// Энкодер сам гонит готовые AU в frames (poll-горутина → readH264KeepHeaders).
 			if err := s.nativeEnc.submit(nv12); err != nil {
 				log.Printf("capture: native encoder submit: %v", err)
 				return false
-			}
-			for _, au := range s.nativeEnc.drain() {
-				if !pushFrame(ctx, frames, au, opts.DropLate) {
-					return false
-				}
 			}
 			sumEnc += time.Since(te)
 			nFrames++
@@ -406,7 +401,7 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 	// In-process нативный энкодер (сборка winnative): аппаратный H264 MFT на ТОМ ЖЕ
 	// D3D11-устройстве, что и захват — общий GPU-контекст, без ffmpeg-подпроцесса и
 	// второго девайса. В обычной сборке newNativePreferredEncoder возвращает ok=false.
-	if ne, ok := newNativePreferredEncoder(dev, *dstW, *dstH, fps, kbps, fps*2); ok {
+	if ne, ok := newNativePreferredEncoder(s.ctx, s.frames, dev, *dstW, *dstH, fps, kbps, fps*2, opts.DropLate); ok {
 		s.mu.Lock()
 		s.nativeEnc = ne
 		s.mu.Unlock()

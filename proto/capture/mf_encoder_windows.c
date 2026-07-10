@@ -191,7 +191,11 @@ static void enc_drain_output(katana_enc *e) {
     odb.dwStreamID = 0;
     odb.pSample = osample; // NULL, если MFT сам аллоцирует
     DWORD status = 0;
+    // ProcessOutput под тем же локом, что и ProcessInput (enc_feed_locked) —
+    // сериализуем вызовы MFT между потоком захвата и потоком callback'а.
+    EnterCriticalSection(&e->lock);
     HRESULT hr = IMFTransform_ProcessOutput(e->mft, 0, 1, &odb, &status);
+    LeaveCriticalSection(&e->lock);
     if (SUCCEEDED(hr) && odb.pSample) {
         IMFMediaBuffer *cbuf = NULL;
         if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(odb.pSample, &cbuf))) {
