@@ -25,8 +25,11 @@ typedef struct katana_enc katana_enc;
 // out_stage (может быть NULL) получает номер провалившегося шага для диагностики:
 //   1 MFStartup, 2 MFTEnumEx, 3 нет аппаратного энкодера, 4 ActivateObject,
 //   5 SetOutputType, 6 SetInputType, 7 QI EventGenerator, 8 BeginGetEvent.
+// out_info (может быть NULL) заполняется диагностикой найденного MFT
+// ("count=N name=…") — что именно винда предлагает как аппаратный H264-энкодер.
 katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
-                              int bitrate_kbps, int gop, int32_t *out_hr, int *out_stage);
+                              int bitrate_kbps, int gop, int32_t *out_hr, int *out_stage,
+                              char *out_info, int info_cap);
 
 // katana_enc_submit кладёт один NV12-кадр (системная память, длина width*height*3/2).
 // Неблокирующе: кадр ставится в очередь, реально скармливается на METransformNeedInput.

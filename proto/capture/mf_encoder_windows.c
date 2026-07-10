@@ -14,6 +14,7 @@
 #include <codecapi.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "mf_encoder_windows.h"
 
@@ -254,9 +255,11 @@ static void configure_codecapi(katana_enc *e, int gop) {
 }
 
 katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
-                              int bitrate_kbps, int gop, int32_t *out_hr, int *out_stage) {
+                              int bitrate_kbps, int gop, int32_t *out_hr, int *out_stage,
+                              char *out_info, int info_cap) {
     HRESULT hr = S_OK;
     int stage = 0;
+    if (out_info && info_cap > 0) out_info[0] = 0;
     katana_enc *e = (katana_enc *)calloc(1, sizeof(katana_enc));
     if (!e) { if (out_hr) *out_hr = E_OUTOFMEMORY; if (out_stage) *out_stage = 0; return NULL; }
     e->width = width; e->height = height; e->fps = fps > 0 ? fps : 30;
@@ -270,18 +273,43 @@ katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
     hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
     if (FAILED(hr)) goto fail;
 
-    // Ищем аппаратный H264-энкодер.
+    // Ищем аппаратный H264-энкодер (async hardware MFT).
     stage = 2;
-    MFT_REGISTER_TYPE_INFO out_info = { MFMediaType_Video, MFVideoFormat_H264 };
+    MFT_REGISTER_TYPE_INFO type_info = { MFMediaType_Video, MFVideoFormat_H264 };
     IMFActivate **acts = NULL;
     UINT32 count = 0;
     hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                   NULL, &out_info, &acts, &count);
+                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                   NULL, &type_info, &acts, &count);
     if (FAILED(hr)) goto fail;
     if (count == 0) { stage = 3; hr = MF_E_NOT_FOUND; goto fail; }
+
+    // Диагностика: имя первого кандидата — что винда предлагает как аппаратный H264.
+    if (out_info && info_cap > 8) {
+        char pfx[32];
+        int pn = sprintf(pfx, "count=%u name=", (unsigned)count);
+        int off = 0;
+        for (int k = 0; k < pn && off < info_cap - 1; k++) out_info[off++] = pfx[k];
+        WCHAR *wname = NULL; UINT32 wlen = 0;
+        if (SUCCEEDED(IMFActivate_GetAllocatedString(acts[0], &MFT_FRIENDLY_NAME_Attribute, &wname, &wlen)) && wname) {
+            WideCharToMultiByte(CP_UTF8, 0, wname, -1, out_info + off, info_cap - off, NULL, NULL);
+            CoTaskMemFree(wname);
+        } else {
+            out_info[off] = 0;
+        }
+        out_info[info_cap - 1] = 0;
+    }
+
+    // Активируем по очереди — первый рабочий берём. Async-режим разблокируем на
+    // activate ДО активации (для аппаратных MFT так надёжнее).
     stage = 4;
-    hr = IMFActivate_ActivateObject(acts[0], &IID_IMFTransform, (void **)&e->mft);
+    hr = MF_E_NOT_FOUND;
+    for (UINT32 i = 0; i < count; i++) {
+        IMFActivate_SetUINT32((IMFActivate *)acts[i], &MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+        HRESULT ah = IMFActivate_ActivateObject(acts[i], &IID_IMFTransform, (void **)&e->mft);
+        if (SUCCEEDED(ah)) { hr = S_OK; break; }
+        hr = ah;
+    }
     for (UINT32 i = 0; i < count; i++) IMFActivate_Release(acts[i]);
     CoTaskMemFree(acts);
     if (FAILED(hr)) goto fail;

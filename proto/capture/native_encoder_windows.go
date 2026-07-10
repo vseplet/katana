@@ -32,10 +32,12 @@ type nativeEncoder struct {
 func newNativeEncoder(dev uintptr, w, h, fps, kbps, gop int) (*nativeEncoder, error) {
 	var hr C.int32_t
 	var stage C.int
+	var info [256]C.char
 	handle := C.katana_enc_create(unsafe.Pointer(dev), C.int(w), C.int(h),
-		C.int(fps), C.int(kbps), C.int(gop), &hr, &stage)
+		C.int(fps), C.int(kbps), C.int(gop), &hr, &stage, &info[0], C.int(len(info)))
 	if handle == nil {
-		return nil, fmt.Errorf("native H264 MFT create: stage=%d hr=0x%08x", int(stage), uint32(hr))
+		return nil, fmt.Errorf("native H264 MFT create: stage=%d hr=0x%08x [%s]",
+			int(stage), uint32(hr), C.GoString(&info[0]))
 	}
 	// Один AU H264 заведомо меньше несжатого кадра — берём его как потолок буфера.
 	return &nativeEncoder{h: handle, out: make([]byte, w*h*3/2)}, nil
