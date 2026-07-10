@@ -265,7 +265,10 @@ func planBadge(plan string) string {
 // runHostUI запускает TUI и хост параллельно: хост крутится в горутине, TUI держит
 // главный поток (tea.Run блокирует). Когда хост завершается — закрываем TUI.
 func runHostUI(session, url, logPath string, cancel context.CancelFunc, run func()) {
-	uiProg = tea.NewProgram(newHostModel(session, url, logPath, cancel))
+	// AltScreen — изолированный экран (как less/vim): TUI перерисовывается целиком
+	// на ресайз/скролл (не «сыплется» в основной буфер) и восстанавливает терминал
+	// при выходе. Без него ресайз окна ломал вывод.
+	uiProg = tea.NewProgram(newHostModel(session, url, logPath, cancel), tea.WithAltScreen())
 	go func() {
 		run()
 		uiProg.Quit()
