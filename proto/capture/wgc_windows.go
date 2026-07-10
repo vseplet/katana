@@ -416,6 +416,12 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 			*srcW, *srcH, *dstW, *dstH, fps, kbps)
 		return
 	}
+	if preferNativeOnly {
+		// Нативная сборка: ffmpeg/MFT-фолбэка нет — чинить надо натив (HRESULT выше).
+		log.Printf("capture: native-only build — энкодер не поднялся, видео нет")
+		comRelease(st)
+		return
+	}
 
 	// Предпочитаем ffmpeg (аппаратный h264_amf/nvenc/qsv, вендор-нейтрально).
 	// KATANA_MFT_ENCODER форсит нативный MFT (диагностика/машины без ffmpeg).
