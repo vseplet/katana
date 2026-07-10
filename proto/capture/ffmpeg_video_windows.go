@@ -11,7 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"sync"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -50,42 +50,26 @@ type ffmpegVideoEnc struct {
 	wdone chan struct{} // закрывается, когда writeLoop вышел
 	dead  int32         // atomic: ffmpeg умер / энкодер закрыт
 
-	wroteFirst bool // диагностика: залогировать первую постановку кадра в очередь
+	wroteFirst bool  // диагностика: залогировать первую постановку кадра в очередь
 	nDropped   int64 // счётчик дропнутых кадров (лог раз в N)
+	gotOutput  int32 // atomic: ffmpeg выдал хоть один байт H264 (энкодер жив)
 }
 
-var (
-	winHWEncOnce sync.Once
-	winHWEncName string
-)
-
-// pickWindowsH264Encoder один раз пробует аппаратные энкодеры (в порядке
-// AMD→Intel→NVIDIA) и кэширует первый рабочий; при отсутствии — libx264 (софт).
-func pickWindowsH264Encoder(ff string) string {
-	winHWEncOnce.Do(func() {
-		for _, enc := range []string{"h264_amf", "h264_qsv", "h264_nvenc"} {
-			if probeFFmpegEncoder(ff, enc) {
-				winHWEncName = enc
-				return
-			}
+// ffmpegEncoderCandidates — порядок кандидатов: аппаратные (если сборка ffmpeg их
+// содержит) → libx264. Наличие проверяем по СПИСКУ `ffmpeg -encoders`, который НЕ
+// открывает GPU-сессию — в отличие от старой пробы-через-кодирование, которая сама
+// занимала AMF-сессию и конфликтовала с реальным запуском. Реальную работоспособность
+// каждого кандидата проверяет health-check уже на боевом процессе (waitHealthy).
+func ffmpegEncoderCandidates(ff string) []string {
+	out, _ := exec.Command(ff, "-hide_banner", "-encoders").Output()
+	list := string(out)
+	var c []string
+	for _, enc := range []string{"h264_amf", "h264_qsv", "h264_nvenc"} {
+		if strings.Contains(list, enc) {
+			c = append(c, enc)
 		}
-		winHWEncName = "libx264"
-	})
-	return winHWEncName
-}
-
-// probeFFmpegEncoder гоняет кодек на одном чёрном кадре — быстрый способ понять,
-// поднимется ли энкодер на этой машине (нет GPU/драйвера → ненулевой exit).
-func probeFFmpegEncoder(ff, enc string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, ff,
-		"-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", "color=c=black:s=256x256:r=30",
-		"-frames:v", "1", "-c:v", enc, "-f", "null", "-")
-	ok := cmd.Run() == nil
-	log.Printf("ffmpeg: probe %s → %v", enc, ok)
-	return ok
+	}
+	return append(c, "libx264") // софт-фолбэк — гарантированно есть и не занимает GPU
 }
 
 // encoderArgs — CBR + VBV (буфер ~0.5с) + без B-кадров + low-latency пресет под
@@ -119,8 +103,16 @@ func encoderArgs(enc string, kbps, gop int) []string {
 	}
 }
 
-// newFFmpegVideoEnc поднимает ffmpeg (rawvideo NV12 в stdin → Annex-B H264 в
-// stdout) и стартует читателя stdout в общий канал кадров.
+// newFFmpegVideoEnc выбирает рабочий энкодер с фолбэком: перебирает кандидатов
+// (аппаратный → libx264), для каждого поднимает БОЕВОЙ ffmpeg и health-check'ом
+// проверяет, что он реально выдаёт поток. Первый живой и возвращается.
+//
+// Почему health-check на боевом процессе, а не отдельной пробой: h264_amf на
+// драйверах AMD то поднимается, то нет (сессия занята сиротой/не отпущена драйвером),
+// а любая ВТОРАЯ h264_amf-сессия (проба/валидация) сама провоцирует конфликт. Здесь
+// AMF-сессия открывается РОВНО ОДИН раз — если она не завелась, кадры от неё не
+// пойдут, мы её глушим и падаем на libx264. Чёрного экрана быть не может: libx264
+// (софт) поднимается всегда.
 func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps int, dropLate bool) (*ffmpegVideoEnc, error) {
 	ff := FFmpegPath()
 	if ff == "" {
@@ -136,11 +128,29 @@ func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps 
 	}
 	gop := fps * gopSec
 
-	// ВАЖНО: не запускаем отдельную валидацию-энкодер — h264_amf держит AMF-сессию,
-	// а у AMD жёсткий лимит; второй h264_amf (валидация → сразу реальный) конфликтует
-	// и реальный падает на инициализации. Поэтому просто берём результат быстрой пробы.
-	enc := pickWindowsH264Encoder(ff)
+	var lastErr error
+	for _, enc := range ffmpegEncoderCandidates(ff) {
+		e, err := startFFmpegEnc(ctx, ff, frames, enc, w, h, fps, kbps, gop, gopSec, dropLate)
+		if err != nil {
+			lastErr = err
+			log.Printf("ffmpeg: не удалось запустить %s: %v — беру следующий", enc, err)
+			continue
+		}
+		if e.waitHealthy(w, h) {
+			return e, nil
+		}
+		log.Printf("ffmpeg: %s не выдал поток (сессия занята/краш инициализации) — фолбэк", enc)
+		e.Close()
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no working ffmpeg encoder")
+	}
+	return nil, lastErr
+}
 
+// startFFmpegEnc поднимает боевой ffmpeg на заданном энкодере и стартует горутины
+// читателя stdout и писателя stdin. Готовность энкодера НЕ проверяет — это waitHealthy.
+func startFFmpegEnc(ctx context.Context, ff string, frames chan []byte, enc string, w, h, fps, kbps, gop, gopSec int, dropLate bool) (*ffmpegVideoEnc, error) {
 	args := []string{
 		"-hide_banner", "-loglevel", "warning",
 		"-fflags", "nobuffer",
@@ -184,10 +194,40 @@ func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps 
 	}
 	go func() {
 		defer close(e.done)
-		readH264KeepHeaders(ctx, &countReader{r: stdout}, frames, dropLate)
+		readH264KeepHeaders(ctx, &countReader{r: stdout, flag: &e.gotOutput}, frames, dropLate)
 	}()
 	go e.writeLoop()
 	return e, nil
+}
+
+// waitHealthy скармливает энкодеру несколько чёрных кадров и ждёт ~2с, пока он выдаст
+// первый байт H264 ИЛИ умрёт. true = энкодер жив (пошёл поток). Использует тот же
+// боевой процесс — второй GPU-сессии не открывает. Чёрные кадры уходят в начало
+// стрима (зритель обычно ещё не подключён) — безвредно.
+func (e *ffmpegVideoEnc) waitHealthy(w, h int) bool {
+	black := make([]byte, w*h*3/2) // NV12; нули = зелёный кадр, для проверки цвет неважен
+	for i := 0; i < 8; i++ {
+		if atomic.LoadInt32(&e.dead) != 0 {
+			return false
+		}
+		_ = e.writeFrame(black)
+	}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(30 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if atomic.LoadInt32(&e.gotOutput) != 0 {
+			return true
+		}
+		select {
+		case <-e.done: // читатель вышел = процесс умер
+			return atomic.LoadInt32(&e.gotOutput) != 0
+		case <-deadline.C:
+			return atomic.LoadInt32(&e.gotOutput) != 0
+		case <-tick.C:
+		}
+	}
 }
 
 // writeLoop сливает очередь NV12-кадров в stdin ffmpeg. Блокировка тут (пока ffmpeg
@@ -272,17 +312,16 @@ func readH264KeepHeaders(ctx context.Context, in io.Reader, frames chan []byte, 
 	}
 }
 
-// countReader логирует первый байт вывода ffmpeg (диагностика: доходит ли
-// закодированный поток из stdout до читателя) и молчит дальше.
+// countReader на первом же байте вывода ffmpeg взводит флаг gotOutput (его читает
+// waitHealthy, чтобы понять, что энкодер реально ожил) и логирует факт. Дальше молчит.
 type countReader struct {
-	r     io.Reader
-	first bool
+	r    io.Reader
+	flag *int32
 }
 
 func (c *countReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
-	if n > 0 && !c.first {
-		c.first = true
+	if n > 0 && atomic.CompareAndSwapInt32(c.flag, 0, 1) {
 		log.Printf("ffmpeg: first H264 output from stdout (%d bytes)", n)
 	}
 	return n, err
