@@ -4,6 +4,7 @@ package capture
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4/pkg/media/h264reader"
@@ -36,7 +38,20 @@ type ffmpegVideoEnc struct {
 	name  string        // выбранный энкодер (h264_amf/…)
 	done  chan struct{} // закрывается, когда горутина-читатель stdout вышла
 
-	wroteFirst bool // диагностика: залогировать первую запись в stdin
+	// Развязка захват↔кодирование (ключ к отсутствию залипаний на Windows):
+	// поток захвата НЕ пишет в stdin ffmpeg напрямую — иначе он блокируется, пока
+	// ffmpeg не вычитает 3МБ-кадр из ~64КБ-трубы, и на тяжёлом IDR встаёт (фриз).
+	// Вместо этого кадр копируется и кладётся в очередь, а отдельная горутина
+	// writeLoop сливает её в stdin в своём темпе. При переполнении дропаем самый
+	// старый кадр — захват идёт ровно 60fps и никогда не ждёт энкодер, как на mac/linux.
+	in    chan []byte   // очередь NV12-кадров к писателю
+	free  chan []byte   // пул переиспользуемых буферов (меньше GC)
+	stop  chan struct{} // сигнал остановки писателя
+	wdone chan struct{} // закрывается, когда writeLoop вышел
+	dead  int32         // atomic: ffmpeg умер / энкодер закрыт
+
+	wroteFirst bool // диагностика: залогировать первую постановку кадра в очередь
+	nDropped   int64 // счётчик дропнутых кадров (лог раз в N)
 }
 
 var (
@@ -150,15 +165,51 @@ func newFFmpegVideoEnc(ctx context.Context, frames chan []byte, w, h, fps, kbps 
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	log.Printf("ffmpeg: video %s %dx%d @ %dfps %dkbps gop=%d(%ds) enforce_hrd", enc, w, h, fps, kbps, gop, gopSec)
+	log.Printf("ffmpeg: video %s %dx%d @ %dfps %dkbps gop=%d(%ds)", enc, w, h, fps, kbps, gop, gopSec)
 	go logStderr(stderr)
-	done := make(chan struct{})
+
+	e := &ffmpegVideoEnc{
+		cmd:   cmd,
+		stdin: stdin,
+		name:  enc,
+		done:  make(chan struct{}),
+		in:    make(chan []byte, 4),
+		free:  make(chan []byte, 6),
+		stop:  make(chan struct{}),
+		wdone: make(chan struct{}),
+	}
 	go func() {
-		defer close(done)
+		defer close(e.done)
 		readH264KeepHeaders(ctx, &countReader{r: stdout}, frames, dropLate)
 	}()
+	go e.writeLoop()
+	return e, nil
+}
 
-	return &ffmpegVideoEnc{cmd: cmd, stdin: stdin, name: enc, done: done}, nil
+// writeLoop сливает очередь NV12-кадров в stdin ffmpeg. Блокировка тут (пока ffmpeg
+// не вычитает кадр) НЕ трогает поток захвата — в этом весь смысл развязки.
+func (e *ffmpegVideoEnc) writeLoop() {
+	defer close(e.wdone)
+	for {
+		select {
+		case <-e.stop:
+			return
+		case b := <-e.in:
+			if _, err := e.stdin.Write(b); err != nil {
+				atomic.StoreInt32(&e.dead, 1)
+				select {
+				case <-e.stop: // штатное закрытие — не шумим
+				default:
+					log.Printf("capture: ffmpeg video write: %v", err)
+				}
+				return
+			}
+			select {
+			case e.free <- b: // вернуть буфер в пул
+			default:
+			}
+		}
+	}
 }
 
 // readH264KeepHeaders — как readH264, но гарантирует SPS/PPS перед каждым IDR.
@@ -233,26 +284,60 @@ func (c *countReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// writeFrame отдаёт один NV12-кадр в stdin. Ошибка = ffmpeg умер → стрим мёртв.
+// writeFrame НЕ блокирует поток захвата: копирует кадр в буфер из пула и кладёт в
+// очередь; при переполнении дропает самый старый (dropLate). Ошибка = ffmpeg умер.
 func (f *ffmpegVideoEnc) writeFrame(nv12 []byte) error {
-	n, err := f.stdin.Write(nv12)
+	if atomic.LoadInt32(&f.dead) != 0 {
+		return errors.New("ffmpeg writer stopped")
+	}
+	// Копия обязательна: поток захвата переиспользует свой nv12-буфер сразу после
+	// возврата, а писатель заберёт кадр позже — иначе кадр будет затёрт на лету.
+	var b []byte
+	select {
+	case b = <-f.free:
+		b = append(b[:0], nv12...)
+	default:
+		b = append(make([]byte, 0, len(nv12)), nv12...)
+	}
 	if !f.wroteFirst {
 		f.wroteFirst = true
-		log.Printf("ffmpeg: first NV12 frame written to stdin (%d bytes, err=%v)", n, err)
+		log.Printf("ffmpeg: first NV12 frame queued (%d bytes)", len(b))
 	}
-	return err
+	for {
+		select {
+		case f.in <- b:
+			return nil
+		default:
+			// Очередь полна — ffmpeg отстаёт (напр. кодирует IDR). Выкидываем самый
+			// старый кадр и пробуем снова: захват не ждёт, теряем максимум кадр-два.
+			select {
+			case old := <-f.in:
+				if n := atomic.AddInt64(&f.nDropped, 1); n%60 == 1 {
+					log.Printf("ffmpeg: video queue full, dropped %d frame(s) total", n)
+				}
+				select {
+				case f.free <- old:
+				default:
+				}
+			default:
+			}
+		}
+	}
 }
 
-// Close глушит ffmpeg и ДОЖИДАЕТСЯ выхода читателя stdout, прежде чем вернуться,
-// — иначе гонка с close(frames) в run() (push в закрытый канал = паника).
+// Close останавливает писателя и читателя и глушит ffmpeg. Дожидается ОБЕИХ горутин
+// до возврата — иначе гонка с close(frames) в run() (push в закрытый канал = паника).
 func (f *ffmpegVideoEnc) Close() {
+	atomic.StoreInt32(&f.dead, 1) // writeFrame перестаёт принимать кадры
+	close(f.stop)                 // сигнал writeLoop
 	if f.stdin != nil {
-		f.stdin.Close()
+		f.stdin.Close() // разблокирует зависшую в Write горутину writeLoop
 	}
 	if f.cmd != nil && f.cmd.Process != nil {
 		f.cmd.Process.Kill()
 	}
-	<-f.done
+	<-f.wdone // писатель вышел
+	<-f.done  // читатель вышел
 	if f.cmd != nil {
 		f.cmd.Wait()
 	}
