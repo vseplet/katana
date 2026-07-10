@@ -411,9 +411,10 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 	// In-process нативный энкодер (сборка winnative): аппаратный H264 MFT на ТОМ ЖЕ
 	// D3D11-устройстве, что и захват — общий GPU-контекст, без ffmpeg-подпроцесса и
 	// второго девайса. В обычной сборке newNativePreferredEncoder возвращает ok=false.
-	// GOP длинный (10с): частые принудительные IDR = периодический спайк битрейта и
-	// overload. Кейфреймы по требованию даёт PLI (forceKeyframe) при заходе/потере.
-	if ne, ok := newNativePreferredEncoder(s.ctx, s.frames, dev, *dstW, *dstH, fps, kbps, fps*10, opts.DropLate); ok {
+	// GOP практически бесконечный: провалы совпадали с интервалом IDR — периодические
+	// принудительные кейфреймы для low-latency экрана не нужны. Кейфреймы строго по
+	// требованию через PLI (forceKeyframe) при заходе зрителя/потере пакетов.
+	if ne, ok := newNativePreferredEncoder(s.ctx, s.frames, dev, *dstW, *dstH, fps, kbps, fps*300, opts.DropLate); ok {
 		s.mu.Lock()
 		s.nativeEnc = ne
 		s.mu.Unlock()
