@@ -55,8 +55,11 @@ func newNativeEncoder(ctx context.Context, frames chan []byte, dev uintptr, w, h
 	pr, pw := io.Pipe()
 	e := &nativeEncoder{h: handle, pw: pw, done: make(chan struct{})}
 	// Читатель: тот же путь, что у ffmpeg — парсит NAL, повторяет SPS/PPS, кладёт в frames.
+	// dropLate=true форсим всегда: realtime-экран, устаревший кадр бесполезен — свежесть
+	// важнее полноты, а иначе pushFrame блокирует пайп при заторе сети/зрителя.
+	_ = dropLate
 	go func() {
-		readH264KeepHeaders(ctx, pr, frames, dropLate)
+		readH264KeepHeaders(ctx, pr, frames, true)
 		pr.Close()
 	}()
 	// Писатель: тянет готовые AU из C и льёт в pipe.
@@ -68,6 +71,9 @@ func newNativeEncoder(ctx context.Context, frames chan []byte, dev uintptr, w, h
 func (e *nativeEncoder) pollLoop() {
 	buf := make([]byte, 1<<20) // 1 MiB под один AU; растёт при -2
 	logged := false
+	// Диагностика реального битрейта/частоты вывода — чтобы видеть, держит ли MFT CBR.
+	var winBytes, winAUs int
+	winStart := time.Now()
 	for {
 		select {
 		case <-e.done:
@@ -97,6 +103,14 @@ func (e *nativeEncoder) pollLoop() {
 			}
 			log.Printf("capture: native first AU %d bytes, head=% x", n, buf[:m])
 		}
+		winBytes += n
+		winAUs++
+		if el := time.Since(winStart); el >= 2*time.Second {
+			log.Printf("capture: native out %.0f kbps, %.0f AU/s (avg %d B/AU)",
+				float64(winBytes)*8/1000/el.Seconds(), float64(winAUs)/el.Seconds(),
+				winBytes/(winAUs+1))
+			winBytes, winAUs, winStart = 0, 0, time.Now()
+		}
 		if _, err := e.pw.Write(buf[:n]); err != nil {
 			return
 		}
@@ -118,6 +132,24 @@ func (e *nativeEncoder) submit(nv12 []byte) error {
 		return fmt.Errorf("native encoder submit: %d", int(rc))
 	}
 	return nil
+}
+
+// forceKeyframe просит энкодер выдать IDR на следующем кадре (ответ на PLI зрителя).
+func (e *nativeEncoder) forceKeyframe() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.h != nil {
+		C.katana_enc_force_keyframe(e.h)
+	}
+}
+
+// setBitrate меняет целевой битрейт на лету (проброс AIMD-регулятора из signaling).
+func (e *nativeEncoder) setBitrate(kbps int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.h != nil {
+		C.katana_enc_set_bitrate(e.h, C.int(kbps))
+	}
 }
 
 // Close останавливает и освобождает энкодер.

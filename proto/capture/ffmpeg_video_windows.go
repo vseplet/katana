@@ -72,6 +72,12 @@ func killStrayFFmpeg() {
 // занимала AMF-сессию и конфликтовала с реальным запуском. Реальную работоспособность
 // каждого кандидата проверяет health-check уже на боевом процессе (waitHealthy).
 func ffmpegEncoderCandidates(ff string) []string {
+	// KATANA_ENCODER форсит конкретный энкодер, минуя перебор и фолбэки: например
+	// libx264 даёт детерминированный софт-путь без флейка/GPU-конфликта аппаратного.
+	if forced := os.Getenv("KATANA_ENCODER"); forced != "" {
+		log.Printf("ffmpeg: энкодер форсирован через KATANA_ENCODER=%s", forced)
+		return []string{forced}
+	}
 	out, _ := exec.Command(ff, "-hide_banner", "-encoders").Output()
 	list := string(out)
 	var c []string

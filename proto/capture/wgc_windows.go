@@ -100,6 +100,8 @@ type wgcSession struct {
 // submit кладёт NV12-кадр; готовые Annex-B AU энкодер сам гонит в frames.
 type winVideoEncoder interface {
 	submit(nv12 []byte) error
+	forceKeyframe()
+	setBitrate(kbps int)
 	Close()
 }
 
@@ -108,18 +110,26 @@ func (s *wgcSession) setEnc(e *h264Encoder) { s.mu.Lock(); s.enc = e; s.mu.Unloc
 func (s *wgcSession) forceKeyframe() {
 	s.mu.Lock()
 	e := s.enc
+	ne := s.nativeEnc
 	s.mu.Unlock()
 	if e != nil {
 		e.forceKeyframe()
+	}
+	if ne != nil {
+		ne.forceKeyframe()
 	}
 }
 
 func (s *wgcSession) setBitrate(kbps int) {
 	s.mu.Lock()
 	e := s.enc
+	ne := s.nativeEnc
 	s.mu.Unlock()
 	if e != nil {
 		e.setBitrate(kbps)
+	}
+	if ne != nil {
+		ne.setBitrate(kbps)
 	}
 }
 

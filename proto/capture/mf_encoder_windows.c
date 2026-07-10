@@ -44,12 +44,14 @@ struct katana_enc {
     IMFTransform *mft;
     IMFMediaEventGenerator *evgen;
     IMFDXGIDeviceManager *devmgr;
+    struct ICodecAPI *codec; // для форса ключевого кадра по PLI (может быть NULL)
     async_cb cb;
 
     CRITICAL_SECTION lock;
     frame_node *in_head, *in_tail;
     frame_node *out_head, *out_tail;
     int in_len;     // длина входной очереди (для дропа при отставании энкодера)
+    int out_len;    // длина выходной очереди (для дропа при заторе пайпа/сети)
     int need_input; // сколько NeedInput пришло, пока очередь входа была пуста
 
     LONGLONG sample_time; // 100-нс тики
@@ -138,6 +140,9 @@ static IMFAsyncCallbackVtbl g_cb_vtbl = {
 // Порог входной очереди: при отставании энкодера дропаем самые старые кадры, чтобы
 // латенси не раздувалось (низкая задержка важнее полноты — как dropLate у ffmpeg).
 #define KATANA_IN_QUEUE_MAX 2
+// Порог выходной очереди: если пайп/сеть затыкаются (медленный зритель, TURN/TCP),
+// out-очередь не должна расти безгранично — держим только свежие AU, старые дропаем.
+#define KATANA_OUT_QUEUE_MAX 8
 
 // ---- скармливание входа: под e->lock, пока есть и запросы, и кадры ----
 static void enc_feed_locked(katana_enc *e) {
@@ -159,8 +164,8 @@ static void enc_feed_locked(katana_enc *e) {
                 IMFSample_SetSampleTime(sample, e->sample_time);
                 IMFSample_SetSampleDuration(sample, e->frame_dur);
                 e->sample_time += e->frame_dur;
-                IMFTransform_ProcessInput(e->mft, 0, sample, 0);
-                e->need_input--;
+                if (SUCCEEDED(IMFTransform_ProcessInput(e->mft, 0, sample, 0)))
+                    e->need_input--; // квоту тратим только при принятом кадре
             }
         }
         if (buf) IMFMediaBuffer_Release(buf);
@@ -206,6 +211,15 @@ static void enc_drain_output(katana_enc *e) {
                     memcpy(copy, p, cur);
                     EnterCriticalSection(&e->lock);
                     q_push(&e->out_head, &e->out_tail, copy, (int)cur);
+                    e->out_len++;
+                    // Затор пайпа/сети: не копим бэклог, держим только свежие AU.
+                    while (e->out_len > KATANA_OUT_QUEUE_MAX) {
+                        frame_node *old = q_pop(&e->out_head, &e->out_tail);
+                        if (!old) break;
+                        e->out_len--;
+                        free(old->data);
+                        free(old);
+                    }
                     LeaveCriticalSection(&e->lock);
                 }
                 IMFMediaBuffer_Unlock(cbuf);
@@ -266,6 +280,8 @@ static const GUID k_MaxBitRate        = {0x9651eae4,0x39b9,0x4be1,{0x8c,0xb2,0x7
 static const GUID k_BufferSize        = {0x0db96574,0xb6a4,0x4c8b,{0x81,0x06,0x37,0x73,0xde,0x03,0x10,0xcd}};
 static const GUID k_GOPSize           = {0x95f31b26,0x95a4,0x41aa,{0x93,0x03,0x24,0x6a,0x7f,0xc6,0xee,0xf1}};
 static const GUID k_LowLatency        = {0x9d3ecd55,0x89e8,0x490a,{0x97,0x0a,0x0c,0x95,0x48,0xd5,0xa5,0x6e}};
+static const GUID k_ForceKeyFrame     = {0x398c1b98,0x8353,0x475a,{0x9e,0xf2,0x8f,0x26,0x5d,0x26,0x03,0x45}};
+static const GUID k_MeanBitRate       = {0xf7222374,0x2144,0x4815,{0xb5,0x50,0xa3,0x7f,0x8e,0x12,0xee,0x52}};
 
 // CBR + VBV (буфер ~0.5с) + GOP + low-latency — гасит всплески битрейта на движении
 // и ключевых кадрах (иначе на WAN подскакивает латенси). Best-effort: не все
@@ -279,6 +295,7 @@ static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
     v.vt = VT_UI4; v.ulVal = 0; // eAVEncCommonRateControlMode_CBR
     ICodecAPI_SetValue(api, &k_RateControlMode, &v);
     v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000;
+    ICodecAPI_SetValue(api, &k_MeanBitRate, &v); // часть AMF-драйверов таргетит именно его
     ICodecAPI_SetValue(api, &k_MaxBitRate, &v);
     v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000 / 2; // ~0.5с буфер
     ICodecAPI_SetValue(api, &k_BufferSize, &v);
@@ -288,7 +305,8 @@ static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
     }
     v.vt = VT_BOOL; v.boolVal = VARIANT_TRUE;
     ICodecAPI_SetValue(api, &k_LowLatency, &v);
-    ICodecAPI_Release(api);
+    // Держим ссылку для форса ключевого кадра по PLI; релиз — в destroy.
+    e->codec = api;
 }
 
 katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
@@ -427,6 +445,7 @@ int katana_enc_poll(katana_enc *e, uint8_t *buf, int buflen) {
     if (!e) return -1;
     EnterCriticalSection(&e->lock);
     frame_node *n = q_pop(&e->out_head, &e->out_tail);
+    if (n) e->out_len--;
     LeaveCriticalSection(&e->lock);
     if (!n) return 0;
     int len = n->len;
@@ -437,6 +456,32 @@ int katana_enc_poll(katana_enc *e, uint8_t *buf, int buflen) {
     return len;
 }
 
+// katana_enc_set_bitrate меняет целевой битрейт на лету (ответ на AIMD/потери сети).
+// AMD AMF MFT принимает динамику через CODECAPI_AVEncCommonMeanBitRate — как Chromium.
+void katana_enc_set_bitrate(katana_enc *e, int kbps) {
+    if (!e || !e->codec || kbps <= 0) return;
+    VARIANT v;
+    VariantInit(&v);
+    EnterCriticalSection(&e->lock);
+    v.vt = VT_UI4; v.ulVal = (ULONG)kbps * 1000;
+    ICodecAPI_SetValue(e->codec, &k_MeanBitRate, &v);
+    ICodecAPI_SetValue(e->codec, &k_MaxBitRate, &v);
+    v.vt = VT_UI4; v.ulVal = (ULONG)kbps * 1000 / 2; // VBV ~0.5с
+    ICodecAPI_SetValue(e->codec, &k_BufferSize, &v);
+    LeaveCriticalSection(&e->lock);
+}
+
+// katana_enc_force_keyframe просит энкодер выдать IDR на следующем кадре (ответ на PLI).
+void katana_enc_force_keyframe(katana_enc *e) {
+    if (!e || !e->codec) return;
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_UI4; v.ulVal = 1;
+    EnterCriticalSection(&e->lock);
+    ICodecAPI_SetValue(e->codec, &k_ForceKeyFrame, &v);
+    LeaveCriticalSection(&e->lock);
+}
+
 void katana_enc_destroy(katana_enc *e) {
     if (!e) return;
     InterlockedExchange(&e->dead, 1);
@@ -444,6 +489,7 @@ void katana_enc_destroy(katana_enc *e) {
         IMFTransform_ProcessMessage(e->mft, MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         IMFTransform_ProcessMessage(e->mft, MFT_MESSAGE_COMMAND_DRAIN, 0);
     }
+    if (e->codec) ICodecAPI_Release(e->codec);
     if (e->evgen) IMFMediaEventGenerator_Release(e->evgen);
     if (e->mft) IMFTransform_Release(e->mft);
     if (e->devmgr) IMFDXGIDeviceManager_Release(e->devmgr);

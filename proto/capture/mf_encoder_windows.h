@@ -40,6 +40,12 @@ int katana_enc_submit(katana_enc *e, const uint8_t *nv12, int len);
 // Возвращает число записанных байт, 0 — пока нечего, <0 — ошибка/переполнение буфера.
 int katana_enc_poll(katana_enc *e, uint8_t *buf, int buflen);
 
+// katana_enc_force_keyframe просит IDR на следующем кадре (ответ на PLI зрителя).
+void katana_enc_force_keyframe(katana_enc *e);
+
+// katana_enc_set_bitrate меняет целевой битрейт (kbps) на лету (ответ на AIMD/сеть).
+void katana_enc_set_bitrate(katana_enc *e, int kbps);
+
 // katana_enc_destroy останавливает и освобождает энкодер.
 void katana_enc_destroy(katana_enc *e);
 
