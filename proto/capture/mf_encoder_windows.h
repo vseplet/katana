@@ -22,8 +22,11 @@ typedef struct katana_enc katana_enc;
 //   bitrate_kbps — целевой битрейт (CBR).
 //   gop          — интервал ключевых кадров в кадрах (0 = по умолчанию энкодера).
 // Возвращает хендл или NULL; в *out_hr кладёт HRESULT для диагностики.
+// out_stage (может быть NULL) получает номер провалившегося шага для диагностики:
+//   1 MFStartup, 2 MFTEnumEx, 3 нет аппаратного энкодера, 4 ActivateObject,
+//   5 SetOutputType, 6 SetInputType, 7 QI EventGenerator, 8 BeginGetEvent.
 katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
-                              int bitrate_kbps, int gop, int32_t *out_hr);
+                              int bitrate_kbps, int gop, int32_t *out_hr, int *out_stage);
 
 // katana_enc_submit кладёт один NV12-кадр (системная память, длина width*height*3/2).
 // Неблокирующе: кадр ставится в очередь, реально скармливается на METransformNeedInput.

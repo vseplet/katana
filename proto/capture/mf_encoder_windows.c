@@ -254,10 +254,11 @@ static void configure_codecapi(katana_enc *e, int gop) {
 }
 
 katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
-                              int bitrate_kbps, int gop, int32_t *out_hr) {
+                              int bitrate_kbps, int gop, int32_t *out_hr, int *out_stage) {
     HRESULT hr = S_OK;
+    int stage = 0;
     katana_enc *e = (katana_enc *)calloc(1, sizeof(katana_enc));
-    if (!e) { if (out_hr) *out_hr = E_OUTOFMEMORY; return NULL; }
+    if (!e) { if (out_hr) *out_hr = E_OUTOFMEMORY; if (out_stage) *out_stage = 0; return NULL; }
     e->width = width; e->height = height; e->fps = fps > 0 ? fps : 30;
     e->frame_dur = 10000000LL / e->fps;
     e->cb.lpVtbl = &g_cb_vtbl;
@@ -265,20 +266,21 @@ katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
     e->cb.enc = e;
     InitializeCriticalSection(&e->lock);
 
+    stage = 1;
     hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
     if (FAILED(hr)) goto fail;
 
     // Ищем аппаратный H264-энкодер.
+    stage = 2;
     MFT_REGISTER_TYPE_INFO out_info = { MFMediaType_Video, MFVideoFormat_H264 };
     IMFActivate **acts = NULL;
     UINT32 count = 0;
     hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
                    MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
                    NULL, &out_info, &acts, &count);
-    if (FAILED(hr) || count == 0) {
-        if (SUCCEEDED(hr)) hr = MF_E_NOT_FOUND;
-        goto fail;
-    }
+    if (FAILED(hr)) goto fail;
+    if (count == 0) { stage = 3; hr = MF_E_NOT_FOUND; goto fail; }
+    stage = 4;
     hr = IMFActivate_ActivateObject(acts[0], &IID_IMFTransform, (void **)&e->mft);
     for (UINT32 i = 0; i < count; i++) IMFActivate_Release(acts[i]);
     CoTaskMemFree(acts);
@@ -304,12 +306,15 @@ katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
     }
 
     // Порядок важен: сначала выходной тип, затем входной.
+    stage = 5;
     hr = set_output_type(e, bitrate_kbps);
     if (FAILED(hr)) goto fail;
+    stage = 6;
     hr = set_input_type(e);
     if (FAILED(hr)) goto fail;
     configure_codecapi(e, gop);
 
+    stage = 7;
     hr = IMFTransform_QueryInterface(e->mft, &IID_IMFMediaEventGenerator, (void **)&e->evgen);
     if (FAILED(hr)) goto fail;
 
@@ -317,14 +322,17 @@ katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
     IMFTransform_ProcessMessage(e->mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
     // Запускаем цикл событий.
+    stage = 8;
     hr = IMFMediaEventGenerator_BeginGetEvent(e->evgen, (IMFAsyncCallback *)&e->cb, NULL);
     if (FAILED(hr)) goto fail;
 
     if (out_hr) *out_hr = S_OK;
+    if (out_stage) *out_stage = 0;
     return e;
 
 fail:
     if (out_hr) *out_hr = hr;
+    if (out_stage) *out_stage = stage;
     katana_enc_destroy(e);
     return NULL;
 }

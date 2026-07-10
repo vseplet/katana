@@ -31,10 +31,11 @@ type nativeEncoder struct {
 // newNativeEncoder поднимает аппаратный H264-MFT на D3D11-устройстве WGC-захвата.
 func newNativeEncoder(dev uintptr, w, h, fps, kbps, gop int) (*nativeEncoder, error) {
 	var hr C.int32_t
+	var stage C.int
 	handle := C.katana_enc_create(unsafe.Pointer(dev), C.int(w), C.int(h),
-		C.int(fps), C.int(kbps), C.int(gop), &hr)
+		C.int(fps), C.int(kbps), C.int(gop), &hr, &stage)
 	if handle == nil {
-		return nil, fmt.Errorf("native H264 MFT create: hr=0x%08x", uint32(hr))
+		return nil, fmt.Errorf("native H264 MFT create: stage=%d hr=0x%08x", int(stage), uint32(hr))
 	}
 	// Один AU H264 заведомо меньше несжатого кадра — берём его как потолок буфера.
 	return &nativeEncoder{h: handle, out: make([]byte, w*h*3/2)}, nil
