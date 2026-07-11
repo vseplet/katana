@@ -13,6 +13,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -411,6 +412,7 @@ type hub struct {
 	peers      map[string]*peer
 	stopTimer  *time.Timer // отложенная остановка захвата при 0 зрителей (grace)
 	lastKeyReq time.Time   // дебаунс форса keyframe по PLI (keyframe дорог)
+	keySuppressed int      // PLI, подавленные дебаунсом с прошлого форса (диагностика шторма)
 	autoBitrate bool       // адаптивный битрейт включён (по запросу зрителя)
 	curBitrate  int        // текущий битрейт энкодера, kbps (для адаптации)
 	maxBitrate  int        // потолок адаптации = целевой битрейт настроек, kbps
@@ -1001,19 +1003,33 @@ func (h *hub) broadcastState() {
 
 // requestKeyframe форсит keyframe общего энкодера в ответ на PLI зрителя —
 // зритель дропает накопленный буфер и прыгает к свежему кадру (догоняет live).
-// Дебаунс: keyframe дорог, а PLI при потере приходят пачкой (и от нескольких
-// зрителей сразу — но keyframe общий, одного достаточно всем).
+//
+// Дебаунс 1с — защита от IDR-шторма: на WAN (~300мс) зритель шлёт следующий PLI
+// раньше, чем долетит и декодируется IDR от предыдущего; при коротком дебаунсе
+// каждый PLI рождает новый жирный IDR в уже забитый канал — спираль (в native out
+// видна горбами 4400+ kbps над потолком CBR). Один IDR в секунду успевает дойти
+// и разорвать петлю. Keyframe общий — одного достаточно всем зрителям.
 func (h *hub) requestKeyframe() {
+	debounce := time.Second
+	if v := os.Getenv("KATANA_KEYFRAME_DEBOUNCE_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 10000 {
+			debounce = time.Duration(n) * time.Millisecond
+		}
+	}
 	h.mu.Lock()
 	now := time.Now()
-	if !h.lastKeyReq.IsZero() && now.Sub(h.lastKeyReq) < 400*time.Millisecond {
+	if !h.lastKeyReq.IsZero() && now.Sub(h.lastKeyReq) < debounce {
+		h.keySuppressed++
 		h.mu.Unlock()
 		return
 	}
 	h.lastKeyReq = now
+	suppressed := h.keySuppressed
+	h.keySuppressed = 0
 	str := h.str
 	h.mu.Unlock()
 	if str != nil {
+		log.Printf("signaling: keyframe forced (PLI/join), подавлено дебаунсом с прошлого: %d", suppressed)
 		str.requestKeyframe()
 	}
 }
@@ -1065,10 +1081,12 @@ func (h *hub) onLoss(lost float64) {
 		cur = h.maxBitrate
 	}
 	changed := cur != h.curBitrate
+	prev := h.curBitrate
 	h.curBitrate = cur
 	str := h.str
 	h.mu.Unlock()
 	if changed && str != nil {
+		log.Printf("signaling: AIMD loss=%.1f%% bitrate %d→%d kbps", lost*100, prev, cur)
 		str.setBitrateKbps(cur)
 	}
 }
