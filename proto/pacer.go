@@ -132,14 +132,32 @@ func (w *pacedWriter) Write(header *rtp.Header, payload []byte, attrs intercepto
 // сразу (без добавленной задержки); залп кадра размазывается ровно до rate.
 func (w *pacedWriter) loop() {
 	var next time.Time
+	// Диагностика: раз в ~5с — фактический слив, пик очереди и суммарное время сна.
+	// Если drain-kbps заметно НИЖЕ битрейта энкодера или очередь постоянно глубокая —
+	// пейсер душит поток (например, из-за грубых таймеров) и сам создаёт фризы.
+	var dBytes, dPkts, dQmax int
+	var dSleep time.Duration
+	dStat := time.Now()
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
 	for {
 		select {
 		case <-w.closed:
 			return
+		case <-tick.C:
+			el := time.Since(dStat)
+			log.Printf("pacer: 5с drain=%d kbps (%d пкт), очередь max=%d/%d, сон=%dмс",
+				int(float64(dBytes)*8/1000/el.Seconds()), dPkts, dQmax, pacedQueue,
+				int(dSleep.Milliseconds()))
+			dBytes, dPkts, dQmax, dSleep, dStat = 0, 0, 0, 0, time.Now()
 		case pkt := <-w.ch:
+			if q := len(w.ch); q > dQmax {
+				dQmax = q
+			}
 			now := time.Now()
 			if next.After(now) {
 				time.Sleep(next.Sub(now))
+				dSleep += time.Since(now)
 			} else {
 				next = now
 			}
@@ -150,6 +168,8 @@ func (w *pacedWriter) loop() {
 			}
 			size := pkt.hdr.MarshalSize() + len(pkt.payload)
 			next = next.Add(time.Duration(size*8) * time.Second / time.Duration(bps))
+			dBytes += size
+			dPkts++
 		}
 	}
 }

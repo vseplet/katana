@@ -419,6 +419,7 @@ type hub struct {
 	maxBitrate  int        // потолок адаптации = целевой битрейт настроек, kbps
 	lastBrAdj   time.Time  // дебаунс шага адаптации битрейта
 	cleanTicks  int        // подряд тиков без потерь (для осторожного подъёма)
+	lastLossLog time.Time  // троттлинг диагностического лога RR-потерь
 
 	srcMu sync.Mutex   // защищает геометрию источника (для координат мыши)
 	rect  capture.Rect // глобальный прямоугольник общего источника
@@ -1065,6 +1066,13 @@ func (h *hub) requestKeyframe() {
 // включённом autoBitrate; дебаунс ~1с (RR приходят примерно раз в секунду).
 func (h *hub) onLoss(lost float64) {
 	h.mu.Lock()
+	// Диагностика: заметные потери логируем ВСЕГДА, даже при выключенном
+	// автобитрейте — иначе при фиксированном битрейте RR-потери невидимы в логе
+	// и сеть невозможно отличить от проблем захвата/энкода.
+	if lost >= 0.05 && time.Since(h.lastLossLog) >= 2*time.Second {
+		h.lastLossLog = time.Now()
+		log.Printf("signaling: RR loss=%.1f%% (autoBitrate=%v)", lost*100, h.autoBitrate)
+	}
 	if !h.autoBitrate || h.str == nil {
 		h.mu.Unlock()
 		return

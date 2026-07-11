@@ -124,8 +124,22 @@ func (s *streamer) applyReconfigure(opts capture.Options) error {
 		defer wg.Done()
 		var n int
 		var loggedErr bool
+		// Диагностика третьей ступени конвейера (capture → encode → WriteSample):
+		// частота записи в трек и максимальная блокировка WriteSample за окно.
+		// Если WriteSample/с проседает при здоровом encode — затор в pion/пейсере.
+		var wsN, wsBad int
+		var wsMaxBlock time.Duration
+		wsStat := time.Now()
 		for frame := range stream.Video {
-			if err := s.track.WriteSample(media.Sample{Data: frame, Duration: frameDur}); err != nil {
+			if !validAU(frame) {
+				wsBad++
+			}
+			t0 := time.Now()
+			err := s.track.WriteSample(media.Sample{Data: frame, Duration: frameDur})
+			if d := time.Since(t0); d > wsMaxBlock {
+				wsMaxBlock = d
+			}
+			if err != nil {
 				// Не выходим на транзиентной ошибке (иначе видео встанет навсегда):
 				// логируем один раз и продолжаем, восстановимся на кейфрейме.
 				if !loggedErr {
@@ -137,6 +151,12 @@ func (s *streamer) applyReconfigure(opts capture.Options) error {
 			n++
 			if n == 1 {
 				log.Printf("webrtc: first frame on track")
+			}
+			wsN++
+			if el := time.Since(wsStat); el >= 2*time.Second {
+				log.Printf("webrtc: 2с writeSample=%d/с maxBlock=%.0fмс badAU=%d",
+					int(float64(wsN)/el.Seconds()), wsMaxBlock.Seconds()*1000, wsBad)
+				wsN, wsBad, wsMaxBlock, wsStat = 0, 0, 0, time.Now()
 			}
 		}
 	}()
@@ -252,4 +272,39 @@ func readRTCP(sender *webrtc.RTPSender, onPLI func(), onLoss func(lost float64))
 			}
 		}
 	}
+}
+
+// validAU — диагностика целостности H264 Access Unit перед WriteSample (см.
+// webrtc: 2с ... badAU=N). Валидный AU: начинается со старт-кода Annex-B и несёт
+// РОВНО ОДИН видеокадр (один VCL NAL с first_mb_in_slice==0; NAL типов 1/5 может
+// быть несколько — мультислайс, но старт кадра один). badAU>0 = кадры режутся по
+// NAL или склеиваются — pion-пакетизатор при этом портит поток для декодера.
+func validAU(au []byte) bool {
+	frameStarts := 0
+	n := len(au)
+	for i := 0; i+3 < n; {
+		// ищем старт-код 00 00 01 (с опциональным ведущим 00)
+		if au[i] == 0 && au[i+1] == 0 && au[i+2] == 1 {
+			hdr := i + 3
+			if hdr >= n {
+				break
+			}
+			if i == 0 || (i >= 1 && au[i-1] == 0) || i == 1 {
+				// ок: 3- или 4-байтовый старт-код
+			}
+			nalType := au[hdr] & 0x1F
+			if nalType == 1 || nalType == 5 { // VCL slice
+				if hdr+1 < n && au[hdr+1]&0x80 != 0 { // ue(v): first_mb_in_slice==0
+					frameStarts++
+				}
+			}
+			i = hdr + 1
+			continue
+		}
+		i++
+	}
+	// старт-код в начале обязателен
+	hasLead := n > 4 && ((au[0] == 0 && au[1] == 0 && au[2] == 1) ||
+		(au[0] == 0 && au[1] == 0 && au[2] == 0 && au[3] == 1))
+	return hasLead && frameStarts == 1
 }

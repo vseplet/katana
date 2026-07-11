@@ -85,6 +85,10 @@ func readH264(ctx context.Context, in io.Reader, frames chan []byte, dropLate bo
 	}
 }
 
+// droppedAUs — счётчик дропнутых AU (диагностика; pushFrame зовётся из одной
+// горутины на поток, гонки по счётчику терпимы для лога).
+var droppedAUs int64
+
 // pushFrame отправляет кадр в канал. При dropLate, если буфер полон, выкидывает
 // самый старый кадр и кладёт свежий (потребитель всегда видит актуальное);
 // иначе — блокирует (backpressure). Возвращает false, если ctx отменён.
@@ -98,8 +102,12 @@ func pushFrame(ctx context.Context, frames chan []byte, frame []byte, dropLate b
 				return false
 			default:
 				// Буфер полон — выкидываем самый старый кадр и пробуем снова.
+				// Диагностика: дроп AU рвёт ссылочную цепочку H264 — у зрителя
+				// это фриз до ближайшего кейфрейма. Логируем каждый.
 				select {
 				case <-frames:
+					droppedAUs++
+					log.Printf("capture: ДРОП AU — потребитель не успевает (всего %d)", droppedAUs)
 				default:
 				}
 			}

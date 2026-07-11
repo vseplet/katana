@@ -268,6 +268,7 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 	var convDur time.Duration
 	var nextEmit time.Time  // дедлайн следующего эмита (единая каденция целевого fps)
 	var lastEmitAt time.Time // wall-время прошлого эмита — ловим разрывы (0 fps)
+	var lastRealAt time.Time // wall-время последнего СВЕЖЕГО кадра WGC (диагностика голодания)
 
 	// emit кодирует текущий nv12 и шлёт access unit'ы. false → ctx отменён, выходим.
 	emit := func() bool {
@@ -386,6 +387,15 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		if gotNew {
 			nReal++
 			sumConv += convDur
+			// Диагностика WGC-голодания: свежий кадр после долгой паузы. На статике
+			// пауза законна (WGC не шлёт без изменений), но если в этот момент на
+			// экране было движение — источник фриза найден: захват, а не сеть.
+			if !lastRealAt.IsZero() {
+				if gap := now.Sub(lastRealAt); gap > time.Second {
+					log.Printf("capture: WGC пауза свежих кадров %.1fс закончилась (шли повторы)", gap.Seconds())
+				}
+			}
+			lastRealAt = now
 		} else {
 			nFill++
 		}
@@ -409,6 +419,10 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		}
 
 		if el := time.Since(statT); el >= 2*time.Second {
+			// Всегда-включённая короткая строка: сколько из эмитнутых кадров были
+			// свежими от WGC, а сколько — CFR-повторами. real≈0 при движении на
+			// экране = фриз происходит в захвате (маскируется филлером под 60fps).
+			log.Printf("capture: 2с real=%d fill=%d", nReal, nFill)
 			if debugCapture() {
 				cv := 0.0
 				if nReal > 0 {
