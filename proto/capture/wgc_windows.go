@@ -266,7 +266,7 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 
 	var haveNV12 bool // получен хотя бы один кадр (есть что кодировать/повторять)
 	var convDur time.Duration
-	var nextFill time.Time // дедлайн следующего CFR-повтора при простое
+	var nextEmit time.Time // дедлайн следующего эмита (единая каденция целевого fps)
 
 	// emit кодирует текущий nv12 и шлёт access unit'ы. false → ctx отменён, выходим.
 	emit := func() bool {
@@ -321,7 +321,13 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		case <-pollTicker.C:
 		}
 
-		// Забираем самый свежий кадр WGC (если есть) и конвертируем в nv12.
+		// Единая каденция целевого fps: эмитим не чаще frameDur. Поллим быстрее (fps*4),
+		// чтобы поймать свежий кадр близко к дедлайну, но захват/конверт и эмит делаем
+		// только когда «пора» — иначе 60fps-источник давал бы 60fps даже при цели 30fps
+		// (и лишняя GPU/CPU-работа зря грузила бы конвейер).
+		now := time.Now()
+		due := nextEmit.IsZero() || !now.Before(nextEmit)
+
 		convDur = 0
 		gotNew := false
 		if frame := latestFrame(pool); frame != 0 {
@@ -332,9 +338,10 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 				if staging == 0 {
 					s.firstFrameSetup(tex, dev, opts, fps, kbps, &staging, &nv12, &srcW, &srcH, &dstW, &dstH)
 				}
-				if staging != 0 && s.zeroCopy {
+				// Захват/конверт — только если пора эмитить (кэп по fps + экономия GPU/CPU).
+				if staging != 0 && due && s.zeroCopy {
 					// Zero-copy: забираем кадр в текстуру энкодера (GPU-to-GPU, без CPU).
-					// Кодируем позже в emit — поэтому copy делаем, пока tex ещё жива.
+					// Кодируем ниже в emit — поэтому copy делаем, пока tex ещё жива.
 					tc := time.Now()
 					if err := s.nativeEnc.captureTexture(tex); err == nil {
 						haveNV12 = true
@@ -343,7 +350,7 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 					} else if debugCapture() {
 						log.Printf("wgc: zero-copy capture: %v", err)
 					}
-				} else if staging != 0 {
+				} else if staging != 0 && due {
 					tc := time.Now()
 					if data, rowPitch, unmap, merr := mapStaging(devCtx, staging, tex); merr == nil {
 						// Кадр валиден только при ненулевых pitch/размерах и достаточном
@@ -369,30 +376,27 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 			comRelease(frame)
 		}
 
-		if !haveNV12 {
-			continue // первого кадра ещё не было — кодировать нечего
+		if !haveNV12 || !due {
+			continue // первого кадра ещё не было / ещё не пора эмитить
 		}
 
-		now := time.Now()
-		switch {
-		case gotNew:
-			// Реальный кадр — эмитим немедленно (без сетки → нет биений на движении).
+		// Пора: эмитим свежий кадр (gotNew) или повтор последнего (простой) — держим
+		// целевой fps и ровные RTP-часы.
+		if gotNew {
 			nReal++
 			sumConv += convDur
-			if !emit() {
-				return
-			}
-			nextFill = now.Add(frameDur) // реальный кадр сдвигает дедлайн заполнения
-		case now.After(nextFill):
-			// Простой/сталл — держим fps повтором (RTP идёт в ногу с реальным временем).
+		} else {
 			nFill++
-			if !emit() {
-				return
-			}
-			nextFill = nextFill.Add(frameDur)
-			if now.Sub(nextFill) > frameDur {
-				nextFill = now.Add(frameDur) // не копим долг после долгой паузы
-			}
+		}
+		if !emit() {
+			return
+		}
+		if nextEmit.IsZero() {
+			nextEmit = now
+		}
+		nextEmit = nextEmit.Add(frameDur)
+		if now.Sub(nextEmit) > frameDur {
+			nextEmit = now.Add(frameDur) // не копим долг после долгой паузы
 		}
 
 		if el := time.Since(statT); el >= 2*time.Second {
