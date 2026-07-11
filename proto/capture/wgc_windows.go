@@ -266,7 +266,8 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 
 	var haveNV12 bool // получен хотя бы один кадр (есть что кодировать/повторять)
 	var convDur time.Duration
-	var nextEmit time.Time // дедлайн следующего эмита (единая каденция целевого fps)
+	var nextEmit time.Time  // дедлайн следующего эмита (единая каденция целевого fps)
+	var lastEmitAt time.Time // wall-время прошлого эмита — ловим разрывы (0 fps)
 
 	// emit кодирует текущий nv12 и шлёт access unit'ы. false → ctx отменён, выходим.
 	emit := func() bool {
@@ -388,6 +389,14 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		} else {
 			nFill++
 		}
+		// Разрыв каденции = затык захвата/подачи (emit блокнулся на локе энкодера).
+		if !lastEmitAt.IsZero() {
+			if gap := now.Sub(lastEmitAt); gap > 4*frameDur {
+				log.Printf("capture: emit gap %.0fмс (свежий кадр=%v) — затык захвата/подачи",
+					gap.Seconds()*1000, gotNew)
+			}
+		}
+		lastEmitAt = now
 		if !emit() {
 			return
 		}

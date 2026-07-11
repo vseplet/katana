@@ -67,6 +67,9 @@ func (e *nativeEncoder) pollLoop() {
 	// Диагностика реального битрейта/частоты вывода — держит ли MFT CBR.
 	var winBytes, winAUs int
 	winStart := time.Now()
+	// Вахтенный на выход: ловим САМ момент затыка (0 fps), а не усреднение раз в 2с.
+	lastAU := time.Now()
+	stalled := false
 	for {
 		select {
 		case <-e.done:
@@ -87,9 +90,20 @@ func (e *nativeEncoder) pollLoop() {
 			continue
 		}
 		if n <= 0 {
+			if !stalled && time.Since(lastAU) > 400*time.Millisecond {
+				stalled = true
+				log.Printf("capture: native output STALLED — нет AU уже %.0fмс (энкодер встал)",
+					time.Since(lastAU).Seconds()*1000)
+			}
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}
+		if stalled {
+			log.Printf("capture: native output resumed после простоя %.0fмс",
+				time.Since(lastAU).Seconds()*1000)
+			stalled = false
+		}
+		lastAU = time.Now()
 		if !logged {
 			logged = true
 			m := n
