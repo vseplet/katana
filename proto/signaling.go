@@ -73,6 +73,27 @@ type signalMessage struct {
 	Owner   string        `json:"owner,omitempty"`
 	Plan    string        `json:"plan,omitempty"`
 	Viewers []viewerCount `json:"viewers,omitempty"`
+	// Присутствие курсоров зрителей ("multiplayer cursors"):
+	//   "vcursor" (зритель → хост): позиция СВОЕГО указателя над видео (Mouse.X/Y,
+	//   норм. [0,1]); Gone=true — указатель ушёл с видео. НЕ двигает OS-курсор хоста,
+	//   хост лишь складывает по vid.
+	//   "peers" (хост → зритель): позиции указателей ОСТАЛЬНЫХ зрителей (Cursors) —
+	//   каждый рисует их поверх видео. Рассылается низкочастотно, вьювер сглаживает
+	//   движение интерполяцией.
+	Gone    bool         `json:"gone,omitempty"`
+	Cursors []peerCursor `json:"cursors,omitempty"`
+	// Name — ник зрителя для подписи его курсора ("vcursorname", шлётся один раз).
+	Name string `json:"name,omitempty"`
+}
+
+// peerCursor — позиция указателя одного зрителя для рисования у остальных.
+// X/Y нормализованы [0,1] к содержимому видео (одинаковы у всех зрителей).
+type peerCursor struct {
+	ID    string  `json:"id"`   // vid зрителя (стабильный ключ для интерполяции)
+	X     float64 `json:"x"`
+	Y     float64 `json:"y"`
+	Color string  `json:"color"`          // цвет иконки (детерминированно из vid)
+	Name  string  `json:"name,omitempty"` // ник зрителя для подписи (если прислал)
 }
 
 // viewerCount — один пользователь-зритель и число его открытых вкладок (views).
@@ -423,6 +444,14 @@ type peer struct {
 	inputDC          *webrtc.DataChannel // канал ввода (для отчёта позиции курсора)
 	lastCursorReport time.Time           // троттлинг cursorpos
 	cursorTimer      *time.Timer         // трейлинг: дослать финальную позицию после остановки
+
+	// Позиция СВОЕГО указателя этого зрителя над видео (norm. [0,1]) — для рисования
+	// у остальных зрителей. Обновляется из "vcursor", НЕ двигает OS-курсор. Под hub.mu.
+	vcX, vcY float64
+	vcTS     time.Time // время последнего vcursor (для отсева протухших)
+	vcActive bool      // указатель сейчас над видео (Gone=false)
+	vcName   string    // ник для подписи курсора (из "vcursorname", один раз)
+	hadPeers bool      // в прошлую рассылку этому зрителю ушёл непустой "peers" (для гейта)
 }
 
 // serveHub ведёт хост-узел поверх готового WS-соединения с брокером.
@@ -485,8 +514,109 @@ func serveHub(parent context.Context, conn *websocket.Conn, enc capture.CaptureE
 		}
 	}()
 
+	// Рассылка курсоров зрителей друг другу (тип "peers"). Низкочастотно (10/с) —
+	// вьювер сглаживает движение интерполяцией, поэтому частить незачем.
+	go func() {
+		t := time.NewTicker(100 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				h.broadcastCursors()
+			}
+		}
+	}()
+
 	h.readLoop()
 	return h.reject, h.rejectReason
+}
+
+// cursorPalette — различимые цвета для курсоров зрителей (детерминированно по vid).
+var cursorPalette = []string{
+	"#e5484d", "#4589ff", "#30a46c", "#f76b15",
+	"#8e4ec6", "#e2a336", "#e93d82", "#00a2c7",
+}
+
+// cursorColor детерминированно выбирает цвет из палитры по id (FNV-1a).
+func cursorColor(id string) string {
+	var hsh uint32 = 2166136261
+	for i := 0; i < len(id); i++ {
+		hsh = (hsh ^ uint32(id[i])) * 16777619
+	}
+	return cursorPalette[hsh%uint32(len(cursorPalette))]
+}
+
+// cursorState — снимок присутствия одного зрителя для расчёта рассылки.
+type cursorState struct {
+	id       string
+	active   bool // указатель над видео (vcActive)
+	ts       time.Time
+	x, y     float64
+	name     string
+	hadPeers bool // в прошлую рассылку этому зрителю ушёл непустой список
+}
+
+// planCursorBroadcast — ЧИСТОЕ решение «кому что слать» (без сети, тестируемо).
+// Каждому зрителю — курсоры ОСТАЛЬНЫХ активных и не протухших (>1с). В карте send
+// присутствуют только те, кому реально надо слать: пустой список шлём один раз
+// после того, как курсоры пропали (гейт hadPeers), чтобы вьювер убрал иконки, но
+// не спамить пустотой в простое. had — новое значение hadPeers по id.
+func planCursorBroadcast(states []cursorState, now time.Time) (send map[string][]peerCursor, had map[string]bool) {
+	live := make([]peerCursor, 0, len(states))
+	for _, s := range states {
+		if s.active && now.Sub(s.ts) <= time.Second {
+			live = append(live, peerCursor{ID: s.id, X: s.x, Y: s.y, Color: cursorColor(s.id), Name: s.name})
+		}
+	}
+	send = map[string][]peerCursor{}
+	had = map[string]bool{}
+	for _, dst := range states {
+		cs := make([]peerCursor, 0, len(live))
+		for _, c := range live {
+			if c.ID != dst.id {
+				cs = append(cs, c)
+			}
+		}
+		had[dst.id] = len(cs) > 0
+		if len(cs) == 0 && !dst.hadPeers {
+			continue // нечего слать и в прошлый раз тоже — молчим
+		}
+		send[dst.id] = cs
+	}
+	return send, had
+}
+
+// broadcastCursors рассылает каждому зрителю позиции указателей ОСТАЛЬНЫХ зрителей
+// (тип "peers"). Логику «кому что» считает planCursorBroadcast; здесь — снимок под
+// локом и собственно отправка по inputDC.
+func (h *hub) broadcastCursors() {
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	states := make([]cursorState, 0, len(h.peers))
+	for pid, p := range h.peers {
+		if p.inputDC == nil {
+			continue // без канала слать некуда и учитывать в рассылке незачем
+		}
+		states = append(states, cursorState{
+			id: pid, active: p.vcActive, ts: p.vcTS, x: p.vcX, y: p.vcY, name: p.vcName, hadPeers: p.hadPeers,
+		})
+	}
+	send, had := planCursorBroadcast(states, now)
+	for pid, p := range h.peers {
+		if _, ok := had[pid]; ok {
+			p.hadPeers = had[pid]
+		}
+		cs, ok := send[pid]
+		if !ok || p.inputDC == nil {
+			continue
+		}
+		if b, err := json.Marshal(signalMessage{Type: "peers", Cursors: cs}); err == nil {
+			_ = p.inputDC.SendText(string(b))
+		}
+	}
 }
 
 // send сериализует сообщение (с проставленным pid) и пишет его в общий WS.
@@ -1219,6 +1349,28 @@ func (p *peer) dispatchInput(msg *signalMessage) {
 			}
 			p.handleMouse(msg.Mouse)
 		}
+	case "vcursor":
+		// Позиция СОБСТВЕННОГО указателя зрителя над видео — только запоминаем для
+		// рассылки остальным (broadcastCursors). OS-курсор хоста НЕ трогаем.
+		p.h.mu.Lock()
+		if msg.Gone || msg.Mouse == nil {
+			p.vcActive = false
+		} else {
+			p.vcX, p.vcY = clampF(msg.Mouse.X), clampF(msg.Mouse.Y)
+			p.vcTS = time.Now()
+			p.vcActive = true
+		}
+		p.h.mu.Unlock()
+	case "vcursorname":
+		// Ник зрителя для подписи его курсора у остальных (шлётся один раз). Режем
+		// длину — это чужой ввод, попадёт в UI других зрителей.
+		name := msg.Name
+		if len(name) > 32 {
+			name = name[:32]
+		}
+		p.h.mu.Lock()
+		p.vcName = name
+		p.h.mu.Unlock()
 	case "scroll":
 		if msg.Scroll != nil {
 			scrollMouse(msg.Scroll.Dx, msg.Scroll.Dy)
