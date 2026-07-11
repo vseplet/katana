@@ -413,6 +413,7 @@ type hub struct {
 	stopTimer  *time.Timer // отложенная остановка захвата при 0 зрителей (grace)
 	lastKeyReq time.Time   // дебаунс форса keyframe по PLI (keyframe дорог)
 	keySuppressed int      // PLI, подавленные дебаунсом с прошлого форса (диагностика шторма)
+	lastStormCut  time.Time // дебаунс принудительного среза битрейта при PLI-шторме
 	autoBitrate bool       // адаптивный битрейт включён (по запросу зрителя)
 	curBitrate  int        // текущий битрейт энкодера, kbps (для адаптации)
 	maxBitrate  int        // потолок адаптации = целевой битрейт настроек, kbps
@@ -1027,9 +1028,33 @@ func (h *hub) requestKeyframe() {
 	suppressed := h.keySuppressed
 	h.keySuppressed = 0
 	str := h.str
+
+	// PLI-шторм (повторные PLI при чистых RR) = затор очереди на бутылочном
+	// горлышке (bufferbloat): пакеты уже НЕ теряются, но едут с многосекундной
+	// задержкой — зритель стоит, а RR-петля видит loss=0% и даже поднимает битрейт.
+	// Единственный надёжный сигнал затора здесь — сами повторные PLI: режем битрейт
+	// мультипликативно, чтобы очередь стекла быстрее (не чаще раза в 3с).
+	stormCut := 0
+	if h.autoBitrate && suppressed >= 3 &&
+		(h.lastStormCut.IsZero() || now.Sub(h.lastStormCut) >= 3*time.Second) {
+		cur := h.curBitrate
+		if cur <= 0 {
+			cur = h.maxBitrate
+		}
+		if cut := cur * 4 / 5; cut >= 200 && cut != cur {
+			h.lastStormCut = now
+			h.curBitrate = cut
+			h.cleanTicks = 0
+			stormCut = cut
+		}
+	}
 	h.mu.Unlock()
 	if str != nil {
 		log.Printf("signaling: keyframe forced (PLI/join), подавлено дебаунсом с прошлого: %d", suppressed)
+		if stormCut > 0 {
+			log.Printf("signaling: PLI-шторм → срез битрейта до %d kbps (разгружаем очередь)", stormCut)
+			str.setBitrateKbps(stormCut)
+		}
 		str.requestKeyframe()
 	}
 }
@@ -1066,6 +1091,13 @@ func (h *hub) onLoss(lost float64) {
 		cur = cur * 4 / 5
 		h.cleanTicks = 0
 	case lost < 0.02: // чисто — копим уверенность, поднимаем не сразу
+		// «Чистые» RR при недавних PLI — ловушка: во время стекания затора пакеты
+		// уже не теряются (loss=0%), но зритель ещё стоит и шлёт PLI. Поднимать
+		// битрейт в этот момент = продлевать сталл. Пока идут PLI — не растём.
+		if !h.lastKeyReq.IsZero() && now.Sub(h.lastKeyReq) < 3*time.Second {
+			h.cleanTicks = 0
+			break
+		}
 		h.cleanTicks++
 		if h.cleanTicks >= 3 { // ~3с подряд без потерь
 			cur += 150
