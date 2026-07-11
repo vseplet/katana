@@ -446,10 +446,17 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 	// In-process нативный энкодер (сборка winnative): аппаратный H264 MFT на ТОМ ЖЕ
 	// D3D11-устройстве, что и захват — общий GPU-контекст, без ffmpeg-подпроцесса и
 	// второго девайса. В обычной сборке newNativePreferredEncoder возвращает ok=false.
-	// GOP практически бесконечный: провалы совпадали с интервалом IDR — периодические
-	// принудительные кейфреймы для low-latency экрана не нужны. Кейфреймы строго по
-	// требованию через PLI (forceKeyframe) при заходе зрителя/потере пакетов.
-	if ne, ok := newNativePreferredEncoder(s.ctx, s.frames, dev, *dstW, *dstH, fps, kbps, fps*300, opts.DropLate); ok {
+	// GOP по умолчанию практически бесконечный (кейфреймы только по PLI), но
+	// настраивается через KATANA_GOP_SEC: мак-схема (=1, плановый keyframe каждую
+	// секунду) самозалечивается после потерь без PLI-штормов — сравнивать без пересборки.
+	gopSec := 300
+	if v := os.Getenv("KATANA_GOP_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 3600 {
+			gopSec = n
+			log.Printf("capture: GOP переопределён: %dс (KATANA_GOP_SEC)", n)
+		}
+	}
+	if ne, ok := newNativePreferredEncoder(s.ctx, s.frames, dev, *dstW, *dstH, fps, kbps, fps*gopSec, opts.DropLate); ok {
 		// Zero-copy: GPU-конверт BGRA→NV12 (VideoProcessor) под размер кадра захвата.
 		// Не вышло — откатимся на CPU-конвертацию (bgraToNV12 + submit байтами).
 		zc := ne.initVProc(*srcW, *srcH)

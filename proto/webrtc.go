@@ -196,6 +196,7 @@ func (s *streamer) requestKeyframe() {
 
 // setBitrateKbps меняет битрейт энкодера на лету (адаптация к сети).
 func (s *streamer) setBitrateKbps(kbps int) {
+	setPacerBitrateKbps(kbps) // пейсер держит ×2.5 текущего битрейта
 	s.mu.Lock()
 	fn := s.setBitrate
 	s.mu.Unlock()

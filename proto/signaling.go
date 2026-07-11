@@ -1134,6 +1134,7 @@ func (h *hub) applyAutoBitrateLocked(msg signalMessage) {
 	if h.curBitrate == 0 || (h.maxBitrate > 0 && h.curBitrate > h.maxBitrate) {
 		h.curBitrate = h.maxBitrate
 	}
+	setPacerBitrateKbps(h.curBitrate) // пейсер стартует от актуального битрейта
 }
 
 // parseBitrateKbps вытаскивает kbps из строки опций ("3000k", "3M", "2500").
@@ -1229,6 +1230,10 @@ var webrtcAPI = func() *webrtc.API {
 		panic(err)
 	}
 	ir := &interceptor.Registry{}
+	// Пейсер — ПЕРВЫМ (Chain оборачивает по порядку: первый = самый внутренний,
+	// ближе к сети), чтобы через него шли и NACK-ретрансмиты внешних интерсепторов.
+	// См. pacer.go: без него кадры уходят RTP-залпами и шейперы их режут.
+	ir.Add(pacerFactory{})
 	if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
 		panic(err)
 	}
