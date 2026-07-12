@@ -471,21 +471,12 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 	// D3D11-устройстве, что и захват — общий GPU-контекст, без ffmpeg-подпроцесса и
 	// второго девайса. В обычной сборке newNativePreferredEncoder возвращает ok=false.
 	//
-	// GOP = 1с, как на macOS/Linux. Раньше был почти бесконечный (кейфреймы только
-	// по PLI), но viewer-статистика доказала: при GOP=∞ даже 0.6% потерь пакетов
-	// убивают ~15 кадров подряд — ссылочная цепочка H264 рвётся, а восстановиться
-	// нечем до PLI-кейфрейма (целый round-trip). Периодический кадр каждую секунду
-	// самозалечивает потерю без ожидания PLI (ровно почему мак выживал в тех же
-	// условиях). Всплеск редкого кадра теперь сглаживает RTP-пейсер (см. pacer.go),
-	// поэтому старая грабля «периодический IDR душит канал» не возвращается.
-	// KATANA_GOP_SEC переопределяет (диагностика/подбор).
-	gopSec := 1
-	if v := os.Getenv("KATANA_GOP_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 3600 {
-			gopSec = n
-		}
-	}
-	log.Printf("capture: GOP = %dс (%d кадров)", gopSec, fps*gopSec)
+	// GOP почти бесконечный — БЕЗ периодических ключевых кадров. Фризы шли ровно с
+	// периодом GOP (каждую секунду при GOP=1с) — значит спайк на IDR и есть их
+	// источник. Убираем плановые IDR совсем; свежий кадр присылается только по запросу
+	// зрителя (PLI) при реальной потере. На чистом канале это ровный поток без спайков.
+	gopSec := 600
+	log.Printf("capture: GOP = %dс (%d кадров, кейфреймы только по PLI)", gopSec, fps*gopSec)
 	if ne, ok := newNativePreferredEncoder(s.ctx, s.frames, dev, *dstW, *dstH, fps, kbps, fps*gopSec, opts.DropLate); ok {
 		// Zero-copy: GPU-конверт BGRA→NV12 (VideoProcessor) под размер кадра захвата.
 		// Не вышло — откатимся на CPU-конвертацию (bgraToNV12 + submit байтами).
