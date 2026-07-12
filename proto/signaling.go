@@ -1085,6 +1085,23 @@ func (h *hub) applyGCCTarget() {
 		h.mu.Unlock()
 		return
 	}
+	raw := best
+	// Пол: loss-контроллер GCC на пачечных потерях этого канала кратерит оценку до
+	// своих дефолтных 100 kbps (наш SendSideBWEMinBitrate туда не доходит — quirk
+	// pion: финал = min(delay,loss), полом не клампится). Канал стабильно тянет
+	// больше, а ниже ~1500 смотреть нечего — держим пол сами. Настройка: KATANA_GCC_FLOOR.
+	floor := 1500
+	if v := os.Getenv("KATANA_GCC_FLOOR"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 200 && n <= 10000 {
+			floor = n
+		}
+	}
+	if h.maxBitrate > 0 && floor > h.maxBitrate {
+		floor = h.maxBitrate
+	}
+	if best < floor {
+		best = floor
+	}
 	if h.maxBitrate > 0 && best > h.maxBitrate {
 		best = h.maxBitrate
 	}
@@ -1097,9 +1114,7 @@ func (h *hub) applyGCCTarget() {
 	}
 	h.mu.Unlock()
 	if logNow {
-		// Реальная оценка полосы GCC — чтобы понять, перестраховывается ли он
-		// (низкий выход энкодера может быть просто от малоподвижной картинки).
-		log.Printf("signaling: GCC target=%d kbps (min всех зрителей, потолок %d)", best, h.maxBitrate)
+		log.Printf("signaling: GCC target=%d kbps (raw %d, пол %d, потолок %d)", best, raw, floor, h.maxBitrate)
 	}
 	if changed && str != nil {
 		str.setBitrateKbps(best)
