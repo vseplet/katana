@@ -65,7 +65,7 @@ func (e *nativeEncoder) pollLoop() {
 	buf := make([]byte, 1<<20) // 1 MiB под один AU; растёт при -2
 	logged := false
 	// Диагностика реального битрейта/частоты вывода — держит ли MFT CBR.
-	var winBytes, winAUs int
+	var winBytes, winAUs, winSlices int
 	winStart := time.Now()
 	// Вахтенный на выход: ловим САМ момент затыка (0 fps), а не усреднение раз в 2с.
 	lastAU := time.Now()
@@ -114,11 +114,12 @@ func (e *nativeEncoder) pollLoop() {
 		}
 		winBytes += n
 		winAUs++
+		winSlices += countVCLNALs(buf[:n]) // проверка нарезки на слайсы (устойчивость к потерям)
 		if el := time.Since(winStart); el >= 2*time.Second {
-			log.Printf("capture: native out %.0f kbps, %.0f AU/s (avg %d B/AU)",
+			log.Printf("capture: native out %.0f kbps, %.0f AU/s (avg %d B/AU, %.1f slices/frame)",
 				float64(winBytes)*8/1000/el.Seconds(), float64(winAUs)/el.Seconds(),
-				winBytes/(winAUs+1))
-			winBytes, winAUs, winStart = 0, 0, time.Now()
+				winBytes/(winAUs+1), float64(winSlices)/float64(winAUs+1))
+			winBytes, winAUs, winSlices, winStart = 0, 0, 0, time.Now()
 		}
 		au := e.withHeaders(buf[:n]) // свежий срез, безопасно отдавать в канал
 		if !pushFrame(e.ctx, e.frames, au, true) {
@@ -164,6 +165,18 @@ func prependStartCode(nal []byte) []byte {
 
 // forEachNAL разбирает Annex-B (старт-коды 00 00 01 или 00 00 00 01) и вызывает fn на
 // каждый NAL: тип (nal[0]&0x1f) и тело NAL без старт-кода.
+// countVCLNALs — число слайсов кадра (VCL-NAL: тип 1 = не-IDR, 5 = IDR). >1 значит
+// энкодер режет кадр на слайсы → потеря пакета убивает полоску, а не весь кадр.
+func countVCLNALs(au []byte) int {
+	n := 0
+	forEachNAL(au, func(t byte, _ []byte) {
+		if t == 1 || t == 5 {
+			n++
+		}
+	})
+	return n
+}
+
 func forEachNAL(b []byte, fn func(t byte, nal []byte)) {
 	type mark struct{ pos, length int }
 	var starts []mark

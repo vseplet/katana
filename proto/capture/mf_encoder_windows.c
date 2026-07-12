@@ -337,6 +337,10 @@ static const GUID k_GOPSize           = {0x95f31b26,0x95a4,0x41aa,{0x93,0x03,0x2
 static const GUID k_LowLatency        = {0x9d3ecd55,0x89e8,0x490a,{0x97,0x0a,0x0c,0x95,0x48,0xd5,0xa5,0x6e}};
 static const GUID k_ForceKeyFrame     = {0x398c1b98,0x8353,0x475a,{0x9e,0xf2,0x8f,0x26,0x5d,0x26,0x03,0x45}};
 static const GUID k_MeanBitRate       = {0xf7222374,0x2144,0x4815,{0xb5,0x50,0xa3,0x7f,0x8e,0x12,0xee,0x52}};
+// Нарезка кадра на слайсы (устойчивость к потерям: 1 потерянный пакет убивает
+// один слайс = полоску кадра, а не весь кадр → нет каскада «1 потеря → N кадров»).
+static const GUID k_SliceControlMode  = {0xe9e782ef,0x5f18,0x44c9,{0xa9,0x0b,0xe9,0xc3,0xc2,0xc4,0x66,0x98}};
+static const GUID k_SliceControlSize  = {0x92f51df3,0x07a5,0x4172,{0xae,0xfe,0xc6,0x9c,0xa3,0xb6,0x0e,0x35}};
 
 // CBR + VBV (буфер ~0.5с) + GOP + low-latency — гасит всплески битрейта на движении
 // и ключевых кадрах (иначе на WAN подскакивает латенси). Best-effort: не все
@@ -363,6 +367,14 @@ static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
     }
     v.vt = VT_BOOL; v.boolVal = VARIANT_TRUE;
     ICodecAPI_SetValue(api, &k_LowLatency, &v);
+    // Нарезка на слайсы ~по 1 MTU: одна потеря пакета убивает один слайс (полоску),
+    // а не весь кадр → нет каскада «1 потеря → N кадров». Mode=1 (лимит по битам на
+    // слайс), Size в битах. Часть AMD-драйверов может это игнорировать — проверяем по
+    // фактическому числу VCL-NAL в кадре на Go-стороне (лог "native slices/frame").
+    v.vt = VT_UI4; v.ulVal = 1;
+    ICodecAPI_SetValue(api, &k_SliceControlMode, &v);
+    v.vt = VT_UI4; v.ulVal = 10000; // ~1250 байт на слайс
+    ICodecAPI_SetValue(api, &k_SliceControlSize, &v);
     // Держим ссылку для форса ключевого кадра по PLI; релиз — в destroy.
     e->codec = api;
 }
