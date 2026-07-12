@@ -20,6 +20,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/cc"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/vseplet/katana/proto/capture"
@@ -433,6 +434,7 @@ type peer struct {
 	pc          *webrtc.PeerConnection
 	videoSender *webrtc.RTPSender
 	audioSender *webrtc.RTPSender
+	bwe         cc.BandwidthEstimator // GCC-оценщик полосы этого PC (nil вне Windows/GCC)
 
 	gotAnswer  bool                          // получили ли answer (рукопожатие завершено) — под hub.mu
 	pendingICE []webrtc.ICECandidateInit     // ICE до установки remote description — под hub.mu
@@ -1036,7 +1038,7 @@ func (h *hub) requestKeyframe() {
 	// Единственный надёжный сигнал затора здесь — сами повторные PLI: режем битрейт
 	// мультипликативно, чтобы очередь стекла быстрее (не чаще раза в 3с).
 	stormCut := 0
-	if h.autoBitrate && suppressed >= 3 &&
+	if !gccEnabled() && h.autoBitrate && suppressed >= 3 &&
 		(h.lastStormCut.IsZero() || now.Sub(h.lastStormCut) >= 3*time.Second) {
 		cur := h.curBitrate
 		if cur <= 0 {
@@ -1060,10 +1062,45 @@ func (h *hub) requestKeyframe() {
 	}
 }
 
+// applyGCCTarget гонит битрейт энкодера по оценке GCC. Битрейт = МИНИМУМ оценок всех
+// живых зрителей (общий энкодер обслуживает худший канал), обрезан потолком настроек.
+// Дёргается из колбэка OnTargetBitrateChange (поток интерсептора) → лочим h.mu сами.
+func (h *hub) applyGCCTarget() {
+	h.mu.Lock()
+	best := 0
+	for _, pr := range h.peers {
+		if pr.bwe == nil {
+			continue
+		}
+		t := pr.bwe.GetTargetBitrate() / 1000 // → kbps
+		if t <= 0 {
+			continue
+		}
+		if best == 0 || t < best {
+			best = t
+		}
+	}
+	if best <= 0 {
+		h.mu.Unlock()
+		return
+	}
+	if h.maxBitrate > 0 && best > h.maxBitrate {
+		best = h.maxBitrate
+	}
+	changed := best != h.curBitrate
+	h.curBitrate = best
+	str := h.str
+	h.mu.Unlock()
+	if changed && str != nil {
+		str.setBitrateKbps(best)
+	}
+}
+
 // onLoss — адаптивный битрейт (AIMD) по доле потерь из ReceiverReport. Растут
 // потери → мультипликативно снижаем (быстро уступаем дорогу), чисто → аддитивно
 // поднимаем (осторожно пробуем выше) до потолка настроек. Срабатывает только при
 // включённом autoBitrate; дебаунс ~1с (RR приходят примерно раз в секунду).
+// При GCC не используется (см. ранний return внутри) — битрейт гонит applyGCCTarget.
 func (h *hub) onLoss(lost float64) {
 	h.mu.Lock()
 	// Диагностика: заметные потери логируем ВСЕГДА, даже при выключенном
@@ -1072,6 +1109,12 @@ func (h *hub) onLoss(lost float64) {
 	if lost >= 0.05 && time.Since(h.lastLossLog) >= 2*time.Second {
 		h.lastLossLog = time.Now()
 		log.Printf("signaling: RR loss=%.1f%% (autoBitrate=%v)", lost*100, h.autoBitrate)
+	}
+	// При GCC битрейт гонит delay-based BWE (см. applyGCCTarget), а не наш loss-based
+	// AIMD — они бы дрались. RR-потери оставляем только для лога выше.
+	if gccEnabled() {
+		h.mu.Unlock()
+		return
 	}
 	if !h.autoBitrate || h.str == nil {
 		h.mu.Unlock()
@@ -1247,6 +1290,12 @@ func newSharedTracks(opts capture.Options) (*webrtc.TrackLocalStaticSample, *web
 // Голый webrtc.NewPeerConnection ставит кодеки, но НЕ интерсепторы (в SDP rtx/nack
 // есть, а по факту ретрансляции нет — и в GetStats нет OutboundRTPStreamStats).
 var webrtcAPI = func() *webrtc.API {
+	// Windows: настоящий GCC (delay-based BWE + пейсер + TWCC) вместо самопального
+	// AIMD. См. congestion.go. Откат: KATANA_NO_GCC=1. mac/linux — прежний путь ниже.
+	if gccEnabled() {
+		log.Printf("webrtc: конгешн-контроль — GCC (delay-based BWE + пейсер + TWCC)")
+		return newGCCAPI()
+	}
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		panic(err)
@@ -1279,6 +1328,19 @@ func (p *peer) buildLocked() error {
 		return fmt.Errorf("new peer connection: %w", err)
 	}
 	p.pc = pc
+
+	// GCC: забираем BWE-оценщик этого PC (cc-интерсептор кладёт его в канал при
+	// создании PC). Его оценка полосы гонит битрейт энкодера (см. applyGCCTarget),
+	// а его leaky-bucket пейсер ровняет отправку. Вызов под h.mu → корреляция с PC.
+	if gccEnabled() {
+		select {
+		case est := <-gccEstimators:
+			p.bwe = est
+			est.OnTargetBitrateChange(func(int) { h.applyGCCTarget() })
+		case <-time.After(300 * time.Millisecond):
+			log.Printf("gcc: оценщик для %s не пришёл (битрейт погонит другой зритель)", p.pid)
+		}
+	}
 
 	vsender, err := pc.AddTrack(h.vtrack)
 	if err != nil {
