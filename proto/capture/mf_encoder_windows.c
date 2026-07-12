@@ -356,10 +356,14 @@ static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
     v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000;
     ICodecAPI_SetValue(api, &k_MeanBitRate, &v); // часть AMF-драйверов таргетит именно его
     ICodecAPI_SetValue(api, &k_MaxBitRate, &v);
-    // Малый VBV (~2 кадра): большой буфер разрешает жирный кейфрейм-спайк раз в GOP —
-    // именно он даёт периодический overload. Держим стоимость кадра близко к средней.
-    int fps = e->fps > 0 ? e->fps : 30;
-    v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000 * 2 / fps;
+    // VBV ~1 секунда. Раньше был ~2 кадра — это заставляло энкодер держать КАЖДЫЙ
+    // кадр крошечным, и на сложной картинке (движение) шло жёсткое квантование → мыло/
+    // блоки даже на локалке без потерь. Нормальный буфер даёт энкодеру распределять
+    // биты и держать качество. Настройка: KATANA_VBV_MS (миллисекунды).
+    int vbv_ms = 1000;
+    const char *vbv_env = getenv("KATANA_VBV_MS");
+    if (vbv_env) { int m = atoi(vbv_env); if (m >= 30 && m <= 5000) vbv_ms = m; }
+    v.vt = VT_UI4; v.ulVal = (ULONG)((long long)bitrate_kbps * 1000 * vbv_ms / 1000);
     ICodecAPI_SetValue(api, &k_BufferSize, &v);
     if (gop > 0) {
         v.vt = VT_UI4; v.ulVal = (ULONG)gop;
