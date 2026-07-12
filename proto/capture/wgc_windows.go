@@ -471,12 +471,8 @@ func (s *wgcSession) firstFrameSetup(tex, dev uintptr, opts Options, fps, kbps i
 	// D3D11-устройстве, что и захват — общий GPU-контекст, без ffmpeg-подпроцесса и
 	// второго девайса. В обычной сборке newNativePreferredEncoder возвращает ok=false.
 	//
-	// GOP почти бесконечный — БЕЗ периодических ключевых кадров. Фризы шли ровно с
-	// периодом GOP (каждую секунду при GOP=1с) — значит спайк на IDR и есть их
-	// источник. Убираем плановые IDR совсем; свежий кадр присылается только по запросу
-	// зрителя (PLI) при реальной потере. На чистом канале это ровный поток без спайков.
-	gopSec := 600
-	log.Printf("capture: GOP = %dс (%d кадров, кейфреймы только по PLI)", gopSec, fps*gopSec)
+	gopSec := 1 // как на macOS/Linux (плановый кейфрейм раз в секунду)
+	log.Printf("capture: GOP = %dс (%d кадров)", gopSec, fps*gopSec)
 	if ne, ok := newNativePreferredEncoder(s.ctx, s.frames, dev, *dstW, *dstH, fps, kbps, fps*gopSec, opts.DropLate); ok {
 		// Zero-copy: GPU-конверт BGRA→NV12 (VideoProcessor) под размер кадра захвата.
 		// Не вышло — откатимся на CPU-конвертацию (bgraToNV12 + submit байтами).
