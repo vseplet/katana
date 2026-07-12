@@ -66,6 +66,7 @@ struct katana_enc {
     int width, height, fps;
     UINT reset_token;
     volatile LONG dead;
+    int intra_refresh; // 1 если AMD принял rolling intra-refresh (проверка по GetValue)
 
     // --- zero-copy: GPU-конверт BGRA→NV12 через ID3D11VideoProcessor на общем девайсе ---
     // Девайс с MT-protection (ID3D11Multithread) сам сериализует контекст, поэтому
@@ -341,6 +342,10 @@ static const GUID k_MeanBitRate       = {0xf7222374,0x2144,0x4815,{0xb5,0x50,0xa
 // один слайс = полоску кадра, а не весь кадр → нет каскада «1 потеря → N кадров»).
 static const GUID k_SliceControlMode  = {0xe9e782ef,0x5f18,0x44c9,{0xa9,0x0b,0xe9,0xc3,0xc2,0xc4,0x66,0x98}};
 static const GUID k_SliceControlSize  = {0x92f51df3,0x07a5,0x4172,{0xae,0xfe,0xc6,0x9c,0xa3,0xb6,0x0e,0x35}};
+// Rolling intra-refresh: постоянно размазываем свежие I-блоки по кадрам. Потеря
+// самозалечивается за цикл рефреша БЕЗ ожидания кейфрейма/досылки — декодер продолжает
+// (замазывает), а не фризит. Значение = число кадров на полный проход рефреша.
+static const GUID k_GradualIntraRefresh = {0x8f347dee,0xcb0d,0x49ba,{0xb4,0x62,0xdb,0x69,0x27,0xee,0x21,0x01}};
 
 // CBR + VBV (буфер ~0.5с) + GOP + low-latency — гасит всплески битрейта на движении
 // и ключевых кадрах (иначе на WAN подскакивает латенси). Best-effort: не все
@@ -351,25 +356,16 @@ static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
         return;
     VARIANT v;
     VariantInit(&v);
-    // Конфиг КАК НА macOS (VideoToolbox): мягкий средний битрейт, БЕЗ жёсткого VBV.
-    // Мак ставит только AverageBitRate и никаких DataRateLimits — энкодер сам
-    // раскидывает биты по сложности кадра, отсюда и качество, и плавность. Прежние
-    // строгий CBR + малый VBV душили качество и давали периодический спайк на IDR.
-    // KATANA_RC: 0=CBR, 1=PeakVBR, 2=UnconstrainedVBR (по умолчанию 2, как мак).
-    int rc = 2;
-    const char *rc_env = getenv("KATANA_RC");
-    if (rc_env) { int r = atoi(rc_env); if (r >= 0 && r <= 3) rc = r; }
-    v.vt = VT_UI4; v.ulVal = (ULONG)rc;
+    // Конфиг КАК НА macOS (VideoToolbox): мягкий средний битрейт (UnconstrainedVBR),
+    // БЕЗ жёсткого VBV и без потолка. Мак ставит только AverageBitRate и никаких
+    // DataRateLimits — энкодер сам раскидывает биты по сложности кадра, отсюда и
+    // качество, и плавность. Прежние строгий CBR + малый VBV душили качество и давали
+    // периодический спайк на ключевом кадре.
+    v.vt = VT_UI4; v.ulVal = 2; // eAVEncCommonRateControlMode_UnconstrainedVBR
     ICodecAPI_SetValue(api, &k_RateControlMode, &v);
     v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000;
     ICodecAPI_SetValue(api, &k_MeanBitRate, &v);
-    // Для VBR НЕ ставим MaxBitRate/BufferSize — как на маке (нет жёсткого потолка).
-    // Для CBR (KATANA_RC=0) возвращаем буфер ~1с, иначе часть драйверов капризничает.
-    if (rc == 0) {
-        v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000;
-        ICodecAPI_SetValue(api, &k_MaxBitRate, &v);
-        ICodecAPI_SetValue(api, &k_BufferSize, &v);
-    }
+    // MaxBitRate/BufferSize НЕ ставим — как на маке (нет жёсткого потолка/буфера).
     if (gop > 0) {
         v.vt = VT_UI4; v.ulVal = (ULONG)gop;
         ICodecAPI_SetValue(api, &k_GOPSize, &v);
@@ -384,6 +380,19 @@ static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
     ICodecAPI_SetValue(api, &k_SliceControlMode, &v);
     v.vt = VT_UI4; v.ulVal = 10000; // ~1250 байт на слайс
     ICodecAPI_SetValue(api, &k_SliceControlSize, &v);
+
+    // Rolling intra-refresh — устойчивость к потерям БЕЗ буфера/лага (см. GUID выше).
+    // Значение = кадров на полный проход (fps ≈ полный рефреш за 1с). Проверяем, взял
+    // ли драйвер, через обратный GetValue — как со слайсами AMD может молча игнорить.
+    int fps_ir = e->fps > 0 ? e->fps : 30;
+    VARIANT vir; VariantInit(&vir);
+    vir.vt = VT_UI4; vir.ulVal = (ULONG)fps_ir;
+    ICodecAPI_SetValue(api, &k_GradualIntraRefresh, &vir);
+    VARIANT vchk; VariantInit(&vchk);
+    e->intra_refresh = (SUCCEEDED(ICodecAPI_GetValue(api, &k_GradualIntraRefresh, &vchk))
+                        && vchk.vt == VT_UI4 && vchk.ulVal == (ULONG)fps_ir) ? 1 : 0;
+    VariantClear(&vchk);
+
     // Держим ссылку для форса ключевого кадра по PLI; релиз — в destroy.
     e->codec = api;
 }
@@ -480,6 +489,12 @@ katana_enc *katana_enc_create(void *d3d_device, int width, int height, int fps,
     hr = set_input_type(e);
     if (FAILED(hr)) goto fail;
     configure_codecapi(e, gop, bitrate_kbps);
+    if (out_info && info_cap > 0) {
+        size_t l = strlen(out_info);
+        const char *tag = e->intra_refresh ? " ir=ok" : " ir=IGNORED";
+        for (size_t k = 0; tag[k] && l < (size_t)info_cap - 1; k++) out_info[l++] = tag[k];
+        out_info[l] = 0;
+    }
 
     stage = 7;
     hr = IMFTransform_QueryInterface(e->mft, &IID_IMFMediaEventGenerator, (void **)&e->evgen);
