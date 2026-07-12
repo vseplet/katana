@@ -330,6 +330,16 @@ func (s *wgcSession) run(ctx context.Context, opts Options, frames chan []byte, 
 		now := time.Now()
 		due := nextEmit.IsZero() || !now.Before(nextEmit)
 
+		// КЛЮЧЕВОЕ: пока не пора эмитить — НЕ трогаем WGC. latestFrame потребляет кадр
+		// из пула (TryGetNextFrame отдаёт его лишь раз). Раньше он звался на каждом
+		// поллинге (240Гц), а захват шёл только при due (60Гц) — 3 из 4 свежих кадров
+		// WGC потреблялись и выбрасывались, и к моменту эмита свежего не было → повтор.
+		// Итог: реальный fps ~15-20 вместо 60 (слайдшоу) при идеальной сети. Теперь
+		// забираем самый свежий кадр РОВНО когда пора кодировать.
+		if !due {
+			continue
+		}
+
 		convDur = 0
 		gotNew := false
 		if frame := latestFrame(pool); frame != 0 {
