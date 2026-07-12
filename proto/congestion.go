@@ -22,8 +22,12 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+// GCC ВЫКЛЮЧЕН по умолчанию. В нашей версии pion (v0.1.37) loss-контроллер GCC
+// навсегда виснет на 100 kbps и гонит энкодер в мусорное качество ДАЖЕ на локальной
+// сети без потерь. Это не «сглаживание», а удушение качества. Обычный путь (AIMD)
+// на чистом канале держит битрейт высоким. KATANA_GCC=1 — включить для экспериментов.
 func gccEnabled() bool {
-	return runtime.GOOS == "windows" && os.Getenv("KATANA_NO_GCC") != "1"
+	return runtime.GOOS == "windows" && os.Getenv("KATANA_GCC") == "1"
 }
 
 // gccEstimators — канал, куда cc-интерсептор кладёт BWE-оценщик каждого нового
