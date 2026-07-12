@@ -421,8 +421,6 @@ type hub struct {
 	lastBrAdj   time.Time  // дебаунс шага адаптации битрейта
 	cleanTicks  int        // подряд тиков без потерь (для осторожного подъёма)
 	lastLossLog time.Time  // троттлинг диагностического лога RR-потерь
-	lastGCCLog  time.Time  // троттлинг лога оценки GCC
-	gccTicking  bool       // запущен ли опрос delay-оценки GCC
 
 	srcMu sync.Mutex   // защищает геометрию источника (для координат мыши)
 	rect  capture.Rect // глобальный прямоугольник общего источника
@@ -1064,25 +1062,6 @@ func (h *hub) requestKeyframe() {
 	}
 }
 
-// gccLoop раз в 500мс тянет delay-оценку GCC в энкодер. Выходит, когда зрителей не
-// осталось (следующий зритель перезапустит через gccTicking).
-func (h *hub) gccLoop() {
-	t := time.NewTicker(500 * time.Millisecond)
-	defer t.Stop()
-	for range t.C {
-		h.mu.Lock()
-		empty := len(h.peers) == 0
-		if empty {
-			h.gccTicking = false
-		}
-		h.mu.Unlock()
-		if empty {
-			return
-		}
-		h.applyGCCTarget()
-	}
-}
-
 // applyGCCTarget гонит битрейт энкодера по оценке GCC. Битрейт = МИНИМУМ оценок всех
 // живых зрителей (общий энкодер обслуживает худший канал), обрезан потолком настроек.
 // Дёргается из колбэка OnTargetBitrateChange (поток интерсептора) → лочим h.mu сами.
@@ -1093,16 +1072,7 @@ func (h *hub) applyGCCTarget() {
 		if pr.bwe == nil {
 			continue
 		}
-		// Берём DELAY-оценку (delayTargetBitrate), а НЕ GetTargetBitrate: последний =
-		// min(delay,loss), а loss-контроллер pion на этом канале навсегда завис на
-		// своём дне 100 kbps и маскирует хорошую delay-оценку. Delay-based — это и есть
-		// правильный сигнал затора (как в libwebrtc). Фолбэк на GetTargetBitrate.
-		t := 0
-		if d, ok := pr.bwe.GetStats()["delayTargetBitrate"].(int); ok && d > 0 {
-			t = d / 1000
-		} else {
-			t = pr.bwe.GetTargetBitrate() / 1000
-		}
+		t := pr.bwe.GetTargetBitrate() / 1000 // → kbps
 		if t <= 0 {
 			continue
 		}
@@ -1114,36 +1084,13 @@ func (h *hub) applyGCCTarget() {
 		h.mu.Unlock()
 		return
 	}
-	raw := best
-	// Пол — только страховка (delay-оценка сама адаптируется под ёмкость канала).
-	// Держим низким: на пачечном канале ~700-800 может быть реальным потолком без
-	// дропов, и forced-выше = потери. Настройка без пересборки: KATANA_GCC_FLOOR.
-	floor := 700
-	if v := os.Getenv("KATANA_GCC_FLOOR"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 200 && n <= 10000 {
-			floor = n
-		}
-	}
-	if h.maxBitrate > 0 && floor > h.maxBitrate {
-		floor = h.maxBitrate
-	}
-	if best < floor {
-		best = floor
-	}
 	if h.maxBitrate > 0 && best > h.maxBitrate {
 		best = h.maxBitrate
 	}
 	changed := best != h.curBitrate
 	h.curBitrate = best
 	str := h.str
-	logNow := time.Since(h.lastGCCLog) >= 2*time.Second
-	if logNow {
-		h.lastGCCLog = time.Now()
-	}
 	h.mu.Unlock()
-	if logNow {
-		log.Printf("signaling: GCC target=%d kbps (raw %d, пол %d, потолок %d)", best, raw, floor, h.maxBitrate)
-	}
 	if changed && str != nil {
 		str.setBitrateKbps(best)
 	}
@@ -1389,14 +1336,9 @@ func (p *peer) buildLocked() error {
 		select {
 		case est := <-gccEstimators:
 			p.bwe = est
+			est.OnTargetBitrateChange(func(int) { h.applyGCCTarget() })
 		case <-time.After(300 * time.Millisecond):
 			log.Printf("gcc: оценщик для %s не пришёл (битрейт погонит другой зритель)", p.pid)
-		}
-		// Опрашиваем delay-оценку GCC раз в 500мс (колбэк OnTargetBitrateChange висит
-		// на min=loss=100 и почти не дёргается). Один тикер на хаб.
-		if !h.gccTicking {
-			h.gccTicking = true
-			go h.gccLoop()
 		}
 	}
 
