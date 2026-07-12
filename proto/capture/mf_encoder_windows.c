@@ -351,20 +351,25 @@ static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
         return;
     VARIANT v;
     VariantInit(&v);
-    v.vt = VT_UI4; v.ulVal = 0; // eAVEncCommonRateControlMode_CBR
+    // Конфиг КАК НА macOS (VideoToolbox): мягкий средний битрейт, БЕЗ жёсткого VBV.
+    // Мак ставит только AverageBitRate и никаких DataRateLimits — энкодер сам
+    // раскидывает биты по сложности кадра, отсюда и качество, и плавность. Прежние
+    // строгий CBR + малый VBV душили качество и давали периодический спайк на IDR.
+    // KATANA_RC: 0=CBR, 1=PeakVBR, 2=UnconstrainedVBR (по умолчанию 2, как мак).
+    int rc = 2;
+    const char *rc_env = getenv("KATANA_RC");
+    if (rc_env) { int r = atoi(rc_env); if (r >= 0 && r <= 3) rc = r; }
+    v.vt = VT_UI4; v.ulVal = (ULONG)rc;
     ICodecAPI_SetValue(api, &k_RateControlMode, &v);
     v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000;
-    ICodecAPI_SetValue(api, &k_MeanBitRate, &v); // часть AMF-драйверов таргетит именно его
-    ICodecAPI_SetValue(api, &k_MaxBitRate, &v);
-    // VBV ~1 секунда. Раньше был ~2 кадра — это заставляло энкодер держать КАЖДЫЙ
-    // кадр крошечным, и на сложной картинке (движение) шло жёсткое квантование → мыло/
-    // блоки даже на локалке без потерь. Нормальный буфер даёт энкодеру распределять
-    // биты и держать качество. Настройка: KATANA_VBV_MS (миллисекунды).
-    int vbv_ms = 1000;
-    const char *vbv_env = getenv("KATANA_VBV_MS");
-    if (vbv_env) { int m = atoi(vbv_env); if (m >= 30 && m <= 5000) vbv_ms = m; }
-    v.vt = VT_UI4; v.ulVal = (ULONG)((long long)bitrate_kbps * 1000 * vbv_ms / 1000);
-    ICodecAPI_SetValue(api, &k_BufferSize, &v);
+    ICodecAPI_SetValue(api, &k_MeanBitRate, &v);
+    // Для VBR НЕ ставим MaxBitRate/BufferSize — как на маке (нет жёсткого потолка).
+    // Для CBR (KATANA_RC=0) возвращаем буфер ~1с, иначе часть драйверов капризничает.
+    if (rc == 0) {
+        v.vt = VT_UI4; v.ulVal = (ULONG)bitrate_kbps * 1000;
+        ICodecAPI_SetValue(api, &k_MaxBitRate, &v);
+        ICodecAPI_SetValue(api, &k_BufferSize, &v);
+    }
     if (gop > 0) {
         v.vt = VT_UI4; v.ulVal = (ULONG)gop;
         ICodecAPI_SetValue(api, &k_GOPSize, &v);
