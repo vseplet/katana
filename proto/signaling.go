@@ -421,6 +421,7 @@ type hub struct {
 	lastBrAdj   time.Time  // дебаунс шага адаптации битрейта
 	cleanTicks  int        // подряд тиков без потерь (для осторожного подъёма)
 	lastLossLog time.Time  // троттлинг диагностического лога RR-потерь
+	lastGCCLog  time.Time  // троттлинг лога оценки GCC
 
 	srcMu sync.Mutex   // защищает геометрию источника (для координат мыши)
 	rect  capture.Rect // глобальный прямоугольник общего источника
@@ -1090,7 +1091,16 @@ func (h *hub) applyGCCTarget() {
 	changed := best != h.curBitrate
 	h.curBitrate = best
 	str := h.str
+	logNow := time.Since(h.lastGCCLog) >= 2*time.Second
+	if logNow {
+		h.lastGCCLog = time.Now()
+	}
 	h.mu.Unlock()
+	if logNow {
+		// Реальная оценка полосы GCC — чтобы понять, перестраховывается ли он
+		// (низкий выход энкодера может быть просто от малоподвижной картинки).
+		log.Printf("signaling: GCC target=%d kbps (min всех зрителей, потолок %d)", best, h.maxBitrate)
+	}
 	if changed && str != nil {
 		str.setBitrateKbps(best)
 	}
