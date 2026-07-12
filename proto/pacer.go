@@ -33,14 +33,19 @@ import (
 // битрейта (настройки/AIMD/PLI-шторм) через setPacerBitrateKbps.
 var pacerTargetBps atomic.Int64
 
-func init() { pacerTargetBps.Store(3000 * 1000 * 5 / 2) } // дефолт до первой настройки
+// pacerFixedBps — ФИКСИРОВАННАЯ высокая скорость слива (6 Мбит), НЕ привязанная к
+// битрейту. Смысл: мелкие P-кадры (5-6 пакетов) уходят мгновенно (нулевая задержка),
+// а залп кейфрейма (~50КБ = 42 пакета) растягивается на ~60мс — именно он давал
+// пики потерь 94% на шейпленном канале. Прошлый пейсер привязывал скорость к
+// битрейту, и при укатанном AIMD битрейте копил всю очередь → фантомные потери и
+// задержка. Фикс: скорость постоянная и высокая — сглаживаем ТОЛЬКО всплески.
+const pacerFixedBps = 6_000_000
 
-// setPacerBitrateKbps подстраивает скорость пейсера под текущий битрейт энкодера.
-func setPacerBitrateKbps(kbps int) {
-	if kbps > 0 {
-		pacerTargetBps.Store(int64(kbps) * 1000 * 5 / 2)
-	}
-}
+func init() { pacerTargetBps.Store(pacerFixedBps) }
+
+// setPacerBitrateKbps оставлен для совместимости вызовов, но скорость пейсера
+// теперь фиксированная (см. pacerFixedBps) — битрейт на неё не влияет.
+func setPacerBitrateKbps(kbps int) {}
 
 type pacerFactory struct{}
 
