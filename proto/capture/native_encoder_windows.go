@@ -38,6 +38,10 @@ type nativeEncoder struct {
 	frames chan []byte
 	sps    []byte // закешированы с 4-байтовым старт-кодом
 	pps    []byte
+
+	// Диагностика структуры битстрима (сравнение с macOS-битстримом без дампов).
+	diagCount int
+	diagLast  time.Time
 }
 
 // newNativeEncoder поднимает аппаратный H264-MFT на D3D11-устройстве WGC-захвата и
@@ -112,6 +116,7 @@ func (e *nativeEncoder) pollLoop() {
 			}
 			log.Printf("capture: native first AU %d bytes, head=% x", n, buf[:m])
 		}
+		e.diagAnnexB(buf[:n]) // разбор реальной структуры битстрима (profile/IDR/SEI)
 		winBytes += n
 		winAUs++
 		winSlices += countVCLNALs(buf[:n]) // проверка нарезки на слайсы (устойчивость к потерям)
@@ -206,6 +211,137 @@ func forEachNAL(b []byte, fn func(t byte, nal []byte)) {
 			fn(b[ns]&0x1f, b[ns:ne])
 		}
 	}
+}
+
+// diagAnnexB разбирает готовый AU и (первые 3 кадра + далее не чаще раза в 2с для
+// «интересных» AU — с SPS/IDR/I) логирует РЕАЛЬНУЮ структуру битстрима от энкодера:
+// что за profile/level реально выдал AMD, IDR(type 5) это или не-IDR I-кадр (open-GOP,
+// который PLI не сбросит по-настоящему → долгий фриз), есть ли recovery-point SEI. Это
+// прямое сравнение с macOS-битстримом без пересылки дампов — всё в существующий лог.
+func (e *nativeEncoder) diagAnnexB(au []byte) {
+	e.diagCount++
+	first := e.diagCount <= 3
+	now := time.Now()
+	if !first && now.Sub(e.diagLast) < 2*time.Second {
+		return
+	}
+
+	var hasSPS, hasPPS, hasIDR, hasNonIDRI, hasP, hasRecovery bool
+	var profile, constraint, level byte
+	var types []byte
+	forEachNAL(au, func(t byte, nal []byte) {
+		types = append(types, t)
+		switch t {
+		case 7: // SPS
+			hasSPS = true
+			if len(nal) >= 4 {
+				profile, constraint, level = nal[1], nal[2], nal[3]
+			}
+		case 8: // PPS
+			hasPPS = true
+		case 5: // IDR-слайс
+			hasIDR = true
+		case 1: // не-IDR VCL: I-слайс = open-GOP кейфрейм, иначе P
+			if sliceIsIntra(nal) {
+				hasNonIDRI = true
+			} else {
+				hasP = true
+			}
+		case 6: // SEI
+			if seiHasRecoveryPoint(nal) {
+				hasRecovery = true
+			}
+		}
+	})
+	// Печатаем только «интересные» AU (кейфрейм/SPS/I) или первые кадры — не спамим на P.
+	if !(first || hasSPS || hasIDR || hasNonIDRI) {
+		return
+	}
+	e.diagLast = now
+	prof := "?"
+	switch profile {
+	case 66:
+		prof = "Baseline"
+	case 77:
+		prof = "Main"
+	case 100:
+		prof = "High"
+	}
+	log.Printf("capture: native bitstream AU#%d nals=%v | SPS=%v PPS=%v profile=%d(%s) constraint=0x%02x level=%d | IDR(t5)=%v openGOP-I(t1)=%v P=%v recovery-SEI=%v",
+		e.diagCount, types, hasSPS, hasPPS, profile, prof, constraint, level, hasIDR, hasNonIDRI, hasP, hasRecovery)
+}
+
+// sliceIsIntra читает slice_header не-IDR VCL-NAL и говорит, I-слайс это или P.
+// slice_type: 2/7 = I. Разбор через Exp-Golomb: first_mb_in_slice ue, slice_type ue.
+// Emulation-prevention в первых байтах игнорируем (на этих полях практически не бывает).
+func sliceIsIntra(nal []byte) bool {
+	if len(nal) < 2 {
+		return false
+	}
+	r := bitReader{b: nal[1:]} // тело после nal-заголовка
+	r.ue()                     // first_mb_in_slice
+	st := r.ue()               // slice_type
+	return st%5 == 2
+}
+
+// seiHasRecoveryPoint ищет в SEI-NAL сообщение recovery_point (payloadType 6) — маркер,
+// которым энкодер с intra-refresh говорит декодеру «отсюда можно восстановиться».
+func seiHasRecoveryPoint(nal []byte) bool {
+	i := 1 // после nal-заголовка
+	for i < len(nal) {
+		pt := 0
+		for i < len(nal) && nal[i] == 0xFF {
+			pt += 255
+			i++
+		}
+		if i >= len(nal) {
+			break
+		}
+		pt += int(nal[i])
+		i++
+		ps := 0
+		for i < len(nal) && nal[i] == 0xFF {
+			ps += 255
+			i++
+		}
+		if i >= len(nal) {
+			break
+		}
+		ps += int(nal[i])
+		i++
+		if pt == 6 {
+			return true
+		}
+		i += ps
+	}
+	return false
+}
+
+// bitReader — минимальный MSB-first читатель бит для Exp-Golomb ue(v) в slice-заголовке.
+type bitReader struct {
+	b   []byte
+	pos int // позиция в битах
+}
+
+func (r *bitReader) bit() int {
+	if r.pos>>3 >= len(r.b) {
+		return 0
+	}
+	v := (r.b[r.pos>>3] >> (7 - uint(r.pos&7))) & 1
+	r.pos++
+	return int(v)
+}
+
+func (r *bitReader) ue() int {
+	zeros := 0
+	for r.bit() == 0 && zeros < 32 {
+		zeros++
+	}
+	v := 0
+	for i := 0; i < zeros; i++ {
+		v = (v << 1) | r.bit()
+	}
+	return v + (1 << zeros) - 1
 }
 
 // initVProc поднимает zero-copy конвейер под размер кадра захвата. ok=false → нет
