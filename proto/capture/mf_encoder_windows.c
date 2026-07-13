@@ -307,7 +307,12 @@ static HRESULT set_output_type(katana_enc *e, int bitrate_kbps) {
     attr_u64(t, &MF_MT_FRAME_SIZE, e->width, e->height);
     attr_u64(t, &MF_MT_FRAME_RATE, e->fps, 1);
     attr_u64(t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-    IMFMediaType_SetUINT32(t, &MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
+    // High profile — КАК НА macOS (VideoToolbox ставит H264_High). CABAC + 8x8-трансформ
+    // + лучшее интра-предсказание: заметно качественнее Baseline при том же битрейте (та
+    // самая «шакальность» на движении). B-кадров нет (BPictureCount=0 ниже + low-latency),
+    // так что латенси не растёт. Браузер декодит High поверх SDP profile-level-id=42xxxx —
+    // мак уже так работает у того же зрителя. Откат: eAVEncH264VProfile_Base.
+    IMFMediaType_SetUINT32(t, &MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High);
     hr = IMFTransform_SetOutputType(e->mft, 0, t, 0);
     IMFMediaType_Release(t);
     return hr;
@@ -338,6 +343,9 @@ static const GUID k_GOPSize           = {0x95f31b26,0x95a4,0x41aa,{0x93,0x03,0x2
 static const GUID k_LowLatency        = {0x9d3ecd55,0x89e8,0x490a,{0x97,0x0a,0x0c,0x95,0x48,0xd5,0xa5,0x6e}};
 static const GUID k_ForceKeyFrame     = {0x398c1b98,0x8353,0x475a,{0x9e,0xf2,0x8f,0x26,0x5d,0x26,0x03,0x45}};
 static const GUID k_MeanBitRate       = {0xf7222374,0x2144,0x4815,{0xb5,0x50,0xa3,0x7f,0x8e,0x12,0xee,0x52}};
+// CODECAPI_AVEncMPVDefaultBPictureCount — число B-кадров. Ставим 0: B-кадры добавляют
+// реордеринг = латенси, а с High-профилем они разрешены (в Baseline были запрещены).
+static const GUID k_BPictureCount     = {0x8d390aac,0xdc5c,0x4200,{0xb5,0x7d,0xdd,0xf3,0x2e,0xd5,0x8a,0x24}};
 // Нарезка кадра на слайсы (устойчивость к потерям: 1 потерянный пакет убивает
 // один слайс = полоску кадра, а не весь кадр → нет каскада «1 потеря → N кадров»).
 static const GUID k_SliceControlMode  = {0xe9e782ef,0x5f18,0x44c9,{0xa9,0x0b,0xe9,0xc3,0xc2,0xc4,0x66,0x98}};
@@ -372,6 +380,10 @@ static void configure_codecapi(katana_enc *e, int gop, int bitrate_kbps) {
     }
     v.vt = VT_BOOL; v.boolVal = VARIANT_TRUE;
     ICodecAPI_SetValue(api, &k_LowLatency, &v);
+    // Без B-кадров (High-профиль их разрешает — гасим реордеринг/латенси). Как на маке
+    // (AllowFrameReordering=false). Best-effort.
+    v.vt = VT_UI4; v.ulVal = 0;
+    ICodecAPI_SetValue(api, &k_BPictureCount, &v);
     // Нарезка на слайсы ~по 1 MTU: одна потеря пакета убивает один слайс (полоску),
     // а не весь кадр → нет каскада «1 потеря → N кадров». Mode=1 (лимит по битам на
     // слайс), Size в битах. Часть AMD-драйверов может это игнорировать — проверяем по
