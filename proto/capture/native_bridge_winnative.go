@@ -12,10 +12,18 @@ import (
 // не маскировать провал неработающим ffmpeg).
 const preferNativeOnly = true
 
-// newNativePreferredEncoder — сборка winnative: поднимаем in-process аппаратный
-// энкодер (Media Foundation, общий D3D11-девайс с захватом). При неудаче отдаём
-// ok=false — тогда firstFrameSetup падает на ffmpeg/MFT-путь.
+// newNativePreferredEncoder — сборка winnative: поднимаем in-process аппаратный энкодер
+// на общем с захватом D3D11-девайсе. Гейт: есть рантайм AMF (amfrt64.dll, драйвер AMD) →
+// AMF-энкодер (даёт слайсы + intra-refresh для локализации потерь, чего MF не даёт),
+// иначе — MF-энкодер (Intel/Nvidia/старый драйвер). При неудаче обоих — ok=false.
 func newNativePreferredEncoder(ctx context.Context, frames chan []byte, dev uintptr, w, h, fps, kbps, gop int, dropLate bool) (winVideoEncoder, bool) {
+	if amfAvailable() {
+		if e, err := newAMFEncoder(ctx, frames, dev, w, h, fps, kbps, gop); err == nil {
+			return e, true
+		} else {
+			log.Printf("capture: AMF encoder unavailable (%v) — падаем на MF", err)
+		}
+	}
 	e, err := newNativeEncoder(ctx, frames, dev, w, h, fps, kbps, gop, dropLate)
 	if err != nil {
 		log.Printf("capture: native MF encoder unavailable (%v) — fallback", err)
