@@ -63,6 +63,11 @@ type Stream struct {
 	// SetBitrate меняет целевой битрейт энкодера на лету, kbps (адаптация к сети).
 	// nil, если путь не поддерживает (ffmpeg/VP8/тест).
 	SetBitrate func(kbps int)
+	// LossLocalized — активный энкодер локализует потери (кейфрейм режется на слайсы,
+	// intra-refresh): AMF на Windows. Тогда PLI-дебаунс можно короче (кейфрейм дешевле,
+	// шторм слабее). false у монолитных IDR (MF/VideoToolbox/VAAPI) — им консервативный
+	// дебаунс. Читает signaling.requestKeyframe.
+	LossLocalized bool
 }
 
 // CaptureEncoder запускает захват+энкод и отдаёт каналы кадров.

@@ -106,6 +106,7 @@ type winVideoEncoder interface {
 	encodeCaptured() error          // zero-copy: сконвертить+закодировать последний кадр
 	forceKeyframe()
 	setBitrate(kbps int)
+	lossLocalized() bool // true если кейфрейм режется на слайсы (AMF) → короче дебаунс PLI можно
 	Close()
 }
 
@@ -164,6 +165,7 @@ func startVideoWGC(ctx context.Context, opts Options) (chan []byte, *streamCtl, 
 		forceKeyframe: sess.forceKeyframe,
 		setBitrate:    sess.setBitrate,
 		setCursor:     sess.setCursor,
+		lossLocalized: sess.lossLocalized(),
 	}
 	return frames, ctl, nil
 }
@@ -833,4 +835,14 @@ type streamCtl struct {
 	forceKeyframe func()
 	setBitrate    func(kbps int)
 	setCursor     func(show bool)
+	lossLocalized bool // энкодер режет кейфрейм на слайсы (AMF) — влияет на дебаунс PLI
+}
+
+// lossLocalized — локализует ли активный нативный энкодер потери (AMF: слайсы +
+// intra-refresh). Читается после <-ready, когда nativeEnc уже выставлен.
+func (s *wgcSession) lossLocalized() bool {
+	s.mu.Lock()
+	ne := s.nativeEnc
+	s.mu.Unlock()
+	return ne != nil && ne.lossLocalized()
 }

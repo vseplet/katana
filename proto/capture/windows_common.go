@@ -147,6 +147,7 @@ func (c *captureWindows) Start(ctx context.Context, opts Options) (*Stream, erro
 		st.ForceKeyframe = ctl.forceKeyframe
 		st.SetBitrate = ctl.setBitrate
 		st.SetCursor = ctl.setCursor
+		st.LossLocalized = ctl.lossLocalized
 	}
 	// Звук (WASAPI loopback → ffmpeg → Opus), если есть ffmpeg. Ошибка — не
 	// фатально: продолжаем без аудио (как раньше).

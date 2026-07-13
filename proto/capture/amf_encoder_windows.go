@@ -221,6 +221,10 @@ func (e *amfEncoder) submit(nv12 []byte) error {
 	return nil
 }
 
+// lossLocalized — AMF режет кадр на слайсы + intra-refresh → потеря локализуется,
+// кейфрейм-восстановитель компактнее. Разрешает более короткий дебаунс PLI.
+func (e *amfEncoder) lossLocalized() bool { return true }
+
 func (e *amfEncoder) forceKeyframe() {
 	e.mu.Lock()
 	defer e.mu.Unlock()

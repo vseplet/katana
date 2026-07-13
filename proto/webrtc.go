@@ -27,9 +27,10 @@ type streamer struct {
 	mu         sync.Mutex
 	cancel     context.CancelFunc // останавливает текущий захват
 	done       chan struct{}      // закрывается, когда писатели кадров вышли
-	setCursor  func(bool)         // живое переключение курсора хоста (без рестарта)
-	forceKeyFn func()             // форс keyframe у энкодера (по PLI); nil если не поддерж.
-	setBitrate func(kbps int)     // смена битрейта энкодера на лету; nil если не поддерж.
+	setCursor    func(bool)       // живое переключение курсора хоста (без рестарта)
+	forceKeyFn   func()           // форс keyframe у энкодера (по PLI); nil если не поддерж.
+	setBitrate   func(kbps int)   // смена битрейта энкодера на лету; nil если не поддерж.
+	lossLocal    bool             // энкодер локализует потери (AMF/слайсы) → короче дебаунс PLI
 
 	// Коалесинг живых переконфигураций. Быстрый перебор (слайдер разрешения и др.)
 	// схлопываем в ОДИН рестарт захвата после паузы: каждый рестарт пере-подключает
@@ -111,6 +112,7 @@ func (s *streamer) applyReconfigure(opts capture.Options) error {
 	s.setCursor = stream.SetCursor
 	s.forceKeyFn = stream.ForceKeyframe
 	s.setBitrate = stream.SetBitrate
+	s.lossLocal = stream.LossLocalized
 
 	var wg sync.WaitGroup
 
@@ -128,9 +130,20 @@ func (s *streamer) applyReconfigure(opts capture.Options) error {
 		// частота записи в трек и максимальная блокировка WriteSample за окно.
 		// Если WriteSample/с проседает при здоровом encode — затор в pion/пейсере.
 		var wsN, wsBad int
-		var wsMaxBlock time.Duration
+		var wsMaxBlock, wsMaxGap time.Duration
 		wsStat := time.Now()
+		var wsLastArr time.Time // время прихода прошлого кадра — джиттер ОТДАЧИ энкодера
 		for frame := range stream.Video {
+			// Джиттер отдачи: ровно ли энкодер выплёвывает кадры. При 60fps идеал —
+			// 16.6мс между кадрами. Большой max = кадры идут рывками/пачками (async MFT
+			// отдаёт AU когда докодил) → браузер получает неровно → микрофризы без потерь.
+			now := time.Now()
+			if !wsLastArr.IsZero() {
+				if g := now.Sub(wsLastArr); g > wsMaxGap {
+					wsMaxGap = g
+				}
+			}
+			wsLastArr = now
 			if !validAU(frame) {
 				wsBad++
 			}
@@ -154,9 +167,9 @@ func (s *streamer) applyReconfigure(opts capture.Options) error {
 			}
 			wsN++
 			if el := time.Since(wsStat); el >= 2*time.Second {
-				log.Printf("webrtc: 2с writeSample=%d/с maxBlock=%.0fмс badAU=%d",
-					int(float64(wsN)/el.Seconds()), wsMaxBlock.Seconds()*1000, wsBad)
-				wsN, wsBad, wsMaxBlock, wsStat = 0, 0, 0, time.Now()
+				log.Printf("webrtc: 2с writeSample=%d/с maxBlock=%.0fмс maxGap=%.0fмс badAU=%d",
+					int(float64(wsN)/el.Seconds()), wsMaxBlock.Seconds()*1000, wsMaxGap.Seconds()*1000, wsBad)
+				wsN, wsBad, wsMaxBlock, wsMaxGap, wsStat = 0, 0, 0, 0, time.Now()
 			}
 		}
 	}()
@@ -212,6 +225,14 @@ func (s *streamer) requestKeyframe() {
 	if fn != nil {
 		fn()
 	}
+}
+
+// lossLocalizedEnc — локализует ли активный энкодер потери (AMF: слайсы + intra-refresh).
+// Определяет, можно ли короче дебаунсить PLI-кейфреймы без риска IDR-шторма.
+func (s *streamer) lossLocalizedEnc() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lossLocal
 }
 
 // setBitrateKbps меняет битрейт энкодера на лету (адаптация к сети).

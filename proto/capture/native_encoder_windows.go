@@ -407,6 +407,10 @@ func (e *nativeEncoder) submit(nv12 []byte) error {
 	return nil
 }
 
+// lossLocalized — MF-энкодер выдаёт МОНОЛИТНЫЙ IDR (AMD игнорит слайсы), потеря не
+// локализуется → короткий дебаунс PLI рискует штормом, оставляем консервативным.
+func (e *nativeEncoder) lossLocalized() bool { return false }
+
 // forceKeyframe просит энкодер выдать IDR на следующем кадре (ответ на PLI зрителя).
 func (e *nativeEncoder) forceKeyframe() {
 	e.mu.Lock()
