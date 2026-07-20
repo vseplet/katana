@@ -21,6 +21,9 @@ param(
 $repo  = $PSScriptRoot
 $proto = Join-Path $repo "proto"
 $exe   = Join-Path $env:USERPROFILE ".katana\katana-dev.exe"
+# Go runtime panics/SIGSEGV go to stderr (NOT the session .log, which only gets
+# log.Printf). Capture stderr to crash.log so a crash header survives for diagnosis.
+$crash = Join-Path $env:USERPROFILE ".katana\crash.log"
 $env:CGO_ENABLED = "1"
 
 # Toolchain check - native cgo build needs go, gcc, git.
@@ -54,7 +57,9 @@ while ($true) {
     }
 
     Write-Host "=== [3/3] running. Q in katana = rebuild+restart. Close window = stop ===" -ForegroundColor Green
-    & $exe --session=$Session
+    "===== run $(Get-Date -Format o) =====" | Out-File -Append -Encoding utf8 $crash
+    # stderr (2) -> crash.log, stdout (TUI) stays on console. Full panic header lands in the file.
+    & $exe --session=$Session 2>> $crash
 
     Write-Host "=== katana exited - restarting in 1s... ===" -ForegroundColor Yellow
     Start-Sleep -Seconds 1
