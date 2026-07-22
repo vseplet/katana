@@ -13,17 +13,25 @@ func moveMouse(x, y int) { robotgo.Move(x, y) }
 // хост сообщал её вьюеру (подсветка курсора и follow-pan при зуме на мобиле).
 func mouseLocation() (int, int) { return robotgo.Location() }
 
-// mouseToggle жмёт/отпускает кнопку мыши ("left" | "right" | "center").
+// rbtn — имя кнопки для robotgo: он знает "center", а зритель шлёт "middle" → алиас.
+func rbtn(button string) string {
+	if button == "middle" {
+		return "center"
+	}
+	return button
+}
+
+// mouseToggle жмёт/отпускает кнопку мыши ("left" | "right" | "center"/"middle").
 func mouseToggle(button string, down bool) {
 	state := "up"
 	if down {
 		state = "down"
 	}
-	robotgo.Toggle(button, state)
+	robotgo.Toggle(rbtn(button), state)
 }
 
 // dragMouse постит событие перетаскивания (мышь с зажатой кнопкой) в (x, y).
-func dragMouse(x, y int, button string) { robotgo.Drag(x, y, button) }
+func dragMouse(x, y int, button string) { robotgo.Drag(x, y, rbtn(button)) }
 
 // moveRel сдвигает курсор на (dx, dy) от текущей позиции — трекпад-режим мобилы
 // (свайп = относительное движение, а не абсолютное позиционирование).
@@ -32,18 +40,18 @@ func moveRel(dx, dy int) {
 	robotgo.Move(x+dx, y+dy)
 }
 
-// clickMouse кликает кнопкой ("left"|"right") по ТЕКУЩЕЙ позиции курсора (тап).
-func clickMouse(button string) { robotgo.Click(button) }
+// clickMouse кликает кнопкой ("left"|"right"|"middle") по ТЕКУЩЕЙ позиции курсора.
+func clickMouse(button string) { robotgo.Click(rbtn(button)) }
 
 // doubleClick — двойной клик по текущей позиции (правильный clickCount=2, чтобы
 // ОС распознала double — например, разворот окна по заголовку).
-func doubleClick(button string) { robotgo.Click(button, true) }
+func doubleClick(button string) { robotgo.Click(rbtn(button), true) }
 
 // dragRel тащит на (dx, dy) от текущей позиции с зажатой кнопкой (drag-событие,
 // не просто move) — относительное перетаскивание (long-press-drag на мобиле).
 func dragRel(dx, dy int, button string) {
 	x, y := robotgo.Location()
-	robotgo.Drag(x+dx, y+dy, button)
+	robotgo.Drag(x+dx, y+dy, rbtn(button))
 }
 
 // scrollMouse прокручивает на dx/dy ПИКСЕЛЕЙ (пиксельно-точно, как трекпад) —

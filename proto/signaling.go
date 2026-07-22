@@ -1674,15 +1674,26 @@ func (p *peer) sendCursor() {
 	}
 }
 
+// normButton нормализует кнопку от зрителя. Раньше всё кроме "right" схлопывалось в
+// "left" — из-за этого терялась средняя кнопка. Платформенные инжекторы понимают
+// "middle"/"center" (Linux btnMiddle, Windows MiddleDown, macOS через алиас).
+func normButton(b string) string {
+	switch b {
+	case "right":
+		return "right"
+	case "middle", "center":
+		return "middle"
+	default:
+		return "left"
+	}
+}
+
 func (p *peer) handleMouse(m *mouseMsg) {
 	// Трекпад-режим (мобила): движение/клик/перетаскивание относительно ТЕКУЩЕЙ
 	// позиции, без маппинга на прямоугольник источника.
 	//  moverel — свайп (свободное движение); click — тап; press/release —
 	//  зажать/отпустить кнопку (long-press-drag); dragrel — свайп с зажатой.
-	btn := "left"
-	if m.Button == "right" {
-		btn = "right"
-	}
+	btn := normButton(m.Button)
 	switch m.Action {
 	case "rel":
 		// Захват мыши для игр: сырые дельты → relative-устройство. Без reportCursor
@@ -1719,10 +1730,7 @@ func (p *peer) handleMouse(m *mouseMsg) {
 	}
 	x := int(r.X + clampF(m.X)*r.W)
 	y := int(r.Y + clampF(m.Y)*r.H)
-	button := "left"
-	if m.Button == "right" {
-		button = "right"
-	}
+	button := normButton(m.Button)
 	switch m.Action {
 	case "down":
 		moveMouse(x, y)
